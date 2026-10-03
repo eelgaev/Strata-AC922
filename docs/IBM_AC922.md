@@ -36,6 +36,7 @@ UD-Q4_K_XL on 4x V100 unless noted. **Bitwise** = greedy output identical to the
 | BF16-form weights as FP16 at load (tensor cores) | `load_converted.cpp`, `gemm.cu`, `fused_gr.cu`, `fused_gdn.cu`, ... | prefill **+14-17%**, decode equal | shifts (FP16 rounding) | `STRATA_FP16=load STRATA_FP16_GATES=1` |
 | Decode hc read per token count and weight form, loads a row ahead, bank padding | `fused_gr.cu` | down 38 -> 18 us; window 32.1 -> 29.9 ms (**+7% decode**) | bitwise | default |
 | `gdn_ab_multi` per token count | `verify_kernels.cu` | window 29.85 -> 29.66 ms | bitwise | default |
+| **`--prefill-ring 320`** on 4 GPUs (new flag): the prompt path's streamed-expert ring - the engine picked 96 slots here (its pinned share counts the experts already in the GPU caches), about a third of a layer, so the GPU waited on each layer's expert burst | `generate.cpp`, `prefill.cpp` | copy wait 8.5% -> 1.8% of the GPU timeline; prompts 7.8K 2,658 -> 2,953, 18K 4,036 -> 4,566, 65K 5,700 -> **6,386 tok/s** (+11-13%; ring sweep 96..512 peaks at 320) | bitwise (teacher-forced log-probs byte-identical) | `--prefill-ring 320` |
 | `--prefill 4096` on 4 GPUs (config): a mid-size prompt becomes several chunks, so the layer-split stages overlap them, and the prompt buffers borrow fewer expert-cache slots | server config | prompts 7.8K **+34%** (2,021 -> 2,713), 18K **+22%** (3,294 -> 4,009), 2K and 65K the same | chunk boundaries differ (KL across chunk sizes 2048-16384: 0.018-0.025, noise) | `--prefill 4096` |
 | Shared expert: dead BF16 copy dropped, gate sigmoid fused | `shared_expert.cu`, `verify.cpp` | window -0.75% | bitwise | default |
 | Prompt attention on Volta `wmma` (int8 KV) | `qsa_prompt_attn.cu` | attention 2.4-2.7x (405 -> 166 ms per 8K chunk); 65K prompt **+17%** | FP32-level | `STRATA_ATTN_WMMA=1` |
@@ -47,6 +48,8 @@ UD-Q4_K_XL on 4x V100 unless noted. **Bitwise** = greedy output identical to the
 | CPU share of decode misses on 2 GPUs (the three rows above + `--pcie-frac 0.6`) | | 2 GPUs window 35.7 -> **32.5 ms (-9%)** | CPU instead of GPU kernels | flags above |
 | Skip quantizing activations when no expert goes to the CPU | `expert_source.cpp` | 2 GPUs decode -3% window | bitwise | default |
 | VSX BF16 router dot | `portable.cpp` | the router lookahead on POWER | FP32-level | default |
+
+**Long prompts now (4 GPUs, best mode + the opt-in prompt kernels + `--prefill 4096 --prefill-ring 320`, one prompt each):** 18K 4,414, 65K 6,404, **123K 6,604 tok/s**.
 
 **Totals (4 GPUs, llama-benchy, best mode):** prefill 659-1,265 -> **812-3,601 tok/s** (+23% to +185%), decode mean
 69.5 -> **76.7 tok/s** (+10%); a 65K prompt with the opt-in prompt kernels **5,673 tok/s**. Against the first
@@ -86,7 +89,7 @@ across the GPUs (`--resident-budget-gib` with `--layer-split auto`). A server co
 }
 ```
 
-On 4 GPUs use `"--prefill", "4096"` instead of `"auto"`: mid-size prompts read 22-34% faster (see At a glance).
+On 4 GPUs use `"--prefill", "4096", "--prefill-ring", "320"` instead of `"--prefill", "auto"`: mid-size prompts read 22-34% faster and every prompt from 8K up another 11-13% (see At a glance).
 
 and the environment of the server:
 

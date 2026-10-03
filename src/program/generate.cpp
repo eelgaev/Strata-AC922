@@ -352,6 +352,7 @@ struct Options {
     bool vram_reserve_given = false;   ///< --vram-reserve-mib on the command line (#496: no smaller automatic reserve)
     /// Plan v0.3 P5: batched prompt processing in chunks of this many tokens (0 = the token path).
     int64_t prefill_chunk = 0;
+    int prefill_ring = 0;   ///< --prefill-ring N: the prompt path's streamed ring, N expert slots (0 = the engine's rule)
     /// `--prefill auto`: the largest chunk (up to 8192) whose buffers the expert cache can lend.  Every expert a chunk
     /// routes to is streamed once per chunk, so a bigger chunk streams fewer bytes per token (the "ubatch" effect).
     bool prefill_auto = false;
@@ -542,6 +543,9 @@ void usage() {
                  "  --prefill CHUNK      batched prompt processing in chunks of CHUNK tokens (needs --native); auto =\n"
                  "                       the largest chunk up to 8192 whose buffers the expert cache can lend;\n"
                  "                       auto:16384 / auto:32768 (or STRATA_PREFILL_AUTO_MAX) allow bigger ones\n"
+                 "  --prefill-ring N     the prompt path's streamed-expert ring: N slots (16..512; default: the engine's\n"
+                 "                       rule, 96 or 384). Deeper prefetch, more cache slots lent during a prompt; the\n"
+                 "                       same outputs. IBM AC922, 4x V100 layer split: 320 (65K prompt +12%)\n"
                  "  --no-pool            skip the CPU expert pool (the GPU-only floor)\n"
                  "  --sync-every-layer   debug: synchronise after every layer\n"
                  "  --ple-gguf PATH      the n-gram/PLE shard.  WITHOUT IT LAYER 1's PLE IS SILENTLY SKIPPED,\n"
@@ -1273,6 +1277,13 @@ int main(int argc, char** argv) {
                                      : (o.prefill_auto && env_max != nullptr ? std::atoll(env_max) : 8192);
             o.prefill_auto_max = want_max >= 32768 ? 32768 : want_max >= 16384 ? 16384 : 8192;
             o.prefill_chunk = o.prefill_auto ? o.prefill_auto_max : std::atoll(v.c_str());
+        }
+        else if (a == "--prefill-ring") {
+            o.prefill_ring = std::atoi(next("--prefill-ring"));
+            if (o.prefill_ring < 16 || o.prefill_ring > 512) {
+                std::fprintf(stderr, "strata generate: --prefill-ring takes 16 to 512 slots\n");
+                return 2;
+            }
         }
         else if (a == "--no-split-rows") o.no_split_rows = true;
         else if (a == "--no-prefill-borrow") o.no_prefill_borrow = true;
@@ -4329,6 +4340,12 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata serve: layer split: %.0f%% of the experts resident, the prompt path's "
                                      "streamed ring %d slots\n", 100.0 * res_share, ring);
             }
+        }
+        // --prefill-ring: the ring as asked, before the loans below are sized (STRATA_PREFILL_RING still wins, A/B)
+        if (o.prefill_ring > 0) {
+            strata::prefill::Prefill::set_ring_override(o.prefill_ring);
+            std::fprintf(stderr, "strata serve: the prompt path's streamed ring %d slots (--prefill-ring)\n",
+                         o.prefill_ring);
         }
         std::vector<PfPart> pf_parts;
         // a cache too small to lend the prompt path its buffers would make it allocate them on top - on a card
