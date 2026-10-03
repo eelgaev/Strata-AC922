@@ -94,6 +94,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
+#if defined(__linux__)
+#include <sched.h>
+#endif
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -677,6 +681,7 @@ struct SplitDrive {
     const uint8_t* cache_base[kMax] = {};
     const uint64_t* cache_slot_off[kMax] = {};
     int pcie_num[kMax] = {};
+    strata::kernels::cpu::ExpertPool* pool[kMax] = {};   ///< STRATA_POOL_PER_NODE: the pool on the stage's GPU's socket
 };
 void drive_pool_split(void* user, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k, float* out,
                       int64_t layer) {
@@ -688,6 +693,7 @@ void drive_pool_split(void* user, const float* x_f, const int32_t* ids, int64_t 
     d.d.cache_base = s->cache_base[st];
     d.d.cache_slot_off = s->cache_slot_off[st];
     d.d.pcie_num = s->pcie_num[st];
+    if (s->pool[st] != nullptr) d.d.pool = s->pool[st];
     drive_pool_multi(s->base, x_f, ids, n_tok, k, out, layer);
 }
 
@@ -2712,7 +2718,60 @@ int main(int argc, char** argv) {
 #endif
         srcp = &arena_src;
     }
+    // STRATA_POOL_PER_NODE=1 (Linux, opt-in): the pool on the main GPU's NUMA node's CPUs, and a second pool on the
+    // other node's, which the layer-split stages whose GPU sits there use (their experts are in that socket's arena
+    // segment). A pool takes its cores from the creating thread's CPU set, so each is built under that node's mask.
+    static const bool per_node = [] { const char* v = std::getenv("STRATA_POOL_PER_NODE"); return v && v[0] && v[0] != '0'; }();
+    std::unique_ptr<strata::kernels::cpu::ExpertPool> pool_far;
+    int pool_near_node = -1, pool_far_node = -1;
+#if defined(__linux__)
+    cpu_set_t pool_saved_mask;
+    CPU_ZERO(&pool_saved_mask);
+    auto node_mask = [](int node, cpu_set_t& m) -> bool {
+        CPU_ZERO(&m);
+        char path[96];
+        std::snprintf(path, sizeof path, "/sys/devices/system/node/node%d/cpulist", node);
+        std::FILE* f = std::fopen(path, "r");
+        if (!f) return false;
+        char buf[512] = {};
+        const bool ok = std::fgets(buf, sizeof buf, f) != nullptr;
+        std::fclose(f);
+        if (!ok) return false;
+        int n = 0;
+        for (char* t = std::strtok(buf, ",\n"); t; t = std::strtok(nullptr, ",\n")) {
+            int a = -1, b = -1;
+            if (std::sscanf(t, "%d-%d", &a, &b) == 2) for (int c = a; c <= b; ++c) { CPU_SET(c, &m); ++n; }
+            else if (std::sscanf(t, "%d", &a) == 1) { CPU_SET(a, &m); ++n; }
+        }
+        return n > 0;
+    };
+    if (per_node) {
+        int pool_dev = 0;
+        cudaGetDevice(&pool_dev);
+        pool_near_node = gpu_numa_node(pool_dev);
+        cpu_set_t m;
+        if (pool_near_node >= 0 && sched_getaffinity(0, sizeof pool_saved_mask, &pool_saved_mask) == 0 &&
+            node_mask(pool_near_node, m))
+            sched_setaffinity(0, sizeof m, &m);
+        else
+            pool_near_node = -1;
+    }
+#endif
     strata::kernels::cpu::ExpertPool pool(o.pool_workers, /*pin=*/true, /*host_works=*/!o.no_host_worker, o.pool_affinity);
+#if defined(__linux__)
+    if (per_node && pool_near_node >= 0) {
+        for (int node = 0; node < 256 && !pool_far; ++node) {
+            cpu_set_t m;
+            if (node == pool_near_node || !node_mask(node, m)) continue;
+            sched_setaffinity(0, sizeof m, &m);
+            pool_far = std::make_unique<strata::kernels::cpu::ExpertPool>(o.pool_workers, true, !o.no_host_worker, o.pool_affinity);
+            pool_far_node = node;
+        }
+        sched_setaffinity(0, sizeof pool_saved_mask, &pool_saved_mask);
+        std::fprintf(stderr, "strata generate: expert pools per NUMA node: %d workers on node %d, %d on node %d\n",
+                     pool.workers(), pool_near_node, pool_far ? pool_far->workers() : 0, pool_far_node);
+    }
+#endif
     if (pool.is_hybrid() && pool.affinity() != strata::kernels::cpu::PoolAffinity::All) {
         const char* aff_str = pool.affinity() == strata::kernels::cpu::PoolAffinity::PCores ? "p-cores" :
                               pool.affinity() == strata::kernels::cpu::PoolAffinity::All ? "all" : "auto";
@@ -4283,6 +4342,10 @@ int main(int argc, char** argv) {
                 split_drive.cache_base[st] = drive.d.cache_base;
                 split_drive.cache_slot_off[st] = drive.d.cache_slot_off;
                 split_drive.pcie_num[st] = pcie_num_of(o.pcie_frac);
+                int sdev = 0;
+                if (st == 0) cudaGetDevice(&sdev);
+                else sdev = stages[(size_t) st - 1]->dev;
+                split_drive.pool[st] = pool_far && gpu_numa_node(sdev) == pool_far_node ? pool_far.get() : &pool;
             }
             for (int st = 1; st < n_stages; ++st) {
                 bool ok_s = false;
