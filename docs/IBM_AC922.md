@@ -9,6 +9,7 @@ and **IQ2_XS**, on 2 and 4 GPUs.
 Everything here was measured on one AC922 (RHEL 8, driver 550.54.15 - ppc64le's last - CUDA 12.4, gcc-toolset-12).
 It is not an upstream-supported platform.
 
+- [At a glance](#at-a-glance)
 - [Build](#build)
 - [Run](#run)
 - [Speed](#speed)
@@ -16,6 +17,39 @@ It is not an upstream-supported platform.
 - [Quality](#quality)
 - [Tried and dropped](#tried-and-dropped)
 - [Hardware rules learned on the AC922](#hardware-rules-learned-on-the-ac922)
+
+## At a glance
+
+UD-Q4_K_XL on 4x V100 unless noted. **Bitwise** = greedy output identical to the code before the change;
+**FP32-level** = another summation order, error vs FP64 at FP32 level (outputs can differ late in a greedy answer);
+**shifts** = changes the numbers more than that (still within the quality noise band, see [Quality](#quality)).
+
+| Optimization | Where | Measured | Numerics | On by |
+|---|---|---|---|---|
+| Per-socket page-locked arena: one `cudaHostAlloc` per NUMA node, allocated and filled on that node | `expert_source.cpp`, `pinned.cu`, `generate.cpp` | decode 37-55 -> **67-74 tok/s**; experts load 27.7 GiB/s (registered: 2.4) | GPU instead of CPU kernels for the misses | default with `--resident-budget-gib` |
+| Helper threads release the host thread's CPU pin | `thread_affinity.hpp`, `prefill.cpp`, `pool.cpp` | 10K prompt on 1 GPU **87 -> 894 tok/s**; 4 GPUs 64K prefill +21-26% | bitwise | default |
+| NVLink: >= 60 GB/s links take every missed expert | `generate.cpp` | 1 GPU decode 33.7 -> 38.7 tok/s | GPU instead of CPU kernels | default |
+| Missed-expert fetch beside the cached experts (own stream) | `verify.cpp`, `verify_kernels.cu` | 2 GPUs decode +5% | bitwise | default (`STRATA_FETCH_OVERLAP=0` off) |
+| The idle peer GPU fetches half of the misses over its NVLink | `verify.cpp`, `verify_kernels.cu` | link 55 -> 104 GB/s; 2 GPUs decode **51-58 -> 60-68 tok/s** | bitwise | default (`STRATA_FETCH_PARTNER=0` off) |
+| Prompt chunks pipelined through every layer-split stage | `prefill.cpp` | 4 GPUs 64K prefill **+56-64%** | bitwise | default |
+| Drafter prompt pass batched on a layer split | `prefill.cpp`, `generate.cpp` | draft layer 325 -> 37 ms per chunk; prefill +2-6% | bitwise | default |
+| BF16-form weights as FP16 at load (tensor cores) | `load_converted.cpp`, `gemm.cu`, `fused_gr.cu`, `fused_gdn.cu`, ... | prefill **+14-17%**, decode equal | shifts (FP16 rounding) | `STRATA_FP16=load STRATA_FP16_GATES=1` |
+| Decode hc read per token count and weight form, loads a row ahead, bank padding | `fused_gr.cu` | down 38 -> 18 us; window 32.1 -> 29.9 ms (**+7% decode**) | bitwise | default |
+| `gdn_ab_multi` per token count | `verify_kernels.cu` | window 29.85 -> 29.66 ms | bitwise | default |
+| Shared expert: dead BF16 copy dropped, gate sigmoid fused | `shared_expert.cu`, `verify.cpp` | window -0.75% | bitwise | default |
+| Prompt attention on Volta `wmma` (int8 KV) | `qsa_prompt_attn.cu` | attention 2.4-2.7x (405 -> 166 ms per 8K chunk); 65K prompt **+17%** | FP32-level | `STRATA_ATTN_WMMA=1` |
+| Fused W4A16 prompt experts (Q4_K / Q5_1 / Q8_0 dequantized in shared memory, `wmma`, SwiGLU epilogue, 32 experts per launch) | `fused_expert.cu`, `prefill.cpp` | 5.5x / 2.7x / 1.7x vs dequant + cuBLAS (40 / 160 / 320 tokens per expert); prompts **+14-18%** | FP32-level (more accurate than cuBLAS) | `STRATA_FUSED_EXPERTS=1` |
+| QSA block selection scores on `wmma` (FP16 hi + lo split) | `qsa_select.cu` | scores 8x at 57K context; 65K prompt **+9%** | FP32-level | `STRATA_SELECT_VOLTA=1` |
+| VSX multi-token CPU expert kernels (Q4_K, Q5_1) | `kq_vsx.cpp`, `native_expert.cpp` | per core vs ggml: Q4_K 1.7-2.3x, Q5_1 **4.3-7.7x** | FP32-level vs ggml (2e-7) | `STRATA_VSX_EXPERTS=1` |
+| SMT2 CPU expert pool | `pool.cpp` | per-core throughput 1.95x | bitwise vs 1 thread per core | `STRATA_POOL_SMT=2` |
+| One CPU expert pool per NUMA node | `generate.cpp` | CPU cost per expert 250-440 -> 105 us (4 GPUs) | bitwise | `STRATA_POOL_PER_NODE=1` |
+| CPU share of decode misses on 2 GPUs (the three rows above + `--pcie-frac 0.6`) | | 2 GPUs window 35.7 -> **32.5 ms (-9%)** | CPU instead of GPU kernels | flags above |
+| Skip quantizing activations when no expert goes to the CPU | `expert_source.cpp` | 2 GPUs decode -3% window | bitwise | default |
+| VSX BF16 router dot | `portable.cpp` | the router lookahead on POWER | FP32-level | default |
+
+**Totals (4 GPUs, llama-benchy, best mode):** prefill 659-1,265 -> **812-3,601 tok/s** (+23% to +185%), decode mean
+69.5 -> **76.7 tok/s** (+10%); a 65K prompt with the opt-in prompt kernels **5,673 tok/s**. Against the first
+working port: prefill 426-1,121 and decode ~50 tok/s.
 
 ## Build
 
