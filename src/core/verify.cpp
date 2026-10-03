@@ -7,6 +7,7 @@
 
 #include "strata/core/native_head.hpp"
 #include "strata/core/on_device.hpp"
+#include "strata/core/peer_experts.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
@@ -256,7 +257,9 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     }
     if (hits.d_res == nullptr || hits.cache_base == nullptr || hits.blob <= 0) {
         err = "verify: needs the profile-filled VRAM expert tier (--expert-profile and --expert-cache); with "
-              "--expert-cache auto, no VRAM was left for it: lower --max-context, use --kv k8v4 or images on the CPU";
+              "--expert-cache auto, no VRAM was left for it - the 'no VRAM is left for the expert cache' line above "
+              "says how much is short and what makes room (a smaller --max-context, --kv q4_0, setup --draft-vocab en, "
+              "images on the CPU)";
         return false;
     }
     std::string why;
@@ -819,14 +822,15 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         const int32_t* p_start2 = pl + ptr_off + 4 * capx;
         float* hit_out = hit_out_ + (size_t) tb * K * N;
         const auto& lay = strata::kernels::cpu::expert_layout();
-        // plan v0.3 P6: the VRAM groups now; the PCIe groups once the copy engine has landed them in staging
-        auto grouped = [&](const unsigned long long* gp, const int32_t* gs, const int32_t* gn) {
+        // plan v0.3 P6: the VRAM groups now; the PCIe groups once the copy engine has landed them in staging.
+        // `gy`: the native launch's groups side by side (0: cap, one block row per possible group).
+        auto grouped = [&](const unsigned long long* gp, const int32_t* gs, const int32_t* gn, int64_t gy) {
             if (lay.native) {
                 // the layer's GGUF formats (i-quant gate/up, Q2_0 / IQ4_NL down)
                 const auto& f = lay.fmt[(size_t) l];
                 const NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
                 native_expert_grouped(L, gp, gs, gn, p_dst, p_tok, cap, cap,
-                                      nat_xq_ + (size_t) tb * (N / 32) * 36, hit_scratch_, hit_out, cs);
+                                      nat_xq_ + (size_t) tb * (N / 32) * 36, hit_scratch_, hit_out, cs, gy);
             } else {
                 moe_grouped_s2(gp, gs, gn, p_dst, p_tok, cap, cap, hit_xq_ + (size_t) tb * (N / 32) * 34,
                                hit_xs_ + (size_t) tb * (N / 32), hit_scratch_, hit_out, cs);
@@ -854,12 +858,14 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             fetch(fetch_s_);
             cudaEventRecord(ev_fetched_, fetch_s_);
         }
-        grouped(p_ptr, p_start, p_counts);
+        grouped(p_ptr, p_start, p_counts, 0);
         stamp(l, 20, grp);
         if (overlap) cudaStreamWaitEvent(cs, ev_fetched_, 0);
         else fetch(cs);
         stamp(l, 21, grp);
-        grouped(p_ptr2, p_start2, p_counts + 2);
+        // the PCIe share is pcie_frac of the misses: a few groups when the cache is cold, usually none (always none at
+        // pcie_frac 0), so its launch is kPcieGroupRows block rows striding over the groups, not cap of them
+        grouped(p_ptr2, p_start2, p_counts + 2, kPcieGroupRows);
         stamp(l, 22, grp);
         if (device_plan_) {   // no CPU share when the device planned the group: its rows are zeros
             wait_flag_ge_or(m_flag_, ring, skip_ + grp, cs);

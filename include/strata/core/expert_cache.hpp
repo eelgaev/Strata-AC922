@@ -60,6 +60,23 @@ bool read_expert_profile(const std::string& path, int64_t n_layers, int64_t n_ex
 /// files' clean pages and gives way to a device allocation.  There the figure is MemAvailable less 6 GiB for the OS
 /// and the engine's host side (STRATA_UMA_HEADROOM_GIB).  Elsewhere it is cudaMemGetInfo's.
 size_t device_free_bytes();
+/// #477 (--expert-profile-save): what the adaptive tier learned, as a profile ranking EVERY (layer, expert) pair -
+/// the experts resident in VRAM now first (where the swaps left the cache), then the rest; within each, by `heat`
+/// (the routing the adaptive tier counted since the start, descending), then by `prior` (the profile the engine
+/// started from: an expert this run never routed keeps its old place), then by index.  A start from it begins
+/// where this one ended; one with more slots adds the hottest of the rest, one with fewer keeps the hottest.
+/// `resident` and `heat`: n_layers x n_expert entries (`heat` may be empty: no counts, the prior decides).
+std::vector<std::pair<int32_t, int32_t>> rank_learned_profile(int64_t n_layers, int64_t n_expert,
+                                                              const std::vector<uint8_t>& resident,
+                                                              const std::vector<double>& heat,
+                                                              const std::vector<std::pair<int32_t, int32_t>>& prior);
+
+/// #477: writes `ranked` in tools/make_profile.py's format, byte for byte: `STRP`, `1, n_layers, n_expert,
+/// n_ranked, n_ranked` (uint32), the pairs (uint16 layer, uint16 expert), then the n_layers x n_expert int32 table
+/// of each pair's rank (-1: not ranked).  Atomically: a `<path>.tmp` beside it, renamed over `path` once complete,
+/// so a reader (the next start) never sees half a file.  False with `err` when it could not be written.
+bool write_expert_profile(const std::string& path, int64_t n_layers, int64_t n_expert,
+                          const std::vector<std::pair<int32_t, int32_t>>& ranked, std::string& err);
 
 class ExpertCache {
 public:
