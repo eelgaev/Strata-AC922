@@ -859,6 +859,11 @@ if(STRATA_NATIVE_EXPERTS)
   # part of strata_kernels_cpu (the pool calls these and they call its CPU probe: one library, so GNU ld's
   # one-pass static linking has no cycle to resolve)
   target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/native_expert.cpp)
+  if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(ppc64|powerpc64)")
+    # POWER9 VSX expert kernels (STRATA_VSX_EXPERTS=1); the half->float vector conversion needs ISA 3.0
+    target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/kq_vsx.cpp)
+    set_source_files_properties(src/kernels/cpu/kq_vsx.cpp PROPERTIES COMPILE_OPTIONS "-mcpu=power9")
+  endif()
   if(STRATA_CPU_X86)
     target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/iq_avx512.cpp src/kernels/cpu/iq_avx2.cpp
                                               src/kernels/cpu/kq_avx2.cpp)

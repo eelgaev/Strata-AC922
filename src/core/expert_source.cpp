@@ -1861,7 +1861,12 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         }
     }
     const auto c1 = std::chrono::steady_clock::now();
-    if (native && lay.fmt[(size_t) d.layers].gu_type == 42 && q2_own_kernels())   // a native Q2_0 pack: the Q2_0 kernels' activations
+    // the quantized activations feed only the CPU's jobs: a layer whose entries all went to VRAM, PCIe or a remote
+    // stage skips them (on POWER, ggml's Q8_K quantizer is the scalar reference: ~65 us a layer, every layer)
+    bool any_cpu = false;
+    for (int64_t i = 0; i < n && !any_cpu; ++i) any_cpu = kind[i] < 0;
+    if (!any_cpu) {
+    } else if (native && lay.fmt[(size_t) d.layers].gu_type == 42 && q2_own_kernels())   // a native Q2_0 pack: the Q2_0 kernels' activations
         for (int64_t t = 0; t < n_tok; ++t) act_quant_any(x_f + (size_t) t * H, H, d.act_multi[(size_t) t]);
     else if (native)
         for (int64_t t = 0; t < n_tok; ++t)

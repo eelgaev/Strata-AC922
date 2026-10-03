@@ -220,8 +220,19 @@ CpuTopology detect_cpu_topology(bool skip_first, PoolAffinity affinity) {
     }
 
     if (affinity == PoolAffinity::All || !topo.is_hybrid) {
-        for (const auto& cl : all_cpus) {
-            if (!cl.is_sibling) topo.worker_cores.push_back(cl.cpu);
+        // STRATA_POOL_SMT=k (opt-in): k hardware threads of each physical core, core by core (POWER9: a core's
+        // two halves each run one thread at full speed, measured 1.95x a core's expert throughput at k = 2)
+        static const int smt = [] { const char* e = std::getenv("STRATA_POOL_SMT"); return e ? (std::max)(1, std::atoi(e)) : 1; }();
+        if (smt > 1) {
+            for (const auto& key : seen_phys) {
+                int taken = 0;
+                for (const auto& cl : all_cpus)
+                    if (cl.pkg == key.first && cl.core == key.second && taken < smt) { topo.worker_cores.push_back(cl.cpu); ++taken; }
+            }
+        } else {
+            for (const auto& cl : all_cpus) {
+                if (!cl.is_sibling) topo.worker_cores.push_back(cl.cpu);
+            }
         }
         if (skip_first && !topo.worker_cores.empty()) {
             topo.host_core = topo.worker_cores.front();
