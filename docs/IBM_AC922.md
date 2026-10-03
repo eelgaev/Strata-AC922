@@ -78,13 +78,15 @@ across the GPUs (`--resident-budget-gib` with `--layer-split auto`). A server co
  "args": ["--pack", "/path/to/packs/unsloth-ud-q4_k_xl",
           "--native", "/path/to/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf",
           "--expert-profile", "data/expert-profile.bin", "--expert-cache", "auto", "--prefill", "auto",
-          "--spec", "4", "--spec-min-p", "0.5", "--mtp", "/path/to/mtp/rt",   (4 GPUs: "--prefill", "4096")
+          "--spec", "4", "--spec-min-p", "0.5", "--mtp", "/path/to/mtp/rt",
           "--max-context", "131072", "--kv", "int8", "--kv-resident", "32768", "--ple-io", "ram",
           "--resident-budget-gib", "72"],
  "gpu": [0, 1, 2, 3],
  "layer_split": "auto"
 }
 ```
+
+On 4 GPUs use `"--prefill", "4096"` instead of `"auto"`: mid-size prompts read 22-34% faster (see At a glance).
 
 and the environment of the server:
 
