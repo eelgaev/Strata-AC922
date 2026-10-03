@@ -62,6 +62,11 @@ An **NVIDIA DGX Spark** (GB10, ARM) works too (experimental; tested with IQ2_XS 
 there, and every expert fits on its GPU (decode 55-62 tok/s, prefill 928-1,515 tok/s). Details:
 [DGX Spark](docs/DGX_SPARK.md).
 
+An **IBM Power System AC922** (POWER9 + 4x V100, NVLink 2.0, ppc64le) works on the `ac922` branch (experimental;
+tested with UD-Q4_K_XL and IQ2_XS): a per-socket page-locked arena, Volta tensor-core kernels (FP16 weights, prompt
+attention, fused expert GEMMs, QSA selection), POWER9 VSX/SMT/NUMA-aware CPU experts. 4 GPUs: prefill 812-3,601
+tok/s (5,673 on a 65K prompt with the opt-in kernels), decode ~77 tok/s. Details: [IBM AC922](docs/IBM_AC922.md).
+
 ## Install
 
 ### Let your AI set it up
