@@ -36,6 +36,7 @@ UD-Q4_K_XL on 4x V100 unless noted. **Bitwise** = greedy output identical to the
 | BF16-form weights as FP16 at load (tensor cores) | `load_converted.cpp`, `gemm.cu`, `fused_gr.cu`, `fused_gdn.cu`, ... | prefill **+14-17%**, decode equal | shifts (FP16 rounding) | `STRATA_FP16=load STRATA_FP16_GATES=1` |
 | Decode hc read per token count and weight form, loads a row ahead, bank padding | `fused_gr.cu` | down 38 -> 18 us; window 32.1 -> 29.9 ms (**+7% decode**) | bitwise | default |
 | `gdn_ab_multi` per token count | `verify_kernels.cu` | window 29.85 -> 29.66 ms | bitwise | default |
+| `--prefill 4096` on 4 GPUs (config): a mid-size prompt becomes several chunks, so the layer-split stages overlap them, and the prompt buffers borrow fewer expert-cache slots | server config | prompts 7.8K **+34%** (2,021 -> 2,713), 18K **+22%** (3,294 -> 4,009), 2K and 65K the same | chunk boundaries differ (KL across chunk sizes 2048-16384: 0.018-0.025, noise) | `--prefill 4096` |
 | Shared expert: dead BF16 copy dropped, gate sigmoid fused | `shared_expert.cu`, `verify.cpp` | window -0.75% | bitwise | default |
 | Prompt attention on Volta `wmma` (int8 KV) | `qsa_prompt_attn.cu` | attention 2.4-2.7x (405 -> 166 ms per 8K chunk); 65K prompt **+17%** | FP32-level | `STRATA_ATTN_WMMA=1` |
 | Fused W4A16 prompt experts (Q4_K / Q5_1 / Q8_0 dequantized in shared memory, `wmma`, SwiGLU epilogue, 32 experts per launch) | `fused_expert.cu`, `prefill.cpp` | 5.5x / 2.7x / 1.7x vs dequant + cuBLAS (40 / 160 / 320 tokens per expert); prompts **+14-18%** | FP32-level (more accurate than cuBLAS) | `STRATA_FUSED_EXPERTS=1` |
@@ -77,7 +78,7 @@ across the GPUs (`--resident-budget-gib` with `--layer-split auto`). A server co
  "args": ["--pack", "/path/to/packs/unsloth-ud-q4_k_xl",
           "--native", "/path/to/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf",
           "--expert-profile", "data/expert-profile.bin", "--expert-cache", "auto", "--prefill", "auto",
-          "--spec", "4", "--spec-min-p", "0.5", "--mtp", "/path/to/mtp/rt",
+          "--spec", "4", "--spec-min-p", "0.5", "--mtp", "/path/to/mtp/rt",   (4 GPUs: "--prefill", "4096")
           "--max-context", "131072", "--kv", "int8", "--kv-resident", "32768", "--ple-io", "ram",
           "--resident-budget-gib", "72"],
  "gpu": [0, 1, 2, 3],
@@ -231,6 +232,9 @@ and 5% of top-1 picks. The 2K text is below the 2,051-cell selection width, so s
 | Expert plan on the GPU (branch `ac922-gpu-plan-wip`) | 32.2 -> 32.7 ms/window: the host plan was already hidden |
 | Next-layer expert prefetch (branch `ac922-prefetch-wip`) | 58-61% of misses predicted, but 34.8 -> 39.4 ms/window |
 | Uneven layer splits, 16K prompt chunks, longer drafts (`--spec 6`) | no gain (stages balanced; less overlap; acceptance drops) |
+| A per-prompt chunk size (about 1.5 chunks per stage) with 8K buffers | below a fixed `--prefill 4096`: the 8K buffers borrow more cache slots |
+| Merged host hand-shake kernels in the verify window (wait + copy plan, wait + CPU rows + hits, wait + rebase) | bit-identical, but 29.0 -> 29.1 ms/window: the graph nodes were not on the critical path |
+| Q8_0 decode GEMVs with 2 or 4 rows per block (bit-identical) | slower than 1 row per block (fewer blocks in flight) |
 | Peer-to-peer stage hand-offs, KV cache near each GPU, on-device planner E-6 | no change |
 | `cudaHostRegister` / `cudaMallocManaged` for experts | registered memory reads at 0-48 GB/s with UVM migration on |
 | Drafter at FP16 or with Q4_K_M / Q8_0 experts | acceptance unchanged (76-77%) |
