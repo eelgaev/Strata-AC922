@@ -3666,14 +3666,21 @@ int main(int argc, char** argv) {
         GpuStage& st = *stp;
         const auto& lay = strata::kernels::cpu::expert_layout();
         // the drafter and the head are already allocated by now (they load above, before this), so what is left
-        // to hold back is the windows - and `free_b` has already lost the drafter.
-        const int64_t room = stage_room(st.dev, true, false);
+        // to hold back is the windows - and `free_b` has already lost the drafter.  Not yet the draft head and
+        // logits: MtpDrafter::bind allocates them on the last stage after this (a 106K-token draft vocabulary over
+        // the Q5_K head: 276 MiB), so they come out of its room here, as the one-GPU cache books them (#199) -
+        // without, they took the reserve and the window graphs (~13 MiB each on a 24-layer stage) ran it out
+        const int64_t draft_bind = (&st == last_st && !o.mtp.empty() && st.head.loaded())
+                                       ? (int64_t) mtp.bind_bytes(st.head.row_bytes(), n_vocab) : 0;
+        const int64_t room = std::max<int64_t>(stage_room(st.dev, true, false) - draft_bind, 0);
         const strata::core::OnDevice on(st.dev);
         {
             size_t fb = 0, tb = 0;
             cudaMemGetInfo(&fb, &tb);
-            std::fprintf(stderr, "strata generate: layer split, CUDA%d: %.2f GiB free of %.2f, room for experts %.2f GiB\n",
-                         st.dev, (double) fb / 1073741824.0, (double) tb / 1073741824.0, (double) room / 1073741824.0);
+            std::fprintf(stderr, "strata generate: layer split, CUDA%d: %.2f GiB free of %.2f, room for experts %.2f GiB"
+                                 "%s\n", st.dev, (double) fb / 1073741824.0, (double) tb / 1073741824.0,
+                         (double) room / 1073741824.0,
+                         draft_bind > 0 ? (" (the draft head's " + std::to_string(draft_bind >> 20) + " MiB booked)").c_str() : "");
         }
         std::vector<int64_t> sized;
         int64_t used = 0;
@@ -5879,6 +5886,12 @@ int main(int argc, char** argv) {
             // and a page-in while the verify graph spins on a host flag stalls the request for good
             size_t free_b = 0, total_b = 0;
             cudaMemGetInfo(&free_b, &total_b);
+            // a layer split: the fullest card counts (the last stage carries the head, the drafter and its graphs)
+            for (const auto& stp : stages) {
+                const strata::core::OnDevice on(stp->dev);
+                size_t f2 = 0, t2 = 0;
+                if (cudaMemGetInfo(&f2, &t2) == cudaSuccess && f2 < free_b) free_b = f2;
+            }
             // below ~256 MiB a later allocation (a first-used window's buffers, the desktop, another program) can make
             // the driver page GPU memory, and a verify graph spinning on a host flag then never finishes
             const int64_t free_mib = (int64_t) (free_b >> 20);
