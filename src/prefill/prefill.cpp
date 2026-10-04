@@ -2788,8 +2788,12 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             std::snprintf(b, sizeof b, " %s %.0f (%.1f%%)", kPfNames[i], pt.ms[i], total > 0 ? 100.0 * pt.ms[i] / total : 0.0);
             line += b;
         }
-        std::fprintf(stderr, "strata prefill timing: %lld tokens, GPU timeline %.0f ms, wall %.0f ms, host staging %.0f ms:%s\n",
-                     (long long) n, total, ms_since(t_start), stats_.ms_experts_host, line.c_str());
+        int tdev = 0;
+        cudaGetDevice(&tdev);
+        const double t_end_ms = std::chrono::duration<double, std::milli>(Clock::now().time_since_epoch()).count();
+        std::fprintf(stderr, "strata prefill timing: CUDA%d, %lld tokens, GPU timeline %.0f ms, wall %.0f ms (ended at %.0f), "
+                     "host staging %.0f ms:%s\n", tdev, (long long) n, total, ms_since(t_start), std::fmod(t_end_ms, 1e7),
+                     stats_.ms_experts_host, line.c_str());
         std::fprintf(stderr, "strata prefill timing: host: chunk setup (PLE rows, the expert stream plan) %.0f ms, "
                              "waiting for each chunk %.0f ms, after each chunk (the draft layer, progress) %.0f ms, "
                              "PLE %.0f ms\n", host_setup_ms, host_sync_ms, host_chunk_ms, stats_.ms_ple);

@@ -155,8 +155,11 @@ __device__ __forceinline__ void store_acc(float (*E)[LDE], Acc (&acc)[2][2]) {
 }
 
 // gate/up (Q4_K; interleaved row 2r = gate r, 2r + 1 = up r) and SwiGLU -> H
-__global__ void __launch_bounds__(NT) gu_q4k_kernel(Tiles g, FusedExpertLayout L, const __half* __restrict__ X,
-                                                    __half* __restrict__ H) {
+// GT: Q4_K (12) or Q5_K (13, the fifth bit of each value in qh[32]: bit 2 jj + hi of qh[l] adds 16)
+template<int GT>
+__global__ void __launch_bounds__(NT) gu_kernel(Tiles g, FusedExpertLayout L, const __half* __restrict__ X,
+                                                __half* __restrict__ H) {
+    constexpr int BB = GT == 12 ? 144 : 176, QS = GT == 12 ? 16 : 48;   // block bytes, quants offset
     extern __shared__ __align__(16) unsigned char sm[];
     __half* Xs = (__half*) sm;
     __half* Ws = (__half*) (sm + TM * BK * 2);
@@ -177,13 +180,17 @@ __global__ void __launch_bounds__(NT) gu_q4k_kernel(Tiles g, FusedExpertLayout L
     const uint8_t* rowp = g.blob[e] + ((R & 1) ? L.up_off : 0) + (size_t) (R >> 1) * L.gu_row;
     const __half* Xb = X + row0 * L.n_embd;
     XRegs xr;
-    uint4 qr[NV], hr;
+    uint4 qr[NV], hr, qhr[GT == 13 ? NV : 1];
     auto fetch_w = [&](int64_t k0) {
-        const uint8_t* b = rowp + (size_t) (k0 / 256) * 144;
+        const uint8_t* b = rowp + (size_t) (k0 / 256) * BB;
         const int jj = (int) (k0 % 256) / 64;
         hr = *(const uint4*) b;   // dm, scales[12]
 #pragma unroll
-        for (int v = 0; v < NV; ++v) qr[v] = ((const uint4*) (b + 16 + 32 * jj))[v0 + v];
+        for (int v = 0; v < NV; ++v) qr[v] = ((const uint4*) (b + QS + 32 * jj))[v0 + v];
+        if constexpr (GT == 13) {
+#pragma unroll
+            for (int v = 0; v < NV; ++v) qhr[v] = ((const uint4*) (b + 16))[v0 + v];   // qh[32]
+        }
     };
     auto commit_w = [&](int64_t k0) {
         const int jj = (int) (k0 % 256) / 64;
@@ -199,7 +206,15 @@ __global__ void __launch_bounds__(NT) gu_q4k_kernel(Tiles g, FusedExpertLayout L
             const uint8_t* q = (const uint8_t*) &qr[v];
             __align__(16) __half o[16];
 #pragma unroll
-            for (int l = 0; l < 16; ++l) o[l] = __float2half(d1 * ((q[l] >> sh) & 0xF) - m1);
+            for (int l = 0; l < 16; ++l) {
+                if constexpr (GT == 13) {   // dq_q5_k's formula
+                    const uint8_t* qh = (const uint8_t*) &qhr[v];
+                    const uint8_t hm = (uint8_t) (1u << (2 * jj + hi));
+                    o[l] = __float2half(d1 * (((q[l] >> sh) & 0xF) + (qh[l] & hm ? 16 : 0)) - m1);
+                } else {
+                    o[l] = __float2half(d1 * ((q[l] >> sh) & 0xF) - m1);
+                }
+            }
             *(uint4*) &Ws[soff(wr, hi * 4 + 2 * (v0 + v))] = *(const uint4*) &o[0];
             *(uint4*) &Ws[soff(wr, hi * 4 + 2 * (v0 + v) + 1)] = *(const uint4*) &o[8];
         }
@@ -313,7 +328,7 @@ void check(const char* what) {
 }  // namespace
 
 bool fused_expert_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_ff) noexcept {
-    return gu_type == 12 && (d_type == 7 || d_type == 8) && n_embd % 256 == 0 && n_ff % BN == 0 && n_ff % BK == 0;
+    return (gu_type == 12 || gu_type == 13) && (d_type == 7 || d_type == 8) && n_embd % 256 == 0 && n_ff % BN == 0 && n_ff % BK == 0;
 }
 
 void fused_expert_run(const FusedExpertLayout& L, const FusedExpertGroup& in, const uint16_t* X, uint16_t* H, float* D,
@@ -324,7 +339,8 @@ void fused_expert_run(const FusedExpertLayout& L, const FusedExpertGroup& in, co
         std::exit(1);
     }
     static const bool once = [] {
-        cudaFuncSetAttribute(gu_q4k_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
+        cudaFuncSetAttribute(gu_kernel<12>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
+        cudaFuncSetAttribute(gu_kernel<13>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
         cudaFuncSetAttribute(down_kernel<7>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
         cudaFuncSetAttribute(down_kernel<8>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
         return true;
@@ -345,7 +361,8 @@ void fused_expert_run(const FusedExpertLayout& L, const FusedExpertGroup& in, co
     if (n == 0) return;
     gu.n = dn.n = n;
     const cudaStream_t s = (cudaStream_t) stream;
-    gu_q4k_kernel<<<gu.tile0[n], NT, SMEM, s>>>(gu, L, (const __half*) X, (__half*) H);
+    if (L.gu_type == 13) gu_kernel<13><<<gu.tile0[n], NT, SMEM, s>>>(gu, L, (const __half*) X, (__half*) H);
+    else gu_kernel<12><<<gu.tile0[n], NT, SMEM, s>>>(gu, L, (const __half*) X, (__half*) H);
     check("fused_expert gate/up");
     if (L.d_type == 7) down_kernel<7><<<dn.tile0[n], NT, SMEM, s>>>(dn, L, (const __half*) H, D);
     else down_kernel<8><<<dn.tile0[n], NT, SMEM, s>>>(dn, L, (const __half*) H, D);

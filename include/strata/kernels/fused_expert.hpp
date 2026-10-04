@@ -23,7 +23,7 @@ struct FusedExpertGroup {
     int n = 0;
 };
 
-// gate/up Q4_K with down Q5_1 or Q8_0, n_embd % 256 == 0, n_ff % 64 == 0
+// gate/up Q4_K or Q5_K with down Q5_1 or Q8_0, n_embd % 256 == 0, n_ff % 64 == 0
 bool fused_expert_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_ff) noexcept;
 
 // H[rows][n_ff] (FP16) = SwiGLU of X[rows][n_embd] (FP16) times gate/up (interleaved as iq_dequant_gu_f16),
