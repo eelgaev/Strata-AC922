@@ -1390,9 +1390,24 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
     const bool ple_batch = ple_on && ple_batch_env && strata::kernels::ple_native_postops_enabled() &&
                            (ss.ple.w.key_bf16 != nullptr || ss.ple.w.key_native_data != nullptr) &&
                            m.region_bytes / ((uint64_t) (3 * strata::kernels::NG_HC_DIM + N + 4) * 4 + (uint64_t) N * 2 + 4096) >= 64;
+    // STRATA_PREFILL_ADAPT=F (opt-in; other chunk boundaries than the fixed chunk: another summation order): on a
+    // layer split the first stage cuts the prompt into about F chunks per stage, so the later stages start sooner
+    // (the pipeline's fill and drain cost ~3 chunk-times a prompt on 4 stages) - at least STRATA_PREFILL_ADAPT_MIN
+    // tokens (2048), at most the buffers' chunk. A longer prompt keeps the full chunk.
+    int64_t step = m.T;
+    {
+        static const double adapt = [] { const char* v = std::getenv("STRATA_PREFILL_ADAPT"); return v ? std::atof(v) : 0.0; }();
+        static const int64_t adapt_min = [] { const char* v = std::getenv("STRATA_PREFILL_ADAPT_MIN"); return v ? std::atoll(v) : 2048; }();
+        int stages = 1;
+        for (const Prefill* q = next_; q != nullptr; q = q->next_) ++stages;
+        if (adapt > 0.0 && stage_lb_ == 0 && stages > 1) {
+            const int64_t want = (int64_t) std::ceil((double) n / (adapt * stages));
+            step = std::min<int64_t>(m.T, std::max<int64_t>(adapt_min, (want + 255) / 256 * 256));
+        }
+    }
     const int32_t prev0[2] = {prev[0], prev[1]};
-    auto ple_gather = [&m, &ss, tokens, n, prev0](int64_t c0, int buf, std::string& e) -> bool {
-        const int64_t T = std::min(m.T, n - c0);
+    auto ple_gather = [&m, &ss, tokens, n, prev0, step](int64_t c0, int buf, std::string& e) -> bool {
+        const int64_t T = std::min(step, n - c0);
         auto at = [&](int64_t i) { return i < 2 ? prev0[i] : (int32_t) tokens[i - 2]; };   // prev0, then the tokens
         int32_t pv[2] = {at(c0), at(c0 + 1)};
         for (int64_t t = 0; t < T; ++t) {
@@ -1408,10 +1423,10 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
     std::future<bool> ple_next;             // declared after everything it reads: an early return waits for it
     int ple_buf = 0;
 
-    for (int64_t c0 = 0; c0 < n; c0 += m.T) {
+    for (int64_t c0 = 0; c0 < n; c0 += step) {
         if (should_stop && should_stop()) { err = "cancelled"; return false; }
         if (std::getenv("STRATA_TRACE")) { std::fprintf(stderr, "strata trace: prompt chunk %lld of %lld\n", (long long) c0, (long long) n); std::fflush(stderr); }
-        const int64_t T = std::min(m.T, n - c0), p0 = pos0 + c0;
+        const int64_t T = std::min(step, n - c0), p0 = pos0 + c0;
         core::progress_at("reading the prompt (batched): preparing the chunk from token", p0);   // #251
         ++stats_.chunks;
         pt.mark(kPfStart, cs);
@@ -1493,13 +1508,13 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                 err = std::string("prefill: the PLE rows' upload failed: ") + cudaGetErrorString(cudaGetLastError());
                 return false;
             }
-            if (c0 + m.T < n) {
+            if (c0 + step < n) {
                 // the other buffer's upload (a chunk ago) is done before the SSD thread refills it
                 if (cudaEventSynchronize(m.ple_copied[ple_buf ^ 1]) != cudaSuccess) {
                     err = std::string("prefill: the PLE rows' upload failed: ") + cudaGetErrorString(cudaGetLastError());
                     return false;
                 }
-                ple_next = std::async(std::launch::async, [&ple_gather, &ple_next_err, c1 = c0 + m.T, b = ple_buf ^ 1] {
+                ple_next = std::async(std::launch::async, [&ple_gather, &ple_next_err, c1 = c0 + step, b = ple_buf ^ 1] {
                     strata::platform::release_inherited_pin();
                     return ple_gather(c1, b, ple_next_err);
                 });
