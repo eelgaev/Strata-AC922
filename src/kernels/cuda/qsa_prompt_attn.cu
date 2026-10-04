@@ -737,7 +737,9 @@ bool launch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const
 }
 
 
-#if !defined(__HIPCC__)
+// PR #600: compiled only into the experimental build (-DSTRATA_EXPERIMENTAL_SM60=ON), the one build that runs on a
+// Volta card; the ready-made engine has none of it (no extra kernels to load, the same code as before).
+#if !defined(__HIPCC__) && defined(STRATA_EXPERIMENTAL_SM60)
 // ---- sm_70 (Volta): v1's structure on mma.m8n8k4 ------------------------------------------------------------------
 // From Klaus Friedel's (fks) PR #600 to Niko1221/Strata, commit ee0843da07ee8da96fa0b5afebfdd8dde6c0b587
 // (https://github.com/fks/Strata/commit/ee0843da07ee8da96fa0b5afebfdd8dde6c0b587). ac922: opt-in (STRATA_ATTN_M884=1,
@@ -1117,13 +1119,13 @@ bool launch70(const float* q, const QsaAttnPools& pools, const int32_t* ids, con
     }
     return true;
 }
-#else   // AMD: no m8n8k4 kernel; the dispatcher never selects it there
+#else   // AMD, or a build without STRATA_EXPERIMENTAL_SM60: no m8n8k4 kernel (the caller keeps the old one)
 template <int KV_MODE>
 bool launch70(const float*, const QsaAttnPools&, const int32_t*, const int32_t*, int64_t, const QsaShapes&, float*,
               int64_t, cudaStream_t) {
     return false;
 }
-#endif  // !__HIPCC__
+#endif  // !__HIPCC__ && STRATA_EXPERIMENTAL_SM60
 
 #if defined(__HIPCC__)
 // ---- S6: the int8-KV prompt attention on RDNA4 matrix cores (opt-in: STRATA_HIP_WMMA=1, gfx12 only). The design of
@@ -1676,11 +1678,14 @@ bool launch_volta(const float* q, const QsaAttnPools& pools, const int32_t* ids,
 bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
                            int64_t cap, const QsaShapes& s, float* attn, int64_t n_q, void* stream) {
     if (n_q <= 0) return true;
-    bool turing = false;   // per call, from the CURRENT device (a layer split can mix Turing with newer cards)
+    bool volta = false, turing = false;   // per call, from the CURRENT device (a layer split can mix Turing with newer cards)
     {   // sm_75 or newer: the MMA above compiles for both.  sm_80+ runs the cp.async kernel (launch_i8); Turing has
         // no cp.async, so it runs the v1 kernel (launch<1>, same accuracy, another summation order).  An older card
         // keeps the old kernel.
         // #371: the compute capability with its minor - sm_70 (V100) has no m16n8k8 (the kernels trap below sm_75)
+#if defined(STRATA_HIP_GFX906)
+        return false;   // gfx906: the tensor-core and WMMA kernels are not for it; the FP32 kernel runs
+#endif
         static int cc[64] = {};
         int dev = 0;
         if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return false; }
@@ -1697,26 +1702,22 @@ bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int3
                       : 10 * strata::cc_major_of(major) + strata::cc_minor_of(minor);
         }
 #if !defined(__HIPCC__)
-        // STRATA_ATTN_M884=1 (opt-in, int8 KV): PR #600's mma.m8n8k4 kernel above, ahead of P4's wmma one - 12.4 vs
-        // 14.2 ms per 2,048-query chunk at 32K context, error vs FP64 2.3e-6 vs 6.6e-6
+        // P4: Volta on its own wmma kernel, opt-in (STRATA_ATTN_WMMA=1), int8 KV only - ahead of the m8n8k4 kernel
+        // below, unless STRATA_ATTN_M884=1 asks for that one
         static const bool m884 = [] { const char* e = std::getenv("STRATA_ATTN_M884"); return e && e[0] == '1'; }();
-        if (m884 && cc[dev] >= 70 && cc[dev] < 75 && pools.k_q != nullptr && pools.v_q != nullptr && pools.k_scale != nullptr &&
-            pools.k_q4 == nullptr && pools.v_q4 == nullptr && s.head_dim == HD && s.n_head == (int64_t) G * s.n_head_kv &&
-            cap > 0 && ids && steps && pools.page_table)
-            return launch70<1>(q, pools, ids, steps, cap, s, attn, n_q, (cudaStream_t) stream);
-        // P4: Volta (sm_70) on its own tensor cores, opt-in (STRATA_ATTN_WMMA=1), int8 KV only
-        if (cc[dev] >= 70 && cc[dev] < 75 && volta_wmma_wanted() && pools.k_q != nullptr && pools.v_q != nullptr &&
+        if (!m884 && cc[dev] >= 70 && cc[dev] < 75 && volta_wmma_wanted() && pools.k_q != nullptr && pools.v_q != nullptr &&
             pools.k_scale != nullptr && pools.v_scale != nullptr && pools.k_q4 == nullptr && pools.v_q4 == nullptr &&
             s.head_dim == HD && s.n_head == (int64_t) G * s.n_head_kv && cap > 0 && ids && steps && pools.page_table)
             return launch_volta(q, pools, ids, steps, cap, s, attn, n_q, (cudaStream_t) stream);
 #endif
-        if (cc[dev] < 75) return false;
+        if (cc[dev] < 70) return false;
+        volta = cc[dev] < 75;     // sm_70: the m8n8k4 kernel (STRATA_PA_VOLTA); STRATA_QSA_WARP=1 still forces the old one
         turing = cc[dev] < 80;
     }
 #if defined(__HIPCC__)
     // the tensor-core kernels are compiled out on AMD (its major version is not a CUDA sm); RDNA4 has its own int8-KV
     // matrix-core kernel, opt-in (STRATA_HIP_WMMA=1); everything else keeps the old kernel
-    (void) turing;
+    (void) turing; (void) volta;
     if (pools.k_q != nullptr && pools.v_q != nullptr && pools.k_scale != nullptr && pools.v_scale != nullptr &&
         pools.k_q4 == nullptr && pools.v_q4 == nullptr && s.head_dim == HD && s.n_head == (int64_t) G * s.n_head_kv &&
         cap > 0 && ids && steps && pools.page_table && hip_wmma_usable())
@@ -1737,6 +1738,7 @@ bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int3
     }
     if (pools.k_q != nullptr && pools.v_q4 != nullptr) {   // hybrid K8V4: int8 K + dequantized-q4 V
         if (!pools.k_scale) return false;
+        if (volta) return launch70<3>(q, pools, ids, steps, cap, s, attn, n_q, st);
         return launch<3>(q, pools, ids, steps, cap, s, attn, n_q, st);
     }
     if (pools.k_q != nullptr) {
@@ -1745,10 +1747,12 @@ bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int3
         // for how far the model amplifies an FP32-level change.  Turing always takes it: v2's cp.async does not
         // exist before sm_80.
         static const bool v1 = std::getenv("STRATA_PROMPT_ATTN_V1") != nullptr;
+        if (volta) return launch70<1>(q, pools, ids, steps, cap, s, attn, n_q, st);
         if (v1 || turing) return launch<1>(q, pools, ids, steps, cap, s, attn, n_q, st);
         return launch_i8(q, pools, ids, steps, cap, s, attn, n_q, st);
     }
     if (!pools.k_pool || !pools.v_pool) return false;
+    if (volta) return launch70<0>(q, pools, ids, steps, cap, s, attn, n_q, st);
     return launch<0>(q, pools, ids, steps, cap, s, attn, n_q, st);
 }
 

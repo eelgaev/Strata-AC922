@@ -85,7 +85,14 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
     // AVX-2 kernel, STRATA_NO_IQ256 drops the AVX-2 kernel; ggml-cpu's single-token vec_dot is reached only with
     // both set (and on a CPU without AVX-512, STRATA_NO_IQ512 changes nothing).
     static const bool avx512 = cpu_avx512_ok() && std::getenv("STRATA_NO_IQ512") == nullptr;
-    static const bool avx2 = std::getenv("STRATA_NO_IQ256") == nullptr;
+    // STRATA_NO_IQ256 drops the AVX-2 kernel.  cpu_avx2_ok() is ALSO required: iq_avx2.cpp and kq_avx2.cpp
+    // are compiled /arch:AVX2 and use AVX2 and FMA3, so calling them on a CPU without either is an
+    // illegal instruction, not a slow path.  The gate sat next to `avx512` above, which does test
+    // cpu_avx512_ok(), and that asymmetry is what let a pre-Haswell CPU reach iq256_gu_rows.
+    // Without it this falls through to ggml-cpu's vec_dot below, which is compiled for whatever
+    // baseline the build selected (AVX1 here) and covers the same types - IQ2_XXS and IQ2_S among
+    // them.  That path loops over tokens itself, so it is correct for any `nt`, not just one.
+    static const bool avx2 = cpu_avx2_ok() && std::getenv("STRATA_NO_IQ256") == nullptr;
     // #152: from how many tokens the multi-token kernels run (ggml's vec_dot below that).  The default 2 is the
     // measured-fastest rule, but a token's expert rows then round differently alone than in a group, so greedy output
     // can depend on how many drafts a verify window held.  STRATA_IQ_MT_MIN=1 (opt-in, 0.1.30) uses the multi-token
@@ -94,7 +101,7 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
     // Unsloth UD-Q4_K_XL's Q4_K gate/up: the multi-token kernel is bit-exact against ggml's per-token dot (any group
     // size, no #152 rule).  Opt-in, STRATA_KQ256=1: measured no faster in the engine (a window's expert groups hold
     // ~1.4 tokens and the weights stay in L1 across ggml's per-token calls; 1.01-1.13x in native_expert_parity).
-    static const bool kq = [] { const char* v = std::getenv("STRATA_KQ256"); return v != nullptr && std::atoi(v) != 0; }();
+    static const bool kq = [] { const char* v = std::getenv("STRATA_KQ256"); return cpu_avx2_ok() && v != nullptr && std::atoi(v) != 0; }();
     // POWER9 (STRATA_VSX_EXPERTS=1): Q4_K gate/up through the VSX multi-token kernel, any group size
     if (f.gu_type == 12 && f.gu_act == 15 && kq_vsx_on()) {
         kq_vsx_gu_rows(blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
@@ -147,11 +154,14 @@ void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const
         kq_vsx_q51_rows(blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
         return;
     }
-    if (kq && nt >= 2 && (f.d_type == 7 || f.d_type == 8)) {   // Q5_1 / Q8_0 down: bit-exact, any group size
+    // Both multi-token kernels below are /arch:AVX2 translation units (kq_avx2.cpp and iq_avx2.cpp),
+    // so a CPU without AVX2 has to reach ggml-cpu's vec_dot instead - same reasoning as the gate/up
+    // rows above, where `avx512` tested cpu_avx512_ok() and `avx2` did not.
+    if (cpu_avx2_ok() && kq && nt >= 2 && (f.d_type == 7 || f.d_type == 8)) {   // Q5_1 / Q8_0 down: bit-exact, any group size
         kq256_rows(f.d_type, blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
         return;
     }
-    if (nt >= mt_min && f.d_type == 20 && iq4nl_mt) {   // #152: the same rule as the gate/up rows
+    if (cpu_avx2_ok() && nt >= mt_min && f.d_type == 20 && iq4nl_mt) {   // #152: the same rule as the gate/up rows
         iq4nl256_down_rows(blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
         return;
     }
