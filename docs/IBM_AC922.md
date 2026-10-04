@@ -38,6 +38,7 @@ UD-Q4_K_XL on 4x V100 unless noted. **Bitwise** = greedy output identical to the
 | `gdn_ab_multi` per token count | `verify_kernels.cu` | window 29.85 -> 29.66 ms | bitwise | default |
 | **`--prefill-ring 320`** on 4 GPUs (new flag): the prompt path's streamed-expert ring - the engine picked 96 slots here (its pinned share counts the experts already in the GPU caches), about a third of a layer, so the GPU waited on each layer's expert burst | `generate.cpp`, `prefill.cpp` | copy wait 8.5% -> 1.8% of the GPU timeline; prompts 7.8K 2,658 -> 2,953, 18K 4,036 -> 4,566, 65K 5,700 -> **6,386 tok/s** (+11-13%; ring sweep 96..512 peaks at 320) | bitwise (teacher-forced log-probs byte-identical) | `--prefill-ring 320` |
 | `--prefill 4096` on 4 GPUs (config): a mid-size prompt becomes several chunks, so the layer-split stages overlap them, and the prompt buffers borrow fewer expert-cache slots | server config | prompts 7.8K **+34%** (2,021 -> 2,713), 18K **+22%** (3,294 -> 4,009), 2K and 65K the same | chunk boundaries differ (KL across chunk sizes 2048-16384: 0.018-0.025, noise) | `--prefill 4096` |
+| `--prefill 3072` on 4 GPUs, `--prefill-ring 480` on 2 GPUs (config, re-swept 2026-10-04 after the kernel work) | 4 GPUs vs 4096: 7.8K +9%, 18K +11%, 65K same, 123K -1%. 2 GPUs (auto = 8,192-token chunks) with ring 480: 2K +29%, 7.8K-123K +8-9% | same outputs (ring); chunk size as before | config |
 | Shared expert: dead BF16 copy dropped, gate sigmoid fused | `shared_expert.cu`, `verify.cpp` | window -0.75% | bitwise | default |
 | Prompt attention on Volta `wmma` (int8 KV) | `qsa_prompt_attn.cu` | attention 2.4-2.7x (405 -> 166 ms per 8K chunk); 65K prompt **+17%** | FP32-level | `STRATA_ATTN_WMMA=1` |
 | Fused W4A16 prompt experts (Q4_K / Q5_1 / Q8_0 dequantized in shared memory, `mma.m8n8k4` on a swizzled tile, SwiGLU epilogue, 32 experts per launch) | `fused_expert.cu`, `prefill.cpp` | 5.5x / 2.7x / 1.7x vs dequant + cuBLAS (40 / 160 / 320 tokens per expert); prompts **+14-18%**, then v2 another 6-13% per layer (+2-3% prompts) | FP32-level (more accurate than cuBLAS) | `STRATA_FUSED_EXPERTS=1` |
@@ -88,6 +89,8 @@ across the GPUs (`--resident-budget-gib` with `--layer-split auto`). A server co
  "layer_split": "auto"
 }
 ```
+
+Re-swept 2026-10-04: on 4 GPUs `"--prefill", "3072", "--prefill-ring", "320"` is now the best fixed setting (4096 below it from 7.8K to 65K); on 2 GPUs keep `"--prefill", "auto"` and add `"--prefill-ring", "480"`. `--spec 4 --spec-min-p 0.5` stays best over spec 3-6 x min-p 0.3-0.7 on essay, code and Q&A text.
 
 On 4 GPUs use `"--prefill", "4096", "--prefill-ring", "320"` instead of `"--prefill", "auto"`: mid-size prompts read 22-34% faster and every prompt from 8K up another 11-13% (see At a glance).
 
