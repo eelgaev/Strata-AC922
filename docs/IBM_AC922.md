@@ -49,7 +49,7 @@ UD-Q4_K_XL on 4x V100 unless noted. **Bitwise** = greedy output identical to the
 | Skip quantizing activations when no expert goes to the CPU | `expert_source.cpp` | 2 GPUs decode -3% window | bitwise | default |
 | VSX BF16 router dot | `portable.cpp` | the router lookahead on POWER | FP32-level | default |
 
-**Long prompts now (4 GPUs, best mode + the opt-in prompt kernels + `--prefill 4096 --prefill-ring 320`, one prompt each):** 18K 4,537, 65K 6,540, **123K 6,783 tok/s**.
+**Long prompts now (4 GPUs, best mode + the opt-in prompt kernels + `--prefill 4096 --prefill-ring 320`, one prompt each):** 18K 4,708, 65K 6,766, **123K 6,985 tok/s**.
 
 **Totals (4 GPUs, llama-benchy, best mode):** prefill 659-1,265 -> **812-3,601 tok/s** (+23% to +185%), decode mean
 69.5 -> **76.7 tok/s** (+10%); a 65K prompt with the opt-in prompt kernels **5,673 tok/s**. Against the first
@@ -192,6 +192,7 @@ else keeps the default outputs.
 | `gdn_ab_multi` per token count | 29.85 -> 29.66 ms/window, bit-identical |
 | **`STRATA_FUSED_EXPERTS=1`**: fused W4A16 prompt experts - Q4_K gate/up and Q5_1/Q8_0 down dequantized tile by tile into shared memory, tensor cores, SwiGLU in the epilogue, 32 experts per launch pair, no FP16 copy of the expert | per expert 5.5x / 2.7x / 1.7x vs dequant + cuBLAS at 40 / 160 / 320 tokens; prompts **+14-18%** |
 | Fused experts v2 (same outputs, bit for bit): Q4_K scales read from registers (the byte-indexed header went through local memory and stalled each K step on the prefetch), raw `mma.m8n8k4` on an XOR-swizzled tile (sm_70 `wmma` loads have 8-way bank conflicts at any legal stride), independent accumulators issued back to back, MMAs skipped for rows past an expert's last token | per layer at 40 / 80 / 160 tokens per expert: -9% / -13% / -6%; prompts 18K 4,414 -> 4,537, 65K 6,404 -> 6,540, 123K 6,604 -> 6,783 tok/s |
+| Coalesced Q8_0 -> FP16 dequant (default; same values bit for bit): the prompt path dequantizes every dense Q8_0 projection (GDN qkv/gate/out, QSA q/k/v/out, shared expert, hc) before its cuBLAS GEMM, and the generic kernel's thread per 32-value block wrote 2-byte values 64 bytes apart (~107 GB/s). Four threads per block, one 16-byte store each: ~725 GB/s | attn_qkv 0.747 -> 0.110 ms; the model's dense dequant per 4,096-token chunk 106 -> 18 ms; prompts 18K 4,537 -> 4,708, 65K 6,540 -> 6,766, 123K 6,783 -> 6,985 tok/s |
 | **`STRATA_SELECT_VOLTA=1`**: QSA block selection scores on `wmma` (16 queries share each key read; FP32 split into FP16 hi + lo, 3 products) | scores 8x at 57K context; 65K prompt **+9%** |
 
 **Volta's tensor cores truncate when they accumulate.** A long chain of `mma` into one accumulator (K = 2,560: 160
