@@ -15,6 +15,9 @@
 #include <sys/mman.h>
 #endif
 #include <vector>
+#include <algorithm>
+#include <cstdlib>
+#include <thread>
 #include <stdexcept>
 
 #if defined(_WIN32)
@@ -364,6 +367,32 @@ bool PleTable::gather_batch(const uint32_t* rows, size_t n_tokens, float* out, s
         const auto ticket = impl_->reader.issue(rows, n, raw.data());
         if (!impl_->reader.collect(ticket, err)) return false;
         for (size_t i = 0; i < n; ++i) impl_->decode(raw.data() + i * impl_->rb, out + i * PLE_HEAD_DIM);
+        impl_->bytes_read += (uint64_t) n * impl_->rb;
+        return true;
+    }
+    // the prompt path's batch (16 rows a token, scattered over the table) on several threads: one thread decoded a
+    // 3,072-token chunk's 49,152 rows in ~375 ms on POWER9 and set the pace of a 4-GPU prompt (the first stage waited
+    // ~14 ms a chunk for it). Each row decodes into its own slot: the same output on any thread count.
+    // STRATA_PLE_GATHER_THREADS (default 8; 1 = the serial loop)
+    static const int nth = [] {
+        const char* v = std::getenv("STRATA_PLE_GATHER_THREADS");
+        const int k = v ? std::atoi(v) : 8;
+        return k < 1 ? 1 : (k > 64 ? 64 : k);
+    }();
+    if (nth > 1 && n >= 4096 && impl_->data != nullptr) {
+        std::vector<std::thread> th;
+        const size_t per = (n + (size_t) nth - 1) / (size_t) nth;
+        for (int k = 0; k < nth; ++k) {
+            const size_t i0 = (size_t) k * per, i1 = std::min(n, i0 + per);
+            if (i0 >= i1) break;
+            th.emplace_back([this, rows, out, i0, i1] {
+                for (size_t i = i0; i < i1; ++i) {
+                    if (rows[i] >= impl_->n_rows) std::memset(out + i * PLE_HEAD_DIM, 0, (size_t) PLE_HEAD_DIM * sizeof(float));
+                    else impl_->decode(impl_->data + (size_t) rows[i] * impl_->rb, out + i * PLE_HEAD_DIM);
+                }
+            });
+        }
+        for (auto& t : th) t.join();
         impl_->bytes_read += (uint64_t) n * impl_->rb;
         return true;
     }
