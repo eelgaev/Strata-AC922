@@ -49,11 +49,11 @@ UD-Q4_K_XL on 4x V100 unless noted. **Bitwise** = greedy output identical to the
 | Skip quantizing activations when no expert goes to the CPU | `expert_source.cpp` | 2 GPUs decode -3% window | bitwise | default |
 | VSX BF16 router dot | `portable.cpp` | the router lookahead on POWER | FP32-level | default |
 
-**Long prompts now (4 GPUs, best mode + the opt-in prompt kernels + `--prefill 4096 --prefill-ring 320`, one prompt each):** 18K 4,708, 65K 6,766, **123K 6,985 tok/s**.
+**Long prompts now (4 GPUs, best mode + the opt-in prompt kernels + `--prefill 4096 --prefill-ring 320`, one prompt each, 2026-10-04):** 7.8K 3,295, 18K 4,799, 65K 6,742, **123K 7,020 tok/s**. 2 GPUs: 7.8K 2,061, 18K 2,702, 65K 3,603, 123K 3,642.
 
-**Totals (4 GPUs, llama-benchy, best mode):** prefill 659-1,265 -> **812-3,601 tok/s** (+23% to +185%), decode mean
-69.5 -> **76.7 tok/s** (+10%); a 65K prompt with the opt-in prompt kernels **5,673 tok/s**. Against the first
-working port: prefill 426-1,121 and decode ~50 tok/s.
+**Totals (4 GPUs, llama-benchy, every optimization on, 2026-10-04):** prefill 659-1,265 -> **1,882-5,958 tok/s**,
+decode mean 69.5 -> **79.0 tok/s**. 2 GPUs: prefill **1,417-3,564**, decode **69.0**. Against the first working
+port: prefill 426-1,121 and decode ~50 tok/s.
 
 ## Build
 
@@ -117,17 +117,34 @@ Method: [llama-benchy](https://github.com/eugr/llama-benchy), `--pp 2048 8192 --
 
 ### 4 GPUs, UD-Q4_K_XL: where it started and where it is
 
-| Test | First port (`--mmap-experts`) | Per-socket arena, BF16 default (2026-10-02) | **`ac922` now (best mode)** |
-|---|---:|---:|---:|
-| Prefill pp2048 | 426 | 659 | **812** |
-| Prefill pp8192 | 755 | 1,106 | **1,583** |
-| Prefill pp2048 @ 16K | 864 | 1,098 | **1,981** |
-| Prefill pp8192 @ 16K | 952 | 1,145 | **2,034** |
-| Prefill pp2048 @ 64K | 1,106 | 1,265 | **3,601** |
-| Prefill pp8192 @ 64K | 1,121 | 1,262 | **3,320** |
-| Decode (mean of the 6 rows) | 50 | 69.5 | **76.7** |
+| Test | First port (`--mmap-experts`) | Per-socket arena, BF16 default (2026-10-02) | Best mode after the 0.1.38 merge | **Every optimization on (2026-10-04)** |
+|---|---:|---:|---:|---:|
+| Prefill pp2048 | 426 | 659 | 812 | **1,882** |
+| Prefill pp8192 | 755 | 1,106 | 1,583 | **3,228** |
+| Prefill pp2048 @ 16K | 864 | 1,098 | 1,981 | **3,857** |
+| Prefill pp8192 @ 16K | 952 | 1,145 | 2,034 | **4,012** |
+| Prefill pp2048 @ 64K | 1,106 | 1,265 | 3,601 | **5,958** |
+| Prefill pp8192 @ 64K | 1,121 | 1,262 | 3,320 | **5,768** |
+| Decode (mean of the 6 rows) | 50 | 69.5 | 76.7 | **79.0** |
 
-The `ac922` column is after the merge of upstream 0.1.38, best mode without the opt-in prompt kernels. The first
+"Every optimization on" is the launch configuration: best mode, `STRATA_FUSED_EXPERTS=1 STRATA_SELECT_VOLTA=1`,
+`--prefill 4096 --prefill-ring 320`, with the default-on kernel fixes of 2026-10-04 (fused experts v2, the coalesced
+Q8_0 and expert dequantizers). The third column is best mode without the opt-in prompt kernels.
+
+### 2 GPUs, UD-Q4_K_XL, every optimization on (2026-10-04)
+
+`--prefill auto --pcie-frac 0.6 --pool-workers 39`, `STRATA_VSX_EXPERTS=1 STRATA_POOL_SMT=2` and the prompt kernels
+above:
+
+| Test | Prefill | Decode |
+|---|---:|---:|
+| pp2048 | 1,417 | 63.4 |
+| pp8192 | 2,227 | 67.7 |
+| pp2048 @ 16K | 2,570 | 72.1 |
+| pp8192 @ 16K | 2,619 | 70.1 |
+| pp2048 @ 64K | 3,564 | 72.4 |
+| pp8192 @ 64K | 3,474 | 68.5 |
+| **Mean decode** | | **69.0** | The first
 column is the first working port with the CPU-affinity fix; before that fix a 2K prompt read at 38 tok/s.
 
 ### Long prompts with the opt-in prompt kernels (4 GPUs, one 64,907-token prompt, server log)
