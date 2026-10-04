@@ -1225,6 +1225,22 @@ __device__ __forceinline__ void get_scale_min_k4(int j, const uint8_t* q, uint8_
         m = (q[j + 4] >> 4) | ((q[j - 0] >> 6) << 4);
     }
 }
+// N consecutive values from registers in 16- or 8-byte stores (p aligned to the store); 2-byte stores left the
+// prompt path's expert dequant at ~290 GB/s
+template<typename T, int N>
+__device__ __forceinline__ void store_vec(T* p, const T (&v)[N]) {
+    constexpr int B = (int) sizeof(T) * N;
+    if constexpr (B % 16 == 0) {
+#pragma unroll
+        for (int i = 0; i < B / 16; ++i) ((uint4*) p)[i] = ((const uint4*) v)[i];
+    } else if constexpr (B % 8 == 0) {
+#pragma unroll
+        for (int i = 0; i < B / 8; ++i) ((uint2*) p)[i] = ((const uint2*) v)[i];
+    } else {
+#pragma unroll
+        for (int i = 0; i < N; ++i) p[i] = v[i];
+    }
+}
 template<typename dst_t>
 __device__ void dq_q4_k(const void* vx, int64_t ibs, dst_t* yy, int tid) {
     const block_q4_K* x = (const block_q4_K*) vx;
@@ -1239,10 +1255,13 @@ __device__ void dq_q4_k(const void* vx, int64_t ibs, dst_t* yy, int tid) {
     const float d1 = dall * sc, m1 = dmin * m;
     get_scale_min_k4((int) is + 1, x[ibs].scales, sc, m);
     const float d2 = dall * sc, m2 = dmin * m;
+    __align__(16) dst_t lo[n], hi[n];
     for (int l = 0; l < n; ++l) {
-        y[l + 0] = cvt<dst_t>(d1 * (q[l] & 0xF) - m1);
-        y[l + 32] = cvt<dst_t>(d2 * (q[l] >> 4) - m2);
+        lo[l] = cvt<dst_t>(d1 * (q[l] & 0xF) - m1);
+        hi[l] = cvt<dst_t>(d2 * (q[l] >> 4) - m2);
     }
+    store_vec(y, lo);
+    store_vec(y + 32, hi);
 }
 template<typename dst_t>
 __device__ void dq_q5_k(const void* vx, int64_t ibs, dst_t* yy, int tid) {
@@ -1292,21 +1311,25 @@ __device__ void dq_q5_1(const void* vx, int64_t ibs, dst_t* yy, int tid) {
     uint32_t qh;
     memcpy(&qh, x[ib].qh, sizeof(qh));
     dst_t* y = yy + 32 * ib;
+    __align__(16) dst_t lo[4], hi[4];
     for (int j = 0; j < 4; ++j) {
         const int iqs = 4 * il + j;                   // llama.cpp's dequantize_q5_1 for value pairs iqs, iqs + 16
         const int xh_0 = ((qh >> (iqs + 0)) << 4) & 0x10;
         const int xh_1 = ((qh >> (iqs + 12))) & 0x10;
-        y[iqs] = cvt<dst_t>((float) ((x[ib].qs[iqs] & 0xf) | xh_0) * dm.x + dm.y);
-        y[iqs + 16] = cvt<dst_t>((float) ((x[ib].qs[iqs] >> 4) | xh_1) * dm.x + dm.y);
+        lo[j] = cvt<dst_t>((float) ((x[ib].qs[iqs] & 0xf) | xh_0) * dm.x + dm.y);
+        hi[j] = cvt<dst_t>((float) ((x[ib].qs[iqs] >> 4) | xh_1) * dm.x + dm.y);
     }
+    store_vec(y + 4 * il, lo);
+    store_vec(y + 4 * il + 16, hi);
 }
 template<typename dst_t>
 __device__ void dq_q8_0(const void* vx, int64_t ibs, dst_t* yy, int tid) {
     const block_q8_0* x = (const block_q8_0*) vx + ibs * (QK_K / QK8_0);
     const int ib = tid % 8, il = tid / 8;
     const float d = __half2float(x[ib].d);
-    dst_t* y = yy + 32 * ib + 8 * il;
-    for (int j = 0; j < 8; ++j) y[j] = cvt<dst_t>((float) x[ib].qs[8 * il + j] * d);
+    __align__(16) dst_t v[8];
+    for (int j = 0; j < 8; ++j) v[j] = cvt<dst_t>((float) x[ib].qs[8 * il + j] * d);
+    store_vec(yy + 32 * ib + 8 * il, v);
 }
 
 // BF16 (the token embedding as the checkpoint ships it, tools/embd_bf16_pack.py): 8 values per thread.
@@ -1341,16 +1364,21 @@ __device__ __forceinline__ void dq_dispatch(int ty, const void* vx, int64_t ibs,
     }
 }
 
+// DQ_SB superblocks per block (one warp each): a 32-thread block per superblock kept a third of the SMs' warp slots
+// idle (~290 GB/s on a Q4_K expert)
+constexpr int DQ_SB = 8;
 // flat: superblock i -> y + 256 i
 template<typename dst_t>
-__global__ void dequant_flat_kernel(int ty, const void* __restrict__ vx, dst_t* __restrict__ y) {
-    const int64_t i = blockIdx.x;
+__global__ void dequant_flat_kernel(int ty, const void* __restrict__ vx, dst_t* __restrict__ y, int64_t nsb) {
+    const int64_t i = (int64_t) blockIdx.x * DQ_SB + threadIdx.y;
+    if (i >= nsb) return;
     dq_dispatch<dst_t>(ty, vx, i, y + i * QK_K, threadIdx.x);
 }
 // gate/up: superblock i of a role matrix (n_embd/256 per row) -> interleaved row 2r + parity
 __global__ void dequant_gu_kernel(int ty, const void* __restrict__ gate, const void* __restrict__ up, int64_t per_row,
-                                  __half* __restrict__ y) {
-    const int64_t i = blockIdx.x;
+                                  __half* __restrict__ y, int64_t nsb) {
+    const int64_t i = (int64_t) blockIdx.x * DQ_SB + threadIdx.y;
+    if (i >= nsb) return;
     const int parity = blockIdx.y;
     const int64_t r = i / per_row, c = i % per_row;
     dq_dispatch<__half>(ty, parity ? up : gate, i, y + ((2 * r + parity) * per_row + c) * QK_K, threadIdx.x);
@@ -1469,7 +1497,8 @@ void iq_mmvq(int t, const void* w, const void* x_q8_1, float* y, int n_in, int n
 
 void iq_dequant_f16(int t, const void* src, int64_t n, uint16_t* dst, void* stream) {
     if (n % 256 != 0 || !is_iq(t)) { std::fprintf(stderr, "iq_dequant_f16: bad arguments\n"); std::exit(1); }
-    dequant_flat_kernel<__half><<<(unsigned) (n / 256), 32, 0, (cudaStream_t) stream>>>(t, src, (__half*) dst);
+    dequant_flat_kernel<__half><<<(unsigned) ((n / 256 + DQ_SB - 1) / DQ_SB), dim3(32, DQ_SB), 0, (cudaStream_t) stream>>>(
+        t, src, (__half*) dst, n / 256);
     check("iq_dequant_f16");
 }
 
@@ -1494,7 +1523,8 @@ void iq_embed_rows(int t, const void* table, size_t row_bytes, const int32_t* to
 
 void iq_dequant_f32(int t, const void* src, int64_t n, float* dst, void* stream) {
     if (n % 256 != 0 || !embed_type_supported(t)) { std::fprintf(stderr, "iq_dequant_f32: bad arguments\n"); std::exit(1); }
-    dequant_flat_kernel<float><<<(unsigned) (n / 256), 32, 0, (cudaStream_t) stream>>>(t, src, dst);
+    dequant_flat_kernel<float><<<(unsigned) ((n / 256 + DQ_SB - 1) / DQ_SB), dim3(32, DQ_SB), 0, (cudaStream_t) stream>>>(
+        t, src, dst, n / 256);
     check("iq_dequant_f32");
 }
 
@@ -1502,8 +1532,9 @@ void iq_dequant_gu_f16(int t, const void* gate, const void* up, int64_t n_ff, in
     // checked like the other entry points: an unknown type used to leave `dst` unwritten, a wrong prompt and no error
     if (n_embd % 256 != 0 || !is_iq(t)) { std::fprintf(stderr, "iq_dequant_gu_f16: type %d / %lld\n", t, (long long) n_embd); std::exit(1); }
     const int64_t per_row = n_embd / 256;
-    dequant_gu_kernel<<<dim3((unsigned) (n_ff * per_row), 2), 32, 0, (cudaStream_t) stream>>>(t, gate, up, per_row,
-                                                                                           (__half*) dst);
+    const int64_t nsb = n_ff * per_row;
+    dequant_gu_kernel<<<dim3((unsigned) ((nsb + DQ_SB - 1) / DQ_SB), 2), dim3(32, DQ_SB), 0, (cudaStream_t) stream>>>(
+        t, gate, up, per_row, (__half*) dst, nsb);
     check("iq_dequant_gu_f16");
 }
 
