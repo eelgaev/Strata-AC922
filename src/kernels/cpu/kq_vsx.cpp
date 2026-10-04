@@ -1,4 +1,4 @@
-// src/kernels/cpu/kq_vsx.cpp - see kq_vsx.hpp. Measured on bloom (one POWER9 core, 3.8 GHz, vs ggml-cpu's POWER9
+// src/kernels/cpu/kq_vsx.cpp - see kq_vsx.hpp. Measured on an IBM AC922 (one POWER9 core, 3.8 GHz, vs ggml-cpu's POWER9
 // vec_dot): 640 Q4_K rows 1.7x / 2.1x / 2.3x at 1 / 2 / 3 tokens, 2560 Q5_1 rows 4.3x / 6.5x / 7.7x.
 #include "strata/kernels/cpu/kq_vsx.hpp"
 

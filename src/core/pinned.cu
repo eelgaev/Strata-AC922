@@ -412,7 +412,7 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
                          uint64_t shared_pack_hash) : capacity(bytes) {
     if (bytes == 0) return;
 #if !defined(_WIN32)
-    // bloom (POWER9 + V100, access-counter migration on): memory registered with cudaHostRegister reads at 1-25 GB/s,
+    // an IBM AC922 (POWER9 + V100, access-counter migration on): memory registered with cudaHostRegister reads at 1-25 GB/s,
     // DMA and in place, the larger the worse; cudaHostAlloc's at 68-72 at any size.  So the arena is the driver's,
     // allocated by a thread on the NUMA node of the GPU it is for (the driver puts it on the allocating thread's
     // node).  STRATA_ARENA_HOSTALLOC=0: the registered mapping below, as before.

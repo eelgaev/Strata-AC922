@@ -2,7 +2,7 @@
 # (per expert: gate rows, up rows, down rows - native_expert_layout), behind a 16-byte header
 # "SMTPEXP1" int32 gate/up ggml type, int32 down type; then checks a few experts against Strata's BF16 source tensors.
 import sys, struct, pathlib, numpy as np
-sys.path.insert(0, "/root/Projects/Strata-ppc/tools")
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))   # tools/: gguf_reader.py
 from gguf_reader import GGUFFile
 src, out = sys.argv[1], sys.argv[2]
 H, FF, NE = 2560, 640, 512
