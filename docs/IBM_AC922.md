@@ -40,7 +40,7 @@ UD-Q4_K_XL on 4x V100 unless noted. **Bitwise** = greedy output identical to the
 | `--prefill 4096` on 4 GPUs (config): a mid-size prompt becomes several chunks, so the layer-split stages overlap them, and the prompt buffers borrow fewer expert-cache slots | server config | prompts 7.8K **+34%** (2,021 -> 2,713), 18K **+22%** (3,294 -> 4,009), 2K and 65K the same | chunk boundaries differ (KL across chunk sizes 2048-16384: 0.018-0.025, noise) | `--prefill 4096` |
 | Shared expert: dead BF16 copy dropped, gate sigmoid fused | `shared_expert.cu`, `verify.cpp` | window -0.75% | bitwise | default |
 | Prompt attention on Volta `wmma` (int8 KV) | `qsa_prompt_attn.cu` | attention 2.4-2.7x (405 -> 166 ms per 8K chunk); 65K prompt **+17%** | FP32-level | `STRATA_ATTN_WMMA=1` |
-| Fused W4A16 prompt experts (Q4_K / Q5_1 / Q8_0 dequantized in shared memory, `wmma`, SwiGLU epilogue, 32 experts per launch) | `fused_expert.cu`, `prefill.cpp` | 5.5x / 2.7x / 1.7x vs dequant + cuBLAS (40 / 160 / 320 tokens per expert); prompts **+14-18%** | FP32-level (more accurate than cuBLAS) | `STRATA_FUSED_EXPERTS=1` |
+| Fused W4A16 prompt experts (Q4_K / Q5_1 / Q8_0 dequantized in shared memory, `mma.m8n8k4` on a swizzled tile, SwiGLU epilogue, 32 experts per launch) | `fused_expert.cu`, `prefill.cpp` | 5.5x / 2.7x / 1.7x vs dequant + cuBLAS (40 / 160 / 320 tokens per expert); prompts **+14-18%**, then v2 another 6-13% per layer (+2-3% prompts) | FP32-level (more accurate than cuBLAS) | `STRATA_FUSED_EXPERTS=1` |
 | QSA block selection scores on `wmma` (FP16 hi + lo split) | `qsa_select.cu` | scores 8x at 57K context; 65K prompt **+9%** | FP32-level | `STRATA_SELECT_VOLTA=1` |
 | VSX multi-token CPU expert kernels (Q4_K, Q5_1) | `kq_vsx.cpp`, `native_expert.cpp` | per core vs ggml: Q4_K 1.7-2.3x, Q5_1 **4.3-7.7x** | FP32-level vs ggml (2e-7) | `STRATA_VSX_EXPERTS=1` |
 | SMT2 CPU expert pool | `pool.cpp` | per-core throughput 1.95x | bitwise vs 1 thread per core | `STRATA_POOL_SMT=2` |
@@ -49,7 +49,7 @@ UD-Q4_K_XL on 4x V100 unless noted. **Bitwise** = greedy output identical to the
 | Skip quantizing activations when no expert goes to the CPU | `expert_source.cpp` | 2 GPUs decode -3% window | bitwise | default |
 | VSX BF16 router dot | `portable.cpp` | the router lookahead on POWER | FP32-level | default |
 
-**Long prompts now (4 GPUs, best mode + the opt-in prompt kernels + `--prefill 4096 --prefill-ring 320`, one prompt each):** 18K 4,414, 65K 6,404, **123K 6,604 tok/s**.
+**Long prompts now (4 GPUs, best mode + the opt-in prompt kernels + `--prefill 4096 --prefill-ring 320`, one prompt each):** 18K 4,537, 65K 6,540, **123K 6,783 tok/s**.
 
 **Totals (4 GPUs, llama-benchy, best mode):** prefill 659-1,265 -> **812-3,601 tok/s** (+23% to +185%), decode mean
 69.5 -> **76.7 tok/s** (+10%); a 65K prompt with the opt-in prompt kernels **5,673 tok/s**. Against the first
@@ -190,7 +190,8 @@ else keeps the default outputs.
 | **`STRATA_ATTN_WMMA=1`**: int8-KV prompt attention on Volta `wmma` | attention per 8K chunk 405 -> 166 ms; 65K prompt **+17%** |
 | Decode hc read compiled per token count and weight form (`fused_gr`), loads a row ahead, bank-conflict padding | decode window 32.1 -> 29.9 ms (**+7% decode**), bit-identical |
 | `gdn_ab_multi` per token count | 29.85 -> 29.66 ms/window, bit-identical |
-| **`STRATA_FUSED_EXPERTS=1`**: fused W4A16 prompt experts - Q4_K gate/up and Q5_1/Q8_0 down dequantized tile by tile into shared memory, `wmma`, SwiGLU in the epilogue, 32 experts per launch pair, no FP16 copy of the expert | per expert 5.5x / 2.7x / 1.7x vs dequant + cuBLAS at 40 / 160 / 320 tokens; prompts **+14-18%** |
+| **`STRATA_FUSED_EXPERTS=1`**: fused W4A16 prompt experts - Q4_K gate/up and Q5_1/Q8_0 down dequantized tile by tile into shared memory, tensor cores, SwiGLU in the epilogue, 32 experts per launch pair, no FP16 copy of the expert | per expert 5.5x / 2.7x / 1.7x vs dequant + cuBLAS at 40 / 160 / 320 tokens; prompts **+14-18%** |
+| Fused experts v2 (same outputs, bit for bit): Q4_K scales read from registers (the byte-indexed header went through local memory and stalled each K step on the prefetch), raw `mma.m8n8k4` on an XOR-swizzled tile (sm_70 `wmma` loads have 8-way bank conflicts at any legal stride), independent accumulators issued back to back, MMAs skipped for rows past an expert's last token | per layer at 40 / 80 / 160 tokens per expert: -9% / -13% / -6%; prompts 18K 4,414 -> 4,537, 65K 6,404 -> 6,540, 123K 6,604 -> 6,783 tok/s |
 | **`STRATA_SELECT_VOLTA=1`**: QSA block selection scores on `wmma` (16 queries share each key read; FP32 split into FP16 hi + lo, 3 products) | scores 8x at 57K context; 65K prompt **+9%** |
 
 **Volta's tensor cores truncate when they accumulate.** A long chain of `mma` into one accumulator (K = 2,560: 160
