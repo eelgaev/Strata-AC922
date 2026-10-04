@@ -1,3 +1,26 @@
+> [!NOTE]
+> **This is the `ac922` fork of [Niko1221/Strata](https://github.com/Niko1221/Strata)** for the **IBM Power System
+> AC922** (2x POWER9, 4x V100-SXM2 16 GB, NVLink 2.0, ppc64le, unified memory). It is experimental and not supported
+> upstream. Everything below the line is upstream's README, unchanged.
+>
+> Qwen3.8-Flash-Next **UD-Q4_K_XL** (llama-benchy pp2048/pp8192 at depth 0-64K, MTP `--spec 4`):
+>
+> | | Reads your prompt | Writes answers |
+> |---|---:|---:|
+> | **4x V100** | 1,967-6,353 tok/s (2K-74K); **7,299** on a 249K prompt | 83.4 tok/s (85-87 greedy) |
+> | **2x V100** (one socket) | 1,845-3,785 tok/s; 4,027 at 123K | 73.4 tok/s (72-75 greedy) |
+>
+> What the fork adds: a per-socket page-locked arena and NUMA-aware expert placement, the idle peer GPU fetching
+> over its own NVLink, Volta tensor-core kernels (FP16 weights, prompt attention, fused W4A16 prompt experts, QSA
+> selection), a pipelined layer split, and POWER9 VSX / SMT / per-socket CPU expert pools. Build, run, speed,
+> quality: **[docs/IBM_AC922.md](docs/IBM_AC922.md)**.
+>
+> The fork also runs on an **NVIDIA DGX Spark** (GB10, ARM; experimental, tested with IQ2_XS and UD-Q4_K_XL):
+> `./setup.sh` compiles the engine there, and every expert fits on its GPU (decode 55-62 tok/s, prefill 928-1,515
+> tok/s). Details: [docs/DGX_SPARK.md](docs/DGX_SPARK.md).
+
+---
+
 <h1 align="center">Strata</h1>
 
 **English** · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [Deutsch](README.de.md) · [Français](README.fr.md) · [Español](README.es.md) · [Português](README.pt-BR.md)
@@ -69,15 +92,6 @@ Experimental, written and tested by community members on their own machines:
 - **Older processors without AVX2**: they work, but slowly. [Older CPUs](docs/INSTALL.md#older-cpus-experimental).
 
 The full list: [docs/INSTALL.md](docs/INSTALL.md#what-you-need).
-
-An **NVIDIA DGX Spark** (GB10, ARM) works too (experimental; tested with IQ2_XS and UD-Q4_K_XL): `./setup.sh` compiles the engine
-there, and every expert fits on its GPU (decode 55-62 tok/s, prefill 928-1,515 tok/s). Details:
-[DGX Spark](docs/DGX_SPARK.md).
-
-An **IBM Power System AC922** (POWER9 + 4x V100, NVLink 2.0, ppc64le) works on the `ac922` branch (experimental;
-tested with UD-Q4_K_XL and IQ2_XS): a per-socket page-locked arena, Volta tensor-core kernels (FP16 weights, prompt
-attention, fused expert GEMMs, QSA selection), POWER9 VSX/SMT/NUMA-aware CPU experts. 4 GPUs: prefill 1,882-5,958
-tok/s (7,020 on a 123K prompt), decode ~79 tok/s; 2 GPUs: prefill 1,417-3,564, decode ~69 tok/s. Details: [IBM AC922](docs/IBM_AC922.md).
 
 ## Install
 
