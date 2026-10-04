@@ -10,6 +10,14 @@
 > | **4x V100** | 1,967-6,353 tok/s (2K-74K); **7,299** on a 249K prompt | 83.4 tok/s (85-87 greedy) |
 > | **2x V100** (one socket) | 1,845-3,785 tok/s; 4,027 at 123K | 73.4 tok/s (72-75 greedy) |
 >
+> Peaks on 4x V100 with a 256K context (`--max-context 262144`; natural text, one request at a time):
+>
+> | | Peak |
+> |---|---:|
+> | Reads your prompt | **7,357 tok/s** (135K tokens); 7,188 at 202K; **7,089 at 252K** (35.5 s) |
+> | Writes answers (512 tokens, greedy) | **113 tok/s** JSON, 103 code, 107 counting, 84 prose |
+> | Follow-up at 252K depth | the whole prompt reused: first token after 0.26 s, then 60 tok/s |
+>
 > What the fork adds: a per-socket page-locked arena and NUMA-aware expert placement, the idle peer GPU fetching
 > over its own NVLink, Volta tensor-core kernels (FP16 weights, prompt attention, fused W4A16 prompt experts, QSA
 > selection), a pipelined layer split, and POWER9 VSX / SMT / per-socket CPU expert pools. Build, run, speed,
