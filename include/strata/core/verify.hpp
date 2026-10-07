@@ -261,7 +261,9 @@ private:
     std::atomic<bool> released_{false};  ///< #267: release_gpu_waits ran (maybe on the watchdog thread): no more windows
     bool all_resident_ = false;           ///< 100% of experts in [lb_, le_) resident in VRAM: zero-doorbell graph
     bool device_plan_ = false;            ///< E-6: resident-only layers planned on the device (STRATA_VERIFY_DEVICE_PLAN)
+    bool resident_ = false;               ///< STRATA_VERIFY_RESIDENT: every expert resident, no host step per layer
     uint32_t* skip_ = nullptr;            ///< E-6: per group, the ring whose plan the device built (0: the host's)
+    unsigned* qcnt_ = nullptr;             ///< S26 STRATA_QFUSE: the HC read's q8_1 group counters (n_embd / 32)
     unsigned long long* slot_off_d_ = nullptr;   ///< E-6: the slot offsets on the device
     int64_t lb_ = 0, le_ = -1;           ///< set_stage: the layers this verifier runs (-1: to the last)
     const float* hand_in_ = nullptr;
@@ -294,6 +296,8 @@ private:
     VerifyHits hits_;
     const NativeHead* head_ = nullptr;
     int max_t_ = 0;
+    float* ple_key_ = nullptr;   ///< STRATA_PLE_BATCH: the window rows' PLE key / value projections
+    float* ple_val_ = nullptr;
     int last_t_ = 0;
     int64_t last_pos0_ = 0;
     int32_t last_tokens_[8] = {};

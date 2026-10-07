@@ -48,11 +48,16 @@
 #include <immintrin.h>
 #endif
 
+#ifdef STRATA_NATIVE_EXPERTS
+#include "ggml.h"   // --mtp-q4: the head rows' and projections' formats, dequantized and requantized at load
+#endif
+
 namespace strata::core {
 namespace {
 
 constexpr float EPS = 1e-6f;
 constexpr int GGML_Q8_0 = 8;
+constexpr int GGML_Q4_0 = 2;
 using Clock = std::chrono::steady_clock;
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
 
@@ -116,6 +121,7 @@ MtpDrafter::~MtpDrafter() {
     for (auto& e : prefill_exec_) if (e) cudaGraphExecDestroy(e);
     for (auto& e : prefill_dev_exec_) if (e) cudaGraphExecDestroy(e);
     if (pf_dev_) cudaFree(pf_dev_);
+    if (dense4_) cudaFree(dense4_);
     for (auto& e : round_exec_) if (e) cudaGraphExecDestroy(e);
     for (auto& e : step_exec_) if (e) cudaGraphExecDestroy(e);
     for (auto& e : round_exec_c_) if (e) cudaGraphExecDestroy(e);
@@ -133,7 +139,7 @@ MtpDrafter::~MtpDrafter() {
     if (state_arena_) cudaFree(state_arena_);
     if (arena_) cudaFree(arena_);
     if (head_logits_) cudaFree(head_logits_);
-    if (dhead_) cudaFree(dhead_);
+    if (dhead_) { strata::kernels::native_q6_k_unpack(dhead_); cudaFree(dhead_); }
     if (dvocab_) cudaFree(dvocab_);
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_row_, h_out_, h_prob_};
     for (void* h : hosts) if (h) cudaFreeHost(h);
@@ -150,6 +156,74 @@ const uint16_t* MtpDrafter::bf16(const char* name) const {
 const void* MtpDrafter::q8(const char* name) const {
     for (const auto& t : tensors_) if (t.name == name && t.kind == "q8_0") return dense_ + t.off;
     return nullptr;
+}
+const void* MtpDrafter::wq(const char* name, int& type) const {
+    if (dense4_ != nullptr)
+        for (const auto& e : q4_off_)
+            if (e.first == name) { type = GGML_Q4_0; return dense4_ + e.second; }
+    type = GGML_Q8_0;
+    return q8(name);
+}
+
+// --mtp-q4: every Q8_0 tensor of dense.bin as Q4_0 (ggml's reference quantizer), in one device buffer
+bool MtpDrafter::make_q4_dense(const std::vector<uint8_t>& blob, std::string& err) {
+#ifdef STRATA_NATIVE_EXPERTS
+    uint64_t total = 0;
+    std::vector<std::pair<const Tensor*, uint64_t>> plan;
+    for (const auto& t : tensors_) {
+        if (t.kind != "q8_0" || t.cols % 32 != 0) continue;
+        plan.push_back({&t, total});
+        total += ((uint64_t) t.rows * (uint64_t) (t.cols / 32) * 18 + 255) & ~255ull;
+    }
+    std::vector<uint8_t> host((size_t) total);
+    std::vector<float> row;
+    const auto* q8t = ggml_get_type_traits(GGML_TYPE_Q8_0);
+    for (const auto& [t, off] : plan) {
+        row.resize((size_t) t->cols);
+        const uint64_t in_row = (uint64_t) (t->cols / 32) * 34, out_row = (uint64_t) (t->cols / 32) * 18;
+        for (int64_t r = 0; r < t->rows; ++r) {
+            q8t->to_float(blob.data() + t->off + (uint64_t) r * in_row, row.data(), t->cols);
+            ggml_quantize_chunk(GGML_TYPE_Q4_0, row.data(), host.data() + off + (uint64_t) r * out_row, 0, 1, t->cols,
+                                nullptr);
+        }
+        q4_off_.push_back({t->name, off});
+    }
+    if (cudaMalloc((void**) &dense4_, (size_t) total) != cudaSuccess) { err = "mtp: the Q4_0 projections do not fit"; return false; }
+    cudaMemcpy(dense4_, host.data(), (size_t) total, cudaMemcpyHostToDevice);
+    vram_ += total;
+    std::fprintf(stderr, "strata mtp: --mtp-q4: %zu projections as Q4_0 (%.1f MiB)\n", plan.size(), (double) total / 1048576.0);
+    return true;
+#else
+    (void) blob;
+    err = "mtp: --mtp-q4 needs a build with native experts (ggml)";
+    return false;
+#endif
+}
+
+// --mtp-q4: the draft head's subset rows as Q4_0 (dequantized from the main head's format)
+bool MtpDrafter::make_q4_head(std::string& err) {
+#ifdef STRATA_NATIVE_EXPERTS
+    const int64_t N = g_->n_embd;
+    const auto* tt = ggml_get_type_traits((ggml_type) head_->type());
+    if (tt == nullptr || tt->to_float == nullptr || N % 32 != 0) { err = "mtp: --mtp-q4 cannot read the head's format"; return false; }
+    const size_t in_row = head_->row_bytes(), out_row = (size_t) (N / 32) * 18;
+    std::vector<uint8_t> src((size_t) n_dvocab_ * in_row), dst((size_t) n_dvocab_ * out_row);
+    if (cudaMemcpy(src.data(), dhead_, src.size(), cudaMemcpyDeviceToHost) != cudaSuccess) { err = "mtp: reading the draft head"; return false; }
+    std::vector<float> row((size_t) N);
+    for (int64_t r = 0; r < n_dvocab_; ++r) {
+        tt->to_float(src.data() + (size_t) r * in_row, row.data(), N);
+        ggml_quantize_chunk(GGML_TYPE_Q4_0, row.data(), dst.data() + (size_t) r * out_row, 0, 1, N, nullptr);
+    }
+    // the Q4_0 rows replace the subset in place (they are smaller)
+    if (cudaMemcpy(dhead_, dst.data(), dst.size(), cudaMemcpyHostToDevice) != cudaSuccess) { err = "mtp: writing the draft head"; return false; }
+    dhead_type_ = GGML_Q4_0;
+    std::fprintf(stderr, "strata mtp: --mtp-q4: draft head over %lld tokens as Q4_0 (%.1f MiB read per step, was %.1f)\n",
+                 (long long) n_dvocab_, (double) dst.size() / 1048576.0, (double) src.size() / 1048576.0);
+    return true;
+#else
+    err = "mtp: --mtp-q4 needs a build with native experts (ggml)";
+    return false;
+#endif
 }
 
 const uint16_t* MtpDrafter::tensor_f16(const char* name) const {
@@ -195,6 +269,7 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
         }
         cudaMemcpy(dense_, blob.data(), blob.size(), cudaMemcpyHostToDevice);
         vram_ += blob.size();
+        if (q4_ && !make_q4_dense(blob, err)) return false;
     }
     // ---- STRATA_FP16_MTP=1: FP16 copies of the BF16 weights the prompt path's GEMMs read (exact: BF16 values in
     //      FP16's range; the count of values that became FP16 subnormals or zero is reported)
@@ -389,10 +464,44 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     return true;
 }
 
+namespace {
+// STRATA_MTP_FULL_HEAD=1 (a diagnostic): draft over the whole vocabulary (the main head itself) instead of
+// rt/draft_vocab.bin's subset - the reference head, to measure what the subset costs in acceptance
+bool full_head_env() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_MTP_FULL_HEAD"); return v && v[0] == '1'; }();
+    return on;
+}
+}  // namespace
+
+bool MtpDrafter::top2_env() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_MTP_TOP2"); return v && v[0] == '1'; }();
+    return on;
+}
+
+// STRATA_MTP_TOP2=1 (a diagnostic for tree drafts): draft j's runner-up under the draft layer, from the head logits
+// the step just wrote (row 0), on the host.  Slow; only for measuring what a second branch would have caught.
+void MtpDrafter::record_top2(int j) {
+    const int64_t nv = dhead_ != nullptr ? n_dvocab_ : n_vocab_;
+    if ((int64_t) lg_host_.size() < nv) lg_host_.resize((size_t) nv);
+    if ((int) top2_.size() < max_t_) top2_.assign((size_t) max_t_, -1);
+    if (j < 0 || j >= max_t_) return;
+    if (cudaMemcpy(lg_host_.data(), head_logits_, (size_t) nv * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) {
+        top2_[(size_t) j] = -1;
+        return;
+    }
+    int64_t b1 = -1, b2 = -1;
+    for (int64_t i = 0; i < nv; ++i) {
+        const float v = lg_host_[(size_t) i];
+        if (b1 < 0 || v > lg_host_[(size_t) b1]) { b2 = b1; b1 = i; }
+        else if (b2 < 0 || v > lg_host_[(size_t) b2]) b2 = i;
+    }
+    top2_[(size_t) j] = b2 < 0 ? -1 : dhead_ != nullptr ? dvocab_host_[(size_t) b2] : (int32_t) b2;
+}
+
 uint64_t MtpDrafter::bind_bytes(uint64_t head_row_bytes, int64_t n_vocab) const {
     uint64_t bytes = head_logits_ ? 0 : (uint64_t) max_t_ * (uint64_t) n_vocab * sizeof(float);
-    if (dhead_ == nullptr) {
-        if (FILE* f = std::fopen((rt_dir_ + "/draft_vocab.bin").c_str(), "rb")) {
+    if (dhead_ == nullptr && !full_head_env()) {
+        if (FILE* f = std::fopen(vocab_file().c_str(), "rb")) {
             std::fseek(f, 0, SEEK_END);
             const long size = std::ftell(f);
             std::fclose(f);
@@ -514,9 +623,9 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
         return false;
     }
     // the draft head's token subset, when tools/draft_vocab.py wrote one
-    if (dhead_ == nullptr) {
+    if (dhead_ == nullptr && !full_head_env()) {
         std::vector<uint8_t> raw;
-        if (read_file(rt_dir_ + "/draft_vocab.bin", raw) && raw.size() >= 4 && raw.size() % 4 == 0) {
+        if (read_file(vocab_file(), raw) && raw.size() >= 4 && raw.size() % 4 == 0) {
             n_dvocab_ = (int64_t) (raw.size() / 4);
             const int64_t row_bytes = (int64_t) head->row_bytes();   // a vocabulary row of the native head
             if (cudaMalloc((void**) &dvocab_, raw.size()) != cudaSuccess ||
@@ -526,11 +635,18 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
                 return false;
             }
             cudaMemcpy(dvocab_, raw.data(), raw.size(), cudaMemcpyHostToDevice);
+            dvocab_host_.resize((size_t) n_dvocab_);
+            std::memcpy(dvocab_host_.data(), raw.data(), raw.size());
             strata::kernels::gather_rows((const uint8_t*) head->weights(), row_bytes, dvocab_, n_dvocab_, dhead_, nullptr);
             cudaDeviceSynchronize();
             vram_ += (uint64_t) (n_dvocab_ * row_bytes) + raw.size();
             std::fprintf(stderr, "strata mtp: draft head over %lld tokens (%.1f MiB)\n", (long long) n_dvocab_,
                          (double) (n_dvocab_ * row_bytes) / 1048576.0);
+            dhead_type_ = head->type();
+            if (q4_head_ && !make_q4_head(err)) return false;
+            if (dhead_type_ == 14 && strata::kernels::native_q6_k_packed_enabled())   // STRATA_Q6_PACKED=1
+                strata::kernels::native_q6_k_pack(dhead_, (int) (row_bytes / 210) * 256, (int) n_dvocab_,
+                                                  "MTP draft head");
         }
     }
     if (coupled_draft_env() && cparams_ == nullptr && !setup_coupled(err)) return false;
@@ -551,6 +667,14 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
     const GrShapes gs{g.n_embd, g.hc, g.hc_lr};
     const int32_t* step = step_ + row0 * 4;
     const int32_t* pos = pos_ + row0 * NH;
+    // --mtp-q4: each projection's format and weights for this pass (Q8_0 unless the Q4_0 copies exist)
+    int wt_fc_embedding, wt_fc_hidden, wt_k_proj, wt_v_proj, wt_q_proj, wt_o_proj;
+    const void* wp_fc_embedding = wq("fc_embedding.weight", wt_fc_embedding);
+    const void* wp_fc_hidden = wq("fc_hidden.weight", wt_fc_hidden);
+    const void* wp_k_proj = wq("self_attn.k_proj.weight", wt_k_proj);
+    const void* wp_v_proj = wq("self_attn.v_proj.weight", wt_v_proj);
+    const void* wp_q_proj = wq("self_attn.q_proj.weight", wt_q_proj);
+    const void* wp_o_proj = wq("self_attn.o_proj.weight", wt_o_proj);
     try {
         // ---- the two input branches
         const WeightRef* we = wt_->find("token_embd.weight");
@@ -566,12 +690,15 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
         }
         native_qsa_rms_norm_weighted(emb_, f32("pre_fc_norm_embedding.weight"), en_, (int) N, T, EPS, cs);
         native_quantize_q8_1(en_, xq_, (int) N, T, cs);
-        native_mmvq(GGML_Q8_0, q8("fc_embedding.weight"), xq_, e2_, (int) N, (int) N, T, cs);
-        native_qsa_rms_norm_weighted(Rin_, f32("pre_fc_norm_hidden.weight"), hn_, (int) (HC * N), T, EPS, cs);
+        native_mmvq(wt_fc_embedding, wp_fc_embedding, xq_, e2_, (int) N, (int) N, T, cs);
+        if (hnorm_stream_)   // --mtp-hnorm stream: one RMS per stream, each scaled by its slice of the weight
+            native_qsa_rms_norm_grouped(Rin_, f32("pre_fc_norm_hidden.weight"), hn_, (int) N, (int) HC, (int) (T * HC), EPS, cs);
+        else
+            native_qsa_rms_norm_weighted(Rin_, f32("pre_fc_norm_hidden.weight"), hn_, (int) (HC * N), T, EPS, cs);
         for (int c0 = 0; c0 < T * HC; c0 += 8) {
             const int nc = (int) std::min<int64_t>(8, T * HC - c0);
             native_quantize_q8_1(hn_ + (size_t) c0 * N, xq_, (int) N, nc, cs);
-            native_mmvq(GGML_Q8_0, q8("fc_hidden.weight"), xq_, h2_ + (size_t) c0 * N, (int) N, (int) N, nc, cs);
+            native_mmvq(wt_fc_hidden, wp_fc_hidden, xq_, h2_ + (size_t) c0 * N, (int) N, (int) N, nc, cs);
         }
         add_streams_broadcast(h2_, e2_, R_, N, (int) HC, T, cs);
         // ---- the attention hyper-connection
@@ -595,8 +722,8 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
             else rope_neox_apply(data, data, rows, cols, (int) s.n_rot, st_.cos_tab, st_.sin_tab, p, cs);
         };
         native_quantize_q8_1(mixed_, xq_, (int) N, T, cs);
-        native_mmvq(GGML_Q8_0, q8("self_attn.k_proj.weight"), xq_, kcur_, (int) N, (int) (NKV * HD), T, cs);
-        native_mmvq(GGML_Q8_0, q8("self_attn.v_proj.weight"), xq_, vcur_, (int) N, (int) (NKV * HD), T, cs);
+        native_mmvq(wt_k_proj, wp_k_proj, xq_, kcur_, (int) N, (int) (NKV * HD), T, cs);
+        native_mmvq(wt_v_proj, wp_v_proj, xq_, vcur_, (int) N, (int) (NKV * HD), T, cs);
         for (int t = 0; t < T; ++t) {
             norm_rope(kcur_ + t * NKV * HD, f32("self_attn.k_norm.weight"), (int) NKV, (int) HD, pos + t * NH);
             if (st_.kv_rot) {   // rotated K and V (kv_q4.hpp): Q4_0, and INT8 with STRATA_KV_ROT=1
@@ -615,7 +742,7 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
                                vcur_ + t * NKV * HD, s, cs, &st_.host);
         }
         if (!full) return true;
-        native_mmvq(GGML_Q8_0, q8("self_attn.q_proj.weight"), xq_, qfull_, (int) N, (int) (NH * 2 * HD), T, cs);
+        native_mmvq(wt_q_proj, wp_q_proj, xq_, qfull_, (int) N, (int) (NH * 2 * HD), T, cs);
         for (int t = 0; t < T; ++t) {
             float* qc = qcur_ + t * NH * HD;
             if (cudaMemcpy2DAsync(qc, (size_t) HD * 4, qfull_ + t * NH * 2 * HD, (size_t) HD * 2 * 4, (size_t) HD * 4,
@@ -633,7 +760,7 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
         for (int t = 0; t < T; ++t)
             native_qsa_gate_apply(attn_ + t * NH * HD, qfull_ + t * NH * 2 * HD, attn32_ + t * NH * HD, (int) NH, (int) HD, cs);
         native_quantize_q8_1(attn32_, xq_, (int) (NH * HD), T, cs);
-        native_mmvq(GGML_Q8_0, q8("self_attn.o_proj.weight"), xq_, bo_, (int) (NH * HD), (int) N, T, cs);
+        native_mmvq(wt_o_proj, wp_o_proj, xq_, bo_, (int) (NH * HD), (int) N, T, cs);
         // ---- the MLP hyper-connection (the attention write folded in)
         {
             FusedGrArgs fa[kFusedGrMaxT];
@@ -668,9 +795,9 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
                        hit_xs_, hit_scratch_, parts_, cs);
         }
         NativeSharedWeights nsw;
-        nsw.gate_type = GGML_Q8_0; nsw.gate_data = q8("mlp.shared_expert.gate_proj.weight");
-        nsw.up_type = GGML_Q8_0; nsw.up_data = q8("mlp.shared_expert.up_proj.weight");
-        nsw.down_type = GGML_Q8_0; nsw.down_data = q8("mlp.shared_expert.down_proj.weight");
+        nsw.gate_data = wq("mlp.shared_expert.gate_proj.weight", nsw.gate_type);
+        nsw.up_data = wq("mlp.shared_expert.up_proj.weight", nsw.up_type);
+        nsw.down_data = wq("mlp.shared_expert.down_proj.weight", nsw.down_type);
         nsw.q8_1 = xq_;
         const SForm none{};
         const bool need_bf16_x = !shared_expert_native_bf16_enabled();
@@ -714,7 +841,8 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
         native_quantize_q8_1(sample_, xq_, (int) N, T, cs);
         const bool sub = dhead_ != nullptr;
         const int64_t nv = sub ? n_dvocab_ : n_vocab_;
-        native_mmvq(head_->type(), sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N, (int) nv, T, cs);
+        native_mmvq(sub ? dhead_type_ : head_->type(), sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N,
+                    (int) nv, T, cs);
         if (coupled_rec_) {
             // coupled draft sampling: the target's chain and Philox draw for the row that will verify this draft
             // (counter = this cell + 1, from its step record), penalties over the ring; T == 1 (full layer)

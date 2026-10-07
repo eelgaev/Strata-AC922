@@ -79,9 +79,14 @@ void shared_expert(const uint8_t* x_q8_0, const uint8_t* x_q8k, const uint16_t* 
 /// `x` (n_tok, n_embd) f32, `x_bf16` the same rounded (only read when the native BF16 gate is off), `gate`/`up`
 /// (n_tok, n_ff) scratch, `g` n_tok floats, `out` (n_tok, n_embd).  `nw.q8_1` must hold n_tok columns of n_embd.
 /// `gate_inp_form`: the scalar gate's stored form (STRATA_FP16=load: F32 or FP16; those need the native gate).
+/// x_q8_1_ready: the q8_1 image of x (n_tok rows), already quantized by the caller with the same quantizer (the
+/// same bytes native_quantize_q8_1 writes): its gate/up read it and x is not quantized again, and the SwiGLU and
+/// its q8_1 run as one launch (same values). Null: the separate launches.
 void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, const NativeSharedWeights& nw,
                          const void* gate_inp_bf16, float* gate, float* up, float* g, float* out, int64_t n_embd,
-                         int64_t n_ff, void* stream, WForm gate_inp_form = WForm::Bf16);
+                         int64_t n_ff, void* stream, const void* x_q8_1_ready = nullptr,
+                         int lfuse = 0,   // S26 STRATA_LFUSE: bit 0 gate computed + applied by the caller, bit 1 gate/up pair
+                         WForm gate_inp_form = WForm::Bf16);
 
 /// The MoE block's final combination, `ref/moe.py::moe` L156:
 ///

@@ -488,7 +488,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # what composes them into a token.  No tokenizer - the prompt arrives as ids - because Gate C1 compares logits
   # against llama.cpp on the SAME ids and a tokenizer on one side of that comparison is a second variable.
   # plan v0.3 P5: batched prompt processing (tensor-core GEMMs through cuBLAS).
-  add_library(strata_prefill STATIC src/prefill/gemm.cu src/prefill/kernels.cu src/prefill/prefill.cpp)
+  add_library(strata_prefill STATIC src/prefill/gemm.cu src/prefill/wmma_gemm.cu src/prefill/kernels.cu src/prefill/prefill.cpp)
   target_include_directories(strata_prefill PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
   target_link_libraries(strata_prefill PUBLIC strata_engine ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target})
   if(STRATA_ENABLE_HIP AND STRATA_HIPBLASLT_AVAILABLE)
@@ -551,6 +551,17 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       add_test(NAME hip_prefill_native_batch COMMAND hip_prefill_native_batch)
       list(APPEND _strata_hip_tests hip_prefill_native_batch)
     endif()
+    # Aurora: the prompt GDN recurrence's per-head kernel against the column-split + norm kernels, bitwise
+    add_executable(hip_gdn_rec_head tests/hip/gdn_rec_head.cpp)
+    target_link_libraries(hip_gdn_rec_head PRIVATE strata_prefill strata_hip_runtime)
+    add_test(NAME hip_gdn_rec_head COMMAND hip_gdn_rec_head)
+    list(APPEND _strata_hip_tests hip_gdn_rec_head)
+    # #313: the RDNA3 / RDNA3.5 WMMA dense GEMMs (opt-in STRATA_WMMA_GEMM=1) against a reference
+    add_executable(hip_prefill_wmma_gemm_parity tests/hip/prefill_wmma_gemm_parity.cpp)
+    target_include_directories(hip_prefill_wmma_gemm_parity PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/prefill")
+    target_link_libraries(hip_prefill_wmma_gemm_parity PRIVATE strata_prefill strata_hip_runtime)
+    add_test(NAME hip_prefill_wmma_gemm_parity COMMAND hip_prefill_wmma_gemm_parity)
+    list(APPEND _strata_hip_tests hip_prefill_wmma_gemm_parity)
     # S6: the AMD fast router against the portable kernel, bitwise
     add_executable(hip_router_fast tests/hip/router_fast.cpp)
     target_link_libraries(hip_router_fast PRIVATE strata_kernels strata_hip_runtime)
@@ -903,7 +914,8 @@ endif()
 #     worse opt-out.  `cpu_require_expert_support()` therefore refuses at startup on a CPU without the
 #     features, and the fallback exists for tests, exactly as P2.S3 specifies.
 # Plan v0.3 P6: speculation components that need no GPU.
-add_library(strata_spec STATIC src/spec/suffix_drafter.cpp src/spec/controller.cpp src/spec/draft_policy.cpp)
+add_library(strata_spec STATIC src/spec/suffix_drafter.cpp src/spec/controller.cpp src/spec/draft_policy.cpp
+            src/spec/draft_source.cpp)
 target_include_directories(strata_spec PUBLIC include)
 if(STRATA_BUILD_TESTS)
   add_executable(suffix_drafter_test src/spec/suffix_drafter_test.cpp)
@@ -1147,14 +1159,20 @@ if(STRATA_NATIVE_EXPERTS)
     if(NOT EXISTS "${_strata_mmq}/common.cuh" OR NOT EXISTS "${_strata_mmq}/quantize.cu")
       message(FATAL_ERROR "The selected GGML source is missing the ggml-cuda MMQ sources: ${_strata_mmq}")
     endif()
+    # Aurora: moe_fused.cu's and moe_fused_iq.cu's gfx11 WMMA kernels for the prompt experts (opt-in STRATA_PF_FUSED=1)
     set(_strata_mmq_sources
       src/prefill/moe_mmq.cu
+      src/prefill/moe_fused.cu
+      src/prefill/moe_fused_iq.cu
       src/prefill/ggml_cuda_host.cu
       "${_strata_mmq}/quantize.cu")
     foreach(_t IN LISTS _strata_mmq_types)
       list(APPEND _strata_mmq_sources "${_strata_mmq}/template-instances/mmq-instance-${_t}.cu")
     endforeach()
     set_source_files_properties(${_strata_mmq_sources} PROPERTIES LANGUAGE HIP)
+    # moe_fused.cu is Strata's own CUDA-shaped source: it takes the HIP compat headers, ggml's MMQ sources do not
+    set_source_files_properties(src/prefill/moe_fused.cu src/prefill/moe_fused_iq.cu
+                                PROPERTIES INCLUDE_DIRECTORIES "${STRATA_HIP_COMPAT_INCLUDE_DIR}")
     add_library(strata_mmq STATIC ${_strata_mmq_sources})
     target_include_directories(strata_mmq
       PRIVATE "${_strata_gg}/include" "${_strata_gg}/src" "${_strata_mmq}"
@@ -1165,7 +1183,20 @@ if(STRATA_NATIVE_EXPERTS)
     endif()
     target_link_libraries(strata_mmq PUBLIC ggml-base hip::host roc::hipblas)
     target_link_libraries(strata_prefill PUBLIC strata_mmq)
-    target_compile_definitions(strata_prefill PUBLIC STRATA_PREFILL_MMQ=1)
+    target_compile_definitions(strata_prefill PUBLIC STRATA_PREFILL_MMQ=1 STRATA_PREFILL_FUSED=1)
+    # Aurora: the gfx11 fused experts against the FP64 reference and MMQ (tests/cuda's test; exit 77 off gfx11)
+    add_executable(hip_prefill_fused_moe tests/cuda/prefill_fused_moe_test.cpp)
+    target_include_directories(hip_prefill_fused_moe PRIVATE "${_strata_gg}/include")
+    target_link_libraries(hip_prefill_fused_moe PRIVATE strata_mmq ggml-base strata_hip_runtime)
+    add_test(NAME hip_prefill_fused_moe COMMAND hip_prefill_fused_moe)
+    set_tests_properties(hip_prefill_fused_moe PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+    list(APPEND _strata_hip_tests hip_prefill_fused_moe)
+    add_executable(hip_prefill_fused_iq tests/cuda/prefill_fused_iq_test.cpp)
+    target_include_directories(hip_prefill_fused_iq PRIVATE "${_strata_gg}/include")
+    target_link_libraries(hip_prefill_fused_iq PRIVATE strata_mmq ggml-base strata_hip_runtime)
+    add_test(NAME hip_prefill_fused_iq COMMAND hip_prefill_fused_iq)
+    set_tests_properties(hip_prefill_fused_iq PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+    list(APPEND _strata_hip_tests hip_prefill_fused_iq)
 
     # Numerical diagnostic: synthetic layouts by default, optional first-expert IQ3_XXS/IQ4_NL check with a pack.
     add_executable(hip_prefill_mmq_parity tests/hip/prefill_mmq_parity.cpp)

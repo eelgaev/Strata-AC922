@@ -29,7 +29,12 @@ public:
     /// Below sm_80 (no BF16 tensor cores): Volta converts both to FP16 and runs the FP16 tensor-core GEMM (Turing with
     /// STRATA_BF16_TC=1), Pascal widens both to fp32 (cublasSgemm); see gemm.cu.
     void bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy = 0,
-              float beta = 0.0f);
+              float beta = 0.0f, int64_t ldx = 0);
+
+    /// S (STRATA_HCD_EXACT): the HC down projection (N 320, K 10240) by the WMMA kernel that reproduces hipBLASLt's
+    /// solution 1176 / 1177 bit for bit; false (nothing launched) unless hipBLASLt would take one of those for this
+    /// shape (so the caller falls back to bf16(), with the same ldx).
+    bool bf16_hcd_exact(const uint16_t* X, int64_t ldx, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K);
 
     /// Y = X . W^T with both in FP32 (STRATA_FP16=load: the F32 gates).
     void f32(const float* X, const float* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy = 0,
@@ -39,9 +44,10 @@ public:
     void f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy = 0,
              float beta = 0.0f);
 
-    /// W given as native GGUF blocks of `ggml_type`, dequantized to FP16 in the scratch, X in FP16.
+    /// W given as native GGUF blocks of `ggml_type`, dequantized to FP16 in the scratch, X in FP16.  `ldx` (> K) is
+    /// X's padded row stride, taken only by STRATA_PF_PAD's path (0 = K).
     void native(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
-                int64_t ldy = 0, float beta = 0.0f);
+                int64_t ldy = 0, float beta = 0.0f, int64_t ldx = 0);
 
     /// Caller-owned buffers only: the scratch and workspace moved (the prompt path laid its buffers out again).
     void rebind(uint16_t* scratch, int64_t scratch_elems, void* workspace, size_t ws_bytes);

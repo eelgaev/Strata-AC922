@@ -48,6 +48,20 @@ public:
     void set_prompt_len(int64_t n) { prompt_len_ = n; }
     /// At most this many drafts per round (below max_t - 1): a window longer than the MTP's comes from elsewhere.
     void set_max_drafts(int k) { max_drafts_ = k; }
+    /// --mtp-hnorm stream (opt-in; before the first draft or prefill): pre_fc_norm_hidden normalizes each
+    /// hyper-connection stream on its own, as llama.cpp's qwen4exp MTP graph does, instead of one RMS over all four.
+    void set_hnorm_per_stream(bool on) { hnorm_stream_ = on; }
+    bool hnorm_per_stream() const { return hnorm_stream_; }
+    /// --mtp-q4 (opt-in; before load): the draft layer's Q8_0 projections and its draft head run from 4-bit (Q4_0)
+    /// copies made at load/bind - fewer bytes per draft step; drafts only, the verify window decides every token.
+    /// (The prompt path's batched K/V pass keeps the Q8_0 originals.)
+    void set_q4(bool proj, bool head) { q4_ = proj; q4_head_ = head; }
+    /// --mtp-draft-vocab FILE (opt-in; before bind): the draft head's token subset from FILE instead of
+    /// rt/draft_vocab.bin (e.g. data/draft_vocab_en.bin, 40K tokens)
+    void set_draft_vocab(const std::string& path) { dvocab_path_ = path; }
+    /// STRATA_MTP_TOP2=1 (diagnostic): draft j's runner-up token in the last draft() (-1 = unknown)
+    static bool top2_env();
+    int32_t top2(int j) const { return j >= 0 && j < (int) top2_.size() ? top2_[(size_t) j] : -1; }
     uint64_t vram_bytes() const { return vram_; }
     /// The draft layer's K/V state (read-only: --serve's STRATA_STATE_HASH check hashes it)
     const QsaState& kv_state() const { return st_; }
@@ -134,6 +148,20 @@ private:
     int max_t_ = 0;
     int device_ = -1;   ///< the device `load` ran on: the public calls switch to it (layer split)
     int max_drafts_ = 1 << 30;
+    bool hnorm_stream_ = false;
+    bool q4_ = false, q4_head_ = false;
+    uint8_t* dense4_ = nullptr;              ///< --mtp-q4: Q4_0 copies of the Q8_0 tensors
+    std::vector<std::pair<std::string, uint64_t>> q4_off_;
+    int dhead_type_ = -1;                    ///< the draft head subset's ggml type (the main head's, or Q4_0)
+    std::string dvocab_path_;
+    std::string vocab_file() const { return dvocab_path_.empty() ? rt_dir_ + "/draft_vocab.bin" : dvocab_path_; }
+    /// a projection's weights for the draft layer's own pass: the Q4_0 copy under --mtp-q4, else the Q8_0 original
+    const void* wq(const char* name, int& type) const;
+    bool make_q4_dense(const std::vector<uint8_t>& blob, std::string& err);
+    bool make_q4_head(std::string& err);
+    void record_top2(int j);
+    std::vector<int32_t> top2_, dvocab_host_;
+    std::vector<float> lg_host_;
     int64_t n_vocab_ = 0;
     uint64_t vram_ = 0;
     cudaStream_t cs_ = nullptr;

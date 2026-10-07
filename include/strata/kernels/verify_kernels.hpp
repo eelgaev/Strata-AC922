@@ -37,7 +37,9 @@ void gdn_ab_multi(const float* x, const void* w_alpha, const void* w_beta, const
 /// *n_keep tokens are run and the state is written (commit; `y` may be scratch).  Bitwise `fused_gdn_step_norm`.
 void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const float* gate, const float* beta,
                          const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, int n_tok,
-                         const int32_t* n_keep, void* stream, int t_out_begin = 0);
+                         const int32_t* n_keep, void* stream, int t_out_begin = 0, void* xq_out = nullptr);
+/// (xq_out, S26 STRATA_QFUSE: also write the q8_1 image of output rows [t_out_begin, n_tok) there - the bytes
+/// native_quantize_q8_1(y + t_out_begin * value_dim, xq_out, value_dim, n_tok - t_out_begin) would write.)
 /// Spin until *flag >= value (a mapped host flag).  The value is fixed at capture, so several rings can be
 /// outstanding at once (the split verify window keeps two).
 void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream);

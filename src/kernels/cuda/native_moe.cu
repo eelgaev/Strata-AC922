@@ -31,19 +31,36 @@
 namespace strata::kernels {
 namespace {
 std::atomic<bool> enabled{false};
+// GATED (S26 STRATA_LFUSE): `shared` is the shared expert's unscaled output and sg its raw gate logit per token;
+// the row is scaled here as shared_expert_multi did (native_scalar_sigmoid_multi_kernel's expression, then one
+// rounded multiply = scale_rows_kernel's `out *= g`), then added as before
+template<bool ZADD = false, bool GATED = false>
 __global__ void combine(const float* __restrict__ parts, const float* __restrict__ weights,
                         const float* __restrict__ shared, float* __restrict__ output,
-                        int64_t n_embd, int k) {
+                        int64_t n_embd, int k, const float* __restrict__ sg = nullptr) {
     // blockIdx.y = the token of a multi-token launch (0 for the single one)
     const int64_t tk = blockIdx.y;
     parts += tk * k * n_embd; weights += tk * k; if (shared) shared += tk * n_embd; output += tk * n_embd;
     const int64_t col = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (col >= n_embd) return;
-    float sum = parts[col] * weights[0];
+    // ZADD: a part is 0.0f + hit (the zeroed row plus moe_hit_add of the verify window), rounded as that add
+    float p0 = parts[col];
+    if (ZADD) p0 = 0.0f + p0;
+    float sum = p0 * weights[0];
     for (int expert = 1; expert < k; ++expert) {
-        sum += parts[int64_t(expert) * n_embd + col] * weights[expert];
+        float p = parts[int64_t(expert) * n_embd + col];
+        if (ZADD) p = 0.0f + p;
+        sum += p * weights[expert];
     }
-    if (shared) sum += shared[col];
+    if constexpr (GATED) {
+        // contraction off in this block only: the product is rounded on its own (scale_rows' store), then added
+#pragma clang fp contract(off)
+        const float g = __fdividef(1.0f, 1.0f + __expf(-sg[tk]));
+        const float sh = shared[col] * g;
+        sum += sh;
+    } else {
+        if (shared) sum += shared[col];
+    }
     output[col] = sum;
 }
 bool valid_span(const void* p, size_t bytes) {
@@ -80,6 +97,25 @@ void native_moe_combine_multi(const float* parts, const float* weights, const fl
         throw std::invalid_argument("native MoE combine (multi) requires a stream, width, 1..15 experts, tokens");
     combine<<<dim3(unsigned((n_embd + 255) / 256), (unsigned) n_tok), 256, 0, static_cast<cudaStream_t>(stream)>>>(
         parts, weights, shared, output, n_embd, int(k));
+    const auto error = cudaGetLastError();
+    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+}
+void native_moe_combine_multi_hits_gated(const float* hits, const float* weights, const float* shared,
+                                         const float* shared_gate, float* output, int64_t n_embd, int64_t k, int n_tok,
+                                         void* stream) {
+    if (!stream || n_embd <= 0 || k < 1 || k > 15 || n_tok < 1 || !shared || !shared_gate)
+        throw std::invalid_argument("native MoE combine (hits, gated) requires a stream, width, 1..15 experts, tokens");
+    combine<true, true><<<dim3(unsigned((n_embd + 255) / 256), (unsigned) n_tok), 256, 0, static_cast<cudaStream_t>(stream)>>>(
+        hits, weights, shared, output, n_embd, int(k), shared_gate);
+    const auto error = cudaGetLastError();
+    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+}
+void native_moe_combine_multi_hits(const float* hits, const float* weights, const float* shared, float* output,
+                                   int64_t n_embd, int64_t k, int n_tok, void* stream) {
+    if (!stream || n_embd <= 0 || k < 1 || k > 15 || n_tok < 1)
+        throw std::invalid_argument("native MoE combine (hits) requires a stream, width, 1..15 experts, tokens");
+    combine<true><<<dim3(unsigned((n_embd + 255) / 256), (unsigned) n_tok), 256, 0, static_cast<cudaStream_t>(stream)>>>(
+        hits, weights, shared, output, n_embd, int(k));
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }

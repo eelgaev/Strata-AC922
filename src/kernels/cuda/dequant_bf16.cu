@@ -168,11 +168,11 @@ __device__ __forceinline__ void group32(const uint8_t* row_blocks, int gi_in_row
 
 template <int TYPE, typename T>
 __global__ void dequant_kernel(const uint8_t* __restrict__ blocks, int64_t row_bytes, int64_t row0, int64_t rows,
-                               int64_t groups_per_row, T* __restrict__ out) {
+                               int64_t groups_per_row, int64_t ld, T* __restrict__ out) {
     const int64_t g = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (g >= rows * groups_per_row) return;
     const int64_t r = g / groups_per_row, gi = g % groups_per_row;
-    group32<TYPE>(blocks + (row0 + r) * row_bytes, (int) gi, out + r * groups_per_row * 32 + gi * 32);
+    group32<TYPE>(blocks + (row0 + r) * row_bytes, (int) gi, out + r * ld + gi * 32);
 }
 
 // Q8_0 with four threads per block, 8 values each: the warp reads 8 consecutive blocks and writes 512 consecutive
@@ -217,7 +217,8 @@ bool geometry(int type, int& block_elems, int& block_bytes) {
 }
 
 template <typename T>
-void launch(int type, const void* blocks, int64_t row0, int64_t rows, int64_t cols, T* out, void* stream) {
+void launch(int type, const void* blocks, int64_t row0, int64_t rows, int64_t cols, T* out, void* stream,
+            int64_t ld = 0) {
     int be = 0, bb = 0;
     if (!geometry(type, be, bb) || cols % be != 0 || rows <= 0) {
         std::fprintf(stderr, "dequant: unsupported type %d or shape %lld x %lld\n", type, (long long) rows,
@@ -225,16 +226,18 @@ void launch(int type, const void* blocks, int64_t row0, int64_t rows, int64_t co
         std::exit(1);
     }
     const int64_t row_bytes = cols / be * bb, gpr = cols / 32, total = rows * gpr;
+    if (ld <= 0) ld = cols;
     const unsigned grid = (unsigned) ((total + 255) / 256);
     const uint8_t* p = (const uint8_t*) blocks;
     cudaStream_t st = (cudaStream_t) stream;
-    if (type == 8 && (reinterpret_cast<uintptr_t>(blocks) & 1) == 0 && (reinterpret_cast<uintptr_t>(out) & 15) == 0) {
+    if (type == 8 && ld == cols && (reinterpret_cast<uintptr_t>(blocks) & 1) == 0 &&
+        (reinterpret_cast<uintptr_t>(out) & 15) == 0) {   // contiguous rows only (the kernel writes out + g * 32)
         dequant_q8_0_kernel<T><<<(unsigned) ((4 * total + 255) / 256), 256, 0, st>>>(p, row_bytes, row0, rows, gpr, out);
         const cudaError_t e = cudaGetLastError();
         if (e != cudaSuccess) { std::fprintf(stderr, "dequant launch: %s\n", cudaGetErrorString(e)); std::exit(1); }
         return;
     }
-#define STRATA_DQ(TY) dequant_kernel<TY, T><<<grid, 256, 0, st>>>(p, row_bytes, row0, rows, gpr, out); break
+#define STRATA_DQ(TY) dequant_kernel<TY, T><<<grid, 256, 0, st>>>(p, row_bytes, row0, rows, gpr, ld, out); break
     switch (type) {
     case 2: STRATA_DQ(2);
     case 6: STRATA_DQ(6);
@@ -278,6 +281,15 @@ void dequant_f16(int ggml_type, const void* blocks, int64_t row0, int64_t rows, 
         return;
     }
     launch<H16>(ggml_type, blocks, row0, rows, cols, reinterpret_cast<H16*>(out), stream);
+}
+
+bool dequant_f16_ld(int ggml_type, const void* blocks, int64_t row0, int64_t rows, int64_t cols, int64_t ld,
+                    uint16_t* out, void* stream) {
+    int be = 0, bb = 0;
+    if (iq_only(ggml_type) || !geometry(ggml_type, be, bb) || cols % be != 0 || rows <= 0 || ld < cols || ld % 8 != 0)
+        return false;
+    launch<H16>(ggml_type, blocks, row0, rows, cols, reinterpret_cast<H16*>(out), stream, ld);
+    return true;
 }
 
 void dequant_f32(int ggml_type, const void* blocks, int64_t row0, int64_t rows, int64_t cols, float* out, void* stream) {
