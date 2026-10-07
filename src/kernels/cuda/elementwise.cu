@@ -210,6 +210,9 @@ void silu_inplace(float* x, int64_t n, void* stream) {
 __global__ void doorbell_ring_kernel(uint32_t* seq) {
     __threadfence_system();
     *(volatile uint32_t*) seq = *(volatile uint32_t*) seq + 1u;
+#if defined(__HIPCC__)  // #697: HIP only; on RDNA4 the volatile store alone can sit in L2 until the stream syncs
+    __threadfence_system();
+#endif
 }
 
 __global__ void doorbell_wait_kernel(const volatile uint32_t* flag, const volatile uint32_t* seq) {
@@ -310,6 +313,9 @@ __global__ void doorbell_publish_kernel(const float* __restrict__ x, const int32
     __syncthreads();
     if (threadIdx.x == 0) {
         *(volatile uint32_t*) seq = *(volatile uint32_t*) seq + 1u;
+#if defined(__HIPCC__)  // #697: HIP only; on RDNA4 the volatile store alone can sit in L2 until the stream syncs
+        __threadfence_system();
+#endif
     }
 }
 
@@ -331,6 +337,9 @@ __global__ void doorbell_publish_res_kernel(const float* __restrict__ x, const i
     __syncthreads();
     if (threadIdx.x == 0) {
         *(volatile uint32_t*) seq = *(volatile uint32_t*) seq + 1u;
+#if defined(__HIPCC__)  // #697: HIP only; on RDNA4 the volatile store alone can sit in L2 until the stream syncs
+        __threadfence_system();
+#endif
     }
 }
 

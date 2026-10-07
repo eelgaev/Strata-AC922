@@ -334,10 +334,9 @@ class Main(Base):
         self.assertIsNone(cfg)
 
     def test_one_gpu_and_no_images(self):
-        code, out, cfg = self.main(["--context", "8192", "--gpus", "0,1", "--vision", "yes", "--low-ram", "on"],
-                                   n_gpus=2)
+        code, out, cfg = self.main(["--context", "8192", "--vision", "yes", "--low-ram", "on"], n_gpus=2)
         self.assertEqual(code, 0, out)
-        self.assertIn("runs on one GPU", out)
+        self.assertIn("(NVIDIA GeForce RTX 5070, 12 GB) only (--gpus 0,1 uses them together anyway)", out)
         self.assertIn("images are not available with UD-Q4_K_XL", out)
         self.assertIn("--low-ram on does not apply", out)
         self.assertNotIn("layer_split", cfg)
@@ -366,14 +365,21 @@ class Main(Base):
         self.assertIn("OS file cache", out)
         self.assertNotIn("RAM budget: ", out)
 
-    def test_split_refused_without_the_ram(self):
+    def test_split_without_the_ram_is_a_warning_not_a_wall(self):
+        # #737: below the worst-case estimate (a 128 GB PC ran it) the split is still the user's call
         need = setup.unsloth_split_need_gb()
         self.assertAlmostEqual(need, setup.MODELS[M]["download_gb"] + setup.UNSLOTH_RAM_LEFT_GB)
-        code, out, cfg = self.main(["--context", "8192", "--gpus", "0,1"], n_gpus=2, ram=127.8)
+        code, out, cfg = self.main(["--context", "8192"], n_gpus=2, ram=127.8)       # no --gpus: stays on one GPU
         self.assertEqual(code, 0, out)
-        self.assertIn("runs on one GPU here", out)
+        self.assertIn("uses them together anyway", out)
         self.assertNotIn("layer_split", cfg)
         self.assertEqual(cfg["args"][cfg["args"].index("--resident-budget-gib") + 1], "71")   # all of them
+        code, out, cfg = self.main(["--context", "8192", "--gpus", "0,1"], n_gpus=2, ram=127.8)   # asked for by name
+        self.assertEqual(code, 0, out)
+        self.assertIn("worst case", out)
+        self.assertIn("as you chose (--gpus), with 128 GB of RAM", out)
+        self.assertEqual(cfg["gpu"], [0, 1])
+        self.assertNotIn("--resident-budget-gib", cfg["args"])
 
     def test_an_explicit_budget_keeps_one_gpu(self):
         code, out, cfg = self.main(["--context", "8192", "--gpus", "0,1", "--resident-budget-gib", "60"], n_gpus=2,
@@ -564,14 +570,21 @@ class LayerSplit(unittest.TestCase):
         self.assertEqual(cfg["args"], ["--pack", "p", "--kv", "int8", "--remote-expert-opt"])   # 0.1.39b: #578
         self.assertIn("no RAM budget", out)
 
-    def test_start_with_gpus_refused_without_the_ram(self):
-        code, out, cfg, started = self.start(63.7)
+    def test_start_with_gpus_without_the_ram_is_asked(self):
+        # #737: a warning and a question (default no), not a wall; --gpus with --yes is the consent
+        code, out, cfg, started = self.start(63.7, offered="n")          # asked: "n" stops, nothing saved
         self.assertEqual(code, 1)
         self.assertFalse(started)
         self.assertIn("cannot share its RAM budget across GPUs", out)
         self.assertIn("--gpu N", out)
-        self.assertEqual(cfg["gpu"], 0)                                # nothing saved
+        self.assertEqual(cfg["gpu"], 0)
         self.assertIn("--resident-budget-gib", cfg["args"])
+        code, out, cfg, started = self.start(63.7)                       # --gpus + --yes: goes on, no budget
+        self.assertIsNone(code, out)
+        self.assertTrue(started)
+        self.assertIn("cannot share its RAM budget across GPUs", out)
+        self.assertEqual(cfg["gpu"], [0, 1])
+        self.assertNotIn("--resident-budget-gib", cfg["args"])
 
     def test_offered_at_a_start(self):
         code, out, cfg, _ = self.start(165.0, gpu=None, offered="")    # Enter: one GPU (the default here)

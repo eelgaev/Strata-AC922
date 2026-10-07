@@ -79,7 +79,9 @@ int main() {
                 for (size_t i = 0; i < y.size(); ++i) dy_n += std::memcmp(&y[i], &y_ref[i], 4) != 0;
                 for (size_t i = 0; i < y16.size(); ++i) d16 += y16[i] != y16_ref[i];
                 for (size_t i = 0; i < st.size(); ++i) dsn += std::memcmp(&st[i], &st_ref[i], 4) != 0;
-                const bool ok = dy_n == 0 && d16 == 0 && dsn == 0;
+                // (y, the FP32 scratch, is not part of the contract: 0.1.39's norm kernel no longer stores the normalized value there,
+                // while the head kernels store it unless STRATA_GDN_NOY; what the out projection reads is y16, and the state)
+                const bool ok = d16 == 0 && dsn == 0;
                 failures += !ok;
                 std::printf("%s T %lld variant %d vs 0: y %zu, y16 %zu, state %zu values differ\n", ok ? "PASS" : "FAIL",
                             (long long) T, variant, dy_n, d16, dsn);

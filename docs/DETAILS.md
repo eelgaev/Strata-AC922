@@ -117,6 +117,11 @@ RTX 5090 (IQ3_S, the reporter's measurement).
 smaller subset fits, and the server's start error repeats it; setup suggests `--draft-vocab en` on cards under
 14 GB (only a suggestion: nothing changes unless you pass it).
 
+**Serving without the draft layer (`--mtp` is optional):** `serve` runs without `--mtp`. Drafts then come from the
+suffix/prompt-lookup drafter only (or one token per round), every token is still verified against the model, and the
+draft layer's VRAM (~0.7-1 GiB with its head) goes to the expert cache: 1,000 -> 1,678 slots in one A/B on an 8 GB
+card. The conversation cache (`--conversation-cache-mib`) stays on: a parked conversation then carries no draft K/V.
+
 **Low-RAM mode (engine 0.1.26, chosen by setup):** normally all of a model's experts are copied into RAM (23-50 GB,
 pinned) and the GPU holds a copy of the most-used ones. On a PC whose RAM cannot hold them beside the system (the
 experts plus ~10 GB), setup instead maps them from one file in the model's folder (`--mmap-experts`, the pack's
@@ -136,6 +141,15 @@ other ~18 GB), a 32 GB PC with a 12-16 GB GPU the Coder; IQ3_XXS on a 32 GB PC s
   as far as the RAM allows, their experts are kept in RAM too (so a prompt reads nothing from the SSD either).
 - The cache still follows the conversation (`--adapt-every`): a swap copies the evicted expert back from VRAM into the
   RAM place of the one that replaces it, so the RAM copy keeps holding exactly what the GPU does not.
+- `--adapt-async 1` (opt-in, `--serve`): the swaps of a round advance between decode windows on a helper thread
+  (copy back, copy in, move into RAM) instead of one window waiting for the whole round. Not with `--batch` or
+  `--peer-device` (the blocking tier runs there). It is not bit-exact from run to run: which window first computes a
+  swapped-in expert on the GPU (which rounds differently from the CPU) depends on when its copy lands.
+  It stays on the blocking tier (said in the log) when the exchange buffers are not page-locked, and with
+  `--pipeline-windows`; the stats line reports ms per round.
+- `STRATA_EXCHANGE_ROTATE=1` (opt-in): an adaptive swap hands buffer ownership over instead of copying the evicted
+  blob into the RAM copy (equal-size blobs, fully page-locked copy). Same tokens, fewer host copies; it works with
+  `--adapt-async 1` too. Details and the measurement: [EXCHANGE_ROTATION.md](EXCHANGE_ROTATION.md).
 - The answers are the plain mapped mode's for the same expert placement: the bytes are the file's. With a page-locked
   copy the GPU also takes its usual share of the misses over PCIe (`--pcie-frac`), as with enough RAM; `--pcie-frac 0`
   (or `STRATA_RESIDENT_PIN=0`) gives the mapped mode's exact tokens.
@@ -157,6 +171,15 @@ start writes `experts.bin` (when the drive has room for it), later starts map it
 are handed back to the OS. Run it with `--pcie-frac 0` (the GPUs get no mapped alias). Without the variable nothing
 changes.
 
+**Releasing mapped expert pages on Windows (opt-in):** `STRATA_FILE_RELEASE=1` lets `FileExpertSource` trim the
+full file-backed pages of experts after their GPU uploads complete, including the slots lent to prefill and then
+refilled. It works with `experts.bin` and the direct GGUF views; shared boundary pages and private/pinned buffers
+are left alone. Unset or `0` keeps the previous behavior. On one 32 GB Windows 11 laptop with an RTX 4080 Laptop
+and a Thunderbolt RTX 3090, IQ2_XS with `--mmap-experts --layer-split 12 --trim-stage-weights` raised median available
+RAM from 0.51 to 12.19 GiB across 1K/4K/16K prompt trials, with 3.7-4.4% lower prefill throughput. It did not reduce
+committed memory or physical SSD reads. This is a working-set hint, not an unmap or a guarantee that the OS drops
+its file cache. See the [configuration, measurements and limits](../bench/results/2026-10-04-windows-mapped-release/README.md).
+
 **Low-RAM mode without `experts.bin` (engine 0.1.31):** for the native packs (IQ2_XS, IQ3_XXS, IQ3_S, the Coder, Swift,
 Q2_0 packed by `tools/iq_pack.py`; not the canonical Q2_0 pack setup makes for AVX-512 CPUs) the mapped mode no longer
 needs the pack's `experts.bin`: when the pack has none, the engine
@@ -169,15 +192,22 @@ engine fetches a layer's missing experts on 8 threads (`STRATA_FETCH_THREADS`) w
 
 **A RAM budget (engine 0.1.31, `--resident-budget-gib N`):** the resident variant for a model whose experts do not all
 fit: the N GiB of experts the GPU cache does not hold that the expert profile ranks hottest are copied into RAM at
-start (locked; page-locked when the driver allows the whole budget), and the rest are read from the files through the
-OS file cache. It implies `--mmap-experts` and leaves 4 GB of free RAM (a larger N is clamped to that less 256 MiB,
-with a message; #403: a clamped budget no longer fails the safety check that follows, and a budget that cannot be
-kept at all is a warning, with every expert read from the files). Setup sets N with `--resident-budget-gib N`. With
+start (locked; page-locked when the driver allows the whole budget), and the rest are read from the files.
+It implies `--mmap-experts` and leaves 4 GiB of headroom. On Windows, available commit capacity also
+limits the budget; a larger N is clamped to the smaller limit less 4 GiB and a 256 MiB margin, with a message.
+A clamped budget no longer fails the safety check that follows (#403). A budget that cannot be kept at all is a
+warning, with every expert read from the files. Setup sets N with `--resident-budget-gib N`. With
 the GGUF read in place it also warms the next layer's likely experts: while the CPU works on a layer, a thread applies
 the next layer's router to this layer's input and asks the OS for the pages of the predicted experts that neither the
 GPU nor the RAM budget holds (only pages - the experts computed are the same; `STRATA_LOOKAHEAD=0` turns it off). This
 is what runs [Unsloth's UD-Q4_K_XL](UNSLOTH_Q4.md) (72 GiB of experts) on a 64 GB PC: 7-8.5 tokens/s at N = 40 on an
 RTX 5070, against ~3 tokens/s before these changes.
+
+**Read-ahead at start (Linux):** the weights, the native dense matrices, the GPU cache's fill from the profile, the
+resident RAM copy and the MTP draft files are asked for ahead of their reads (madvise / posix_fadvise WILLNEED in
+128 KiB steps), so the drive sees a deep queue instead of one page fault at a time. Measured on a Gen3 NVMe (RTX 5090,
+32 GB, Q2_0 resident at 262K): ready in 70 s instead of ~920 s; the fill went from 39 MB/s to 3.2 GB/s.
+`STRATA_READ_AHEAD=0` turns it off; `STRATA_FILL_AHEAD=N` sets how many fill pairs are asked for ahead (default 256).
 
 **How much came from where:** with `--stats` the engine prints the tiers of the decode (`expert tiers`: blobs from the
 RAM copy, blobs and MB from the files, the time spent reading them; `routing prefetch`: how many of the file reads had
@@ -517,6 +547,20 @@ print(r.choices[0].message.content)
   server ends it there with `finish_reason` `"length"` and says so in its window: a model in a loop, or a broken
   state that answers one token forever (#606 saw 36,689 tokens of `!`). `"repeat_stop_tokens": N` in
   `strata-<model>.json` sets the run length; `0` turns it off (for a request that really wants one token many times).
+- **Repeated reasoning (opt-in, #728).** The single-token guard above does not see a model that repeats whole
+  passages. `"reasoning_loop_recovery"` in `strata-<model>.json` is `false` (the default), `"stop"` or `"recover"`
+  (`true` means `"recover"`). Every 512 output tokens, at a complete character and parser boundary, the reasoning is
+  measured over its last 2,000 words and punctuation marks (counting passages over the last 30,000 words). If at
+  least 25% belong to 12-word passages seen three times, `"stop"` ends the reply there as `"length"` and says so in
+  the server window. `"recover"` stops and drains that generation, then goes on once from all its generated token
+  ids with the template's low-effort sentence in place of the xhigh one in the first system message (a splice of
+  token ids: the rest of the prompt is not decoded or re-encoded). The task stays the same; no answer or `</think>`
+  is inserted, and both passes share the original output limit. On recovery only, temperature is raised to at least
+  1.0 and presence penalty to at least 1.5; a client's top-p, top-k and seed are never changed. `/metrics` records
+  `reasoning_recoveries` and the coverage. This is a policy, not a numerical engine fix or a guarantee of an answer.
+  `"recover"` needs the exact xhigh sentence in the first system message and skips requests with images; re-reading
+  the changed prefix costs prompt time. Either mode can mistake repeated useful code or checks for a loop, so keep
+  the recorded answer quality alongside the completion rate when testing it.
 - **Changing the effort without re-reading the prompt (opt-in, 0.1.39, #458).** The effort's instruction is the
   first thing in the prompt, so a request that only changes the effort (an agent's "think harder" switch, `none` for
   a quick tool step) reads the whole conversation again. `"effort_position": "end"` in `strata-<model>.json` renders
@@ -534,6 +578,15 @@ print(r.choices[0].message.content)
   long prompt the stream sends keep-alives, so agents do not time out; the server window prints progress every
   15 s, and `GET /status` says what it is doing (`reading the prompt`, `answering`, tokens so far). Closing the
   connection or pressing stop in your app really stops the model, so the next request starts at once.
+- **Prefill progress in the stream (opt-in).** `"return_progress": true` puts that progress on the stream instead of
+  sending only the keep-alive, as one extra field on a chunk with an empty delta: `prompt_progress` with `total`,
+  `cache`, `processed` and `time_ms`. Those are llama.cpp's four fields and mean the same there (`time_ms` is the time
+  since the prompt started reading, and the work still to do is `(total-cache) - (processed-cache)`), so a client that
+  draws a prefill bar for llama.cpp draws one here too. It is off unless the request asks, as it is in llama.cpp.
+  The engine says one line per `--prefill` chunk, so that chunk is the step: measured on two RTX 3090s with
+  `--prefill auto` (8192 tokens), a 42,131 token prompt read in 15 s sent six of them. A prompt shorter than one chunk
+  sends nothing, and that is on purpose: its only line arrives once the prompt is read, because the last tokens go
+  through the verify windows rather than the batched path, so it stops up to `--short-read` tokens short of the end.
 - **Chat apps.** Any app with an "OpenAI-compatible" provider works: base URL `http://127.0.0.1:8080/v1`, any API key.
 - **OpenCode** (#543). A starting point for `opencode.jsonc` (in your project, or `~/.config/opencode/`); the field
   names are OpenCode's, so check its config docs if your version differs:
@@ -635,6 +688,11 @@ reading after it instead of from token 0. A prompt read from the start is also c
 prompt when that is 2,048 tokens or more (engine 0.1.20; PR #62 + #65), so that root exists for agent clients with long
 system prompts and tool lists. Engine options: `--prompt-cache N` (0 = off), `--prompt-cache-every N`,
 `--prompt-cache-root N` (0 = no system-prompt checkpoint), `--turn-token ID`.
+A one-shot request that no later request continues (a classification call, a probe) can send
+`"strata_checkpoint": false` in its body: it saves no checkpoint at its last turn nor every 16K tokens, so what
+follows the reused prefix (or the root) is read in one run, and its session is not kept or parked for a next request.
+It still starts from a checkpoint it matches, and still saves the system-prompt root when that reaches
+`--prompt-cache-root`. Without the field (or with `true`) nothing changes.
 
 **Multiple conversations (opt-in).** Add `--conversation-cache-mib 8192
 --conversation-cache-slots 4` to the engine arguments to park up to four conversations
@@ -686,7 +744,9 @@ persisted across restarts.
 **Current limits (v1):** one request at a time unless `"parallel": N` is set (opt-in batch slots, up to N requests
 decoded together: [BATCHING.md](BATCHING.md)), and one conversation cached at a time (switching between two chats
 re-reads the other one unless the opt-in cache above is enabled, or each conversation keeps its own batch slot); images only when set up with them (below); no video. **Temperature / top_p / top_k / min_p /
-seed** are honored per request (OpenAI and Anthropic fields); with the default adaptive expert tier a sampled result
+seed** are honored per request (OpenAI and Anthropic fields), and so are stop strings (OpenAI `stop`, a string or up
+to 4; Anthropic `stop_sequences`): the answer ends before the first one, which is not sent, and the engine stops
+there (`finish_reason` "stop"; `stop_reason` "stop_sequence" with `stop_sequence` set to the one found); with the default adaptive expert tier a sampled result
 is not reproducible run to run - for seed-reproducible output add `--adapt-every 100000` (static residency) to the
 engine arguments. The run config's optional `sampling` block sets the defaults for requests that leave the fields out
 (`"sampling": {"temperature": 1.0, "top_p": 0.95, "top_k": 20}`); a request's own fields always win, and with no
@@ -871,7 +931,7 @@ helper (`strata-vision`, from llama.cpp's `mtmd` library) and adds it to your st
 | Encoder on | Time per picture | Cost |
 | --- | --- | --- |
 | **GPU** (recommended) | **0.1-0.5 s** (up to 1,024 image tokens) | ~1.4 GB of VRAM is kept free for it, so the expert cache is smaller: text output is a few % slower (table below) |
-| CPU | 10-30 s (pictures are scaled down to ~300 image tokens) | nothing on the GPU |
+| CPU | about 3 s at 300 image tokens on 8 cores (6-13 s on 4 threads); more tokens take longer, in proportion (#767, #625) | nothing on the GPU |
 
 A picture becomes up to 1,024 tokens of the context (a 640x480 photo: 300). The same picture sent again, as chat apps
 do on every turn, is encoded only once.
@@ -881,11 +941,23 @@ do on every turn, is encoded only once.
 `strata-<model>.json`, which you can also edit by hand. More tokens keep more detail (small text, charts, screenshots)
 and take longer to encode, on the CPU most of all; a setup run again keeps the value.
 
+**A minimum number of image tokens (0.1.40, #767):** `"min_tokens": N` in the `"vision"` section of
+`strata-<model>.json` (edit it by hand; a setup run again keeps it) is passed to the encoder as `--min-tokens N`
+(mtmd's `image_min_tokens`): a small picture is scaled up to at least N tokens. llama.cpp's mtmd prints that Qwen-VL
+models want at least 1,024 for grounding tasks (pointing, counting small items); the CPU default stays at 300 at most
+and no minimum, because a larger minimum changes the image answers and costs encode time (about 3 s at 300 tokens on
+8 cores, in proportion to the tokens).
+
 **A Q8_0 encoder (#625):** `"mmproj"` in the `"vision"` section can point to another mmproj file of this model, for
 example a Q8_0 one (llama.cpp's `convert_hf_to_gguf.py --mmproj --outtype q8_0` makes one): the encoder's library
-reads quantized weights, the file is half the size, and on the CPU it can encode faster than BF16. Setup downloads
-the BF16 file, and a setup run again keeps a file of your own that still exists. We have not measured its accuracy
-against BF16 yet; numbers are welcome in #625.
+reads quantized weights, the file is smaller (590 MiB against 865 MiB for the BF16 one, from `llama-quantize
+mmproj-Qwen3.8-Flash-Next-BF16.gguf mmproj-Qwen3.8-Flash-Next-Q8_0.gguf Q8_0`), and on the CPU it uses less RAM
+(about 280 MiB less in the encoder) and can encode faster than BF16 at the default 300 tokens. Setup downloads the
+BF16 file, and a setup run again keeps a file of your own that still exists. **Recommended for `--vision cpu`.**
+Accuracy against BF16, per image token: the cosine of the embeddings is 0.997-0.999 on average (#625's report, with
+a community Q8_0 file, at 300, 768 and 1,024 tokens), and 0.9988 and 0.9987 on two pictures with the file made by
+the command above (300 tokens; the worst single token 0.94-0.96). Encode time above 768 tokens is the same as BF16's
+within about 3%. Numbers on more pictures (charts, small text) are welcome in #625.
 
 **A spare GPU for the encoder (0.1.33, #408):** with a card the engine doesn't use, add `"cuda_device": 2` (numbered
 like `nvidia-smi`) to the `"vision"` section of `strata-<model>.json`: the encoder then runs on that card alone. Lower
@@ -1008,7 +1080,7 @@ the document, +0.4% on the chat. Details: `bench/results/2026-09-27-esp/`.
 | Slower than the tables | The monitor plugged into the GPU and other GPU programs take VRAM from the expert cache; RAM running below its rated speed (enable EXPO/XMP in the BIOS) slows the CPU half. |
 | `this server was started without the vision encoder` | The model was set up for text only: run setup again with `--vision gpu`. |
 | A picture is refused or `cannot read the image` | The file is not a picture Pillow can open (JPEG, PNG, WebP, GIF, BMP, TIFF, AVIF work). |
-| Pictures are slow (10-30 s) | The encoder runs on the CPU: run setup again with `--vision gpu` (needs ~1.4 GB of VRAM). |
+| Pictures are slow (3-30 s) | The encoder runs on the CPU: run setup again with `--vision gpu` (needs ~1.4 GB of VRAM). |
 | A request never finishes: "reading the prompt", GPU "100%" at low power | The GPU ran out of VRAM (engines before 0.1.9 could end with ~30 MiB free at large contexts). Run `START-HERE.bat` once to get engine 0.1.9 or newer; the log then says `... MiB of VRAM free with everything loaded` (a few hundred) and names the `--vram-reserve-mib` to add if it is low. |
 | Generation stops mid-answer, GPU "100%", one CPU core busy | Fixed in engine 0.1.12 (issue #29, a race in the CPU expert pool on big-VRAM cards). Since then a request that stops moving ends with an error instead of hanging (after 2 minutes; 1 minute from 0.1.13): the log says `no progress for ... s ... (issue #29)` with where it stopped, and the next request starts the engine again. If you see that line, please open an issue with it. Engine 0.1.13 adds a stall report under it (what every expert-pool thread and the GPU handshake were doing, memory and page faults) and, on Windows, a `strata-stall-<pid>.dmp` file with every thread's stack: attach both. (`STRATA_WATCHDOG_S` sets the time in seconds; 0 turns it off.) Engine 0.1.14 fixes the stall those reports found (issue #31: with the IQ packs the host could wait forever inside the NVIDIA driver while copying experts in a verify window; the experts are now copied by a GPU kernel, `--pcie-mode dma` restores the old way). |
 | `no progress for 60 s ... reading the prompt` on Linux, and the stall report says `threads waiting on the disk (state D): 16 ...` | The engine waits for the drive, not a deadlock: the n-gram table is read at random (`--ple-io direct`), which a rotational disk cannot keep up with (#605). The engine warns at start when the table is on one; `--ple-io ram` (Linux, needs RAM for the table) or the model on an SSD fixes it. Setup adds `--ple-io ram` itself on a rotational disk when the RAM holds the table (0.1.39). |
@@ -1028,7 +1100,13 @@ the document, +0.4% on the chat. Details: `bench/results/2026-09-27-esp/`.
 - **RAM:** all 24,576 experts, pinned. The CPU computes the experts that are not on the GPU **in place**, at the same time
   as the GPU works on the cached ones (AVX-512 / AVX2 kernels, ggml's for the i-quants).
 - **SSD:** the 28.8 GB n-gram table, a few rows per token, read unbuffered past the OS cache (`--ple-io direct`, the
-  default, made for SSDs; on a rotational disk `--ple-io ram` keeps the table in RAM, #605).
+  default, made for SSDs; on a rotational disk `--ple-io ram` keeps the table in RAM, #605). The engine reads the table
+  in the format the GGUF has it: IQ4_NL (the default table), Q4_0, Q5_0, Q5_1, Q8_0, FP8 (E4M3 with a scale) or BF16.
+  Measured on 4,000 random rows against the checkpoint's own BF16 table, the mean per-row error is Q8_0 0.53%, FP8 2.64%,
+  Q5_1 3.78%, Q5_0 4.25%, IQ4_NL 7.60%, Q4_1 7.80%, Q4_0 8.55% (a Q8_0 table is 54 GB, an IQ4_NL one 28.8 GB). On the Q2_0 model, 700 teacher-forced tokens, the mean KL against the BF16 table is 0.0117 (Q5_0), 0.0121 (Q5_1), 0.0125
+  (Q8_0), 0.0128 (FP8), 0.0140 (Q4_0) and 0.0146 (IQ4_NL), with the perplexity within 1% of BF16's either way: any change to the
+  table moves the 2-bit model by about 0.012, so the formats are hard to tell apart. Setup does not offer another table;
+  it only changes which GGUF the engine is given.
 - **Speculation:** the model's own MTP layer drafts up to 3 tokens; one pass over all 48 layers checks them. 2.4-3.2
   tokens per pass on average. When the reply repeats the context (code edits, quoted text), **prompt lookup** (engine
   0.1.7) drafts up to 5 tokens from the earlier copy, but only where its measured acceptance and cost say it pays:
@@ -1094,7 +1172,10 @@ times out, the server keeps ownership and reports an error rather than claiming 
 
 `POST /v1/chat/completions` accepts `response_format: {"type":"json_object"}` or
 `{"type":"json_schema","json_schema":{"name":"answer","strict":true,"schema":{"type":"object","properties":{"answer":{"type":"integer"}},"required":["answer"],"additionalProperties":false}}}`.
-The schema must describe an object at its root. Local `#` references work; remote references are refused.
+The schema must accept only JSON objects at its root: `"type":"object"`, or an `anyOf`/`oneOf` whose branches are all
+object schemas (an `allOf` with an object member, or a local `$ref` to one, also counts), as apps written for
+llama.cpp's `json_schema` send. A root that also allows an array, string, number, boolean or null is refused. Local
+`#` references work; remote references are refused.
 `json_schema` is checked with the Python package `jsonschema` when it is installed (`python -m pip install
 "jsonschema>=4.23,<5"`; setup does not add it); without it the answer is only checked to be one JSON object, and the
 server says so once.

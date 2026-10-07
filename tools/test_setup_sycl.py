@@ -71,5 +71,26 @@ class CMakeOption(unittest.TestCase):
         self.assertIn("add_subdirectory(sycl)", src)
 
 
+class IntelIds(unittest.TestCase):
+    """sycl/setup_intel.py names a card by its PCI device id. The Arc Pro B60s measured on 2x B60 (`lspci -nn` 8086:e211,
+    bmg-g21) must not fall through to "Intel GPU e211 (xe)" with a guessed VRAM size."""
+
+    @staticmethod
+    def table():
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("setup_intel", ROOT / "sycl" / "setup_intel.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod.INTEL_ARC
+
+    def test_b60_e211_is_named_with_its_vram(self):
+        self.assertEqual(self.table()["e211"], ("Arc Pro B60", 24.0))
+
+    def test_the_ids_that_were_listed_before_are_kept(self):
+        t = self.table()
+        self.assertEqual(t["e223"][0], "Arc Pro B70")
+        self.assertEqual(t["e221"][0], "Arc Pro B60")
+
+
 if __name__ == "__main__":
     unittest.main()

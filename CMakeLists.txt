@@ -80,7 +80,7 @@ option(STRATA_PREFILL_MMQ "Build the optional GGML MMQ prefill path for HIP" OFF
 # CUDA: MMQ prompt kernels for Q4_K / Q5_K / Q5_1 (Unsloth's UD-Q4_K_XL experts).  Off by default: the engine loads
 # every kernel when it starts (CUDA_MODULE_LOADING=EAGER), so these took ~5 MB of VRAM - 1-3 expert slots - from every
 # model, and the UD-Q4_K_XL prompt is SSD-bound with or without them (docs/UNSLOTH_Q4.md)
-option(STRATA_MMQ_KQUANTS "Build the CUDA MMQ prompt kernels for Q4_K / Q5_K / Q5_1 experts" OFF)
+option(STRATA_MMQ_KQUANTS "Build the MMQ prompt kernels for Q4_K / Q5_K / Q5_1 / Q6_K: the CUDA experts of Unsloth's UD-Q4_K_XL, and on HIP the dense GGUF projections (STRATA_DENSE_MMQ)" OFF)
 option(STRATA_ORCA_Q4KS_MMQ "Build the GGML Q5_0 MMQ instance for OrcaRouter Q4_K_S" OFF)
 if(STRATA_PREFILL_MMQ AND NOT STRATA_ENABLE_HIP)
   message(FATAL_ERROR "STRATA_PREFILL_MMQ requires STRATA_ENABLE_HIP=ON")
@@ -431,6 +431,14 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     src/core/arch_defaults.cpp)
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
+  if(STRATA_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/exchange_storage_test.cpp")
+    add_executable(exchange_storage_test tests/core/exchange_storage_test.cpp)
+    target_include_directories(exchange_storage_test PRIVATE include)
+    target_link_libraries(exchange_storage_test PRIVATE Threads::Threads)
+    add_test(NAME exchange_storage_test COMMAND exchange_storage_test)
+    set_tests_properties(exchange_storage_test PROPERTIES TIMEOUT 60)
+  endif()
+
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/file_expert_source_test.cpp")
     enable_testing()
     add_executable(file_expert_source_test tests/core/file_expert_source_test.cpp)
@@ -1094,6 +1102,12 @@ if(STRATA_NATIVE_EXPERTS)
   endif()
   target_link_libraries(strata_kernels_cpu PUBLIC ggml-cpu ggml-base)
   target_compile_definitions(strata_kernels_cpu PUBLIC STRATA_NATIVE_EXPERTS=1)
+  if(STRATA_BUILD_TESTS)
+    # the Q5_1 block dequantizer (a Q5_1 PLE table) against ggml's, synthetic blocks: no model, no GPU
+    add_executable(dequant_q5_1_test tests/core/dequant_q5_1_test.cpp)
+    target_link_libraries(dequant_q5_1_test PRIVATE strata_artifact ggml-base)
+    add_test(NAME dequant_q5_1_test COMMAND dequant_q5_1_test)
+  endif()
   # the router lookahead's dot on each rung this CPU has (AVX2, the older CPUs' AVX1) against a double reference
   add_executable(router_dot_parity src/kernels/cpu/router_dot_parity.cpp)
   target_link_libraries(router_dot_parity PRIVATE strata_kernels_cpu)
@@ -1122,7 +1136,7 @@ if(STRATA_NATIVE_EXPERTS)
                 src/prefill/ggml_cuda_host.cu ${_strata_mmq}/quantize.cu)
     # q8_0: the drafter's matrices (E-9); STRATA_ORCA_Q4KS_MMQ adds q5_0 (#296, in _strata_mmq_types), and
     # STRATA_MMQ_KQUANTS q4_k q5_k q5_1, the experts of Unsloth's UD-Q4_K_XL (docs/UNSLOTH_Q4.md; the dispatch
-    # follows eddoursul/Strata 7706c1b)
+    # follows eddoursul/Strata 7706c1b); q6_k is HIP only
     set(_strata_mmq_cuda_types ${_strata_mmq_types})
     if(STRATA_MMQ_KQUANTS)
       list(APPEND _strata_mmq_cuda_types q4_k q5_k q5_1)
@@ -1183,6 +1197,11 @@ if(STRATA_NATIVE_EXPERTS)
       src/prefill/moe_fused_iq.cu
       src/prefill/ggml_cuda_host.cu
       "${_strata_mmq}/quantize.cu")
+    if(STRATA_MMQ_KQUANTS)
+      # the same K-quant instances as the CUDA branch: on HIP they serve the dense GGUF projections
+      # of Gemm::native (STRATA_DENSE_MMQ=1), the mixed-quant packs' attention/PLE tensors
+      list(APPEND _strata_mmq_types q4_k q5_k q5_1 q6_k)
+    endif()
     foreach(_t IN LISTS _strata_mmq_types)
       list(APPEND _strata_mmq_sources "${_strata_mmq}/template-instances/mmq-instance-${_t}.cu")
     endforeach()
@@ -1195,6 +1214,9 @@ if(STRATA_NATIVE_EXPERTS)
       PRIVATE "${_strata_gg}/include" "${_strata_gg}/src" "${_strata_mmq}"
       PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
     target_compile_definitions(strata_mmq PRIVATE GGML_USE_HIP=1)
+    if(STRATA_MMQ_KQUANTS)
+      target_compile_definitions(strata_mmq PRIVATE STRATA_MMQ_KQUANTS=1)
+    endif()
     if(STRATA_ORCA_Q4KS_MMQ)
       target_compile_definitions(strata_mmq PRIVATE STRATA_ORCA_Q4KS_MMQ=1)
     endif()
@@ -1243,7 +1265,9 @@ if(STRATA_NATIVE_EXPERTS)
       # kernel for it before; q5_0/q5_0 (both roles Q5_0) is left out of this list since stacking the same
       # lower-precision format on both roles pushes the GPU path over this test's 3% threshold (quantization
       # noise, not a kernel bug -- see the PR).
-      foreach(_pair q4_K/q5_1 q4_K/q8_0 q5_K/q8_0 q8_0/q8_0 q4_K/q5_0 q5_0/q8_0)
+      # q4_0/q4_0 and q4_0/q4_1: a plain llama-quantize Q4_0 file (bartowski's Qwen3.8-Flash-Next-Q4_0: gate/up Q4_0,
+      # down Q4_0 on 42 layers and Q4_1 on 6)
+      foreach(_pair q4_K/q5_1 q4_K/q8_0 q5_K/q8_0 q8_0/q8_0 q4_K/q5_0 q5_0/q8_0 q4_0/q4_0 q4_0/q4_1)
         string(REPLACE "/" "_" _name "${_pair}")
         add_test(NAME native_expert_parity_${_name} COMMAND native_expert_parity --synthetic ${_pair})
         set_tests_properties(native_expert_parity_${_name} PROPERTIES TIMEOUT 120)

@@ -29,7 +29,7 @@ namespace strata::core {
 size_t device_free_bytes() {
     size_t free_b = 0, total_b = 0;
     cudaMemGetInfo(&free_b, &total_b);
-#if defined(__linux__)
+#if defined(__linux__) && !defined(STRATA_HIP_GFX906)   // (the gfx906 compat layer has no cudaDevAttrIntegrated; that GPU is discrete)
     // per device: a box can mix an integrated GPU (an APU) with a discrete one, and the answer is the CURRENT device's
     static std::atomic<int> uma_cache[64];   // 0 unknown, 1 integrated (unified memory), 2 discrete
     bool unified_memory = false;

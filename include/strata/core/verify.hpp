@@ -149,8 +149,13 @@ public:
     /// listed are not touched, so an idle slot keeps its state (a finished conversation it may continue later).
     bool run_slot_rows(const int* rows, int S, const int32_t* tokens, const int64_t* pos, PoolMultiFn pool, void* user,
                        int32_t* out, std::string& err);
-    /// Keep every row of the last batch window: each slot's state advances by its one token.
+    /// Keep every row of the last batch window.
     bool commit_slots(std::string& err);
+    /// Commit an accepted prefix in each contiguous slot group of the last window. `keep` has
+    /// one entry per slot (indexed by slot ID), each in 1..that slot's group length.
+    bool commit_slot_prefixes(const int* keep, std::string& err);
+    /// --batch-mtp: slot rotation makes many row layouts, so bound the captured batch graph pairs (LRU). 0 = unbounded.
+    void set_batch_graph_limit(size_t n) { batch_graph_limit_ = n; }
 
     // ---- The stages of a layer split as a PIPELINE.  A batch window over the slot GROUP
     // [base, base + S) is launched on ONE stage with its commit right behind it on the stage's stream (a batch window
@@ -179,6 +184,45 @@ public:
     /// Waits for the last commit graph when commit() did not (an event recorded after it, not the whole device);
     /// false with `err` when it failed.  Free when nothing is pending.
     bool wait_commit(std::string& err);
+
+    // ---- PIPELINED WINDOWS (--pipeline-windows, a layer split on two GPUs).  One conversation's windows with the
+    // stages overlapped: stage 0 runs window K+1 while stage 1 still runs window K.  The same window as `run`, driven
+    // without blocking the host, so one host thread keeps a window in flight on each stage (the batch pipeline's
+    // pattern, batch_launch / batch_poll, for one sequence with drafts).  Two verifiers per stage (one per window
+    // parity) share the stage's stream and each has its own hand-off.  `pl_launch` stages and launches (it never
+    // captures: `capture_all` first, with nothing in flight), `service` serves the layers whose doorbells have rung
+    // and returns at once, `done` polls the window's completion, `pl_finish` reads the picks, `pl_commit_async`
+    // queues the commit.  Nothing chains to `next_`: the caller drives every stage.
+    /// The compute stream to use instead of a private one (the two verifiers of one stage share it).  Before `init`.
+    void set_stream(cudaStream_t s) { ext_stream_ = s; }
+    /// Every layer copies the token rows to the host (doorbell_publish), not only the layers with a routed expert
+    /// outside the VRAM tier by the device's residency table: with windows in flight the adaptive tier marks an
+    /// expert evicted on the host (the pool then computes it on the CPU) before the device table follows.  Also turns
+    /// the device-planned layers (E-6) off.  Before `init`.
+    void set_always_publish(bool on) { always_publish_ = on; }
+    cudaStream_t stream() const { return cs_; }
+    int device() const { return device_; }
+    /// Capture every window size and the commit graph now (a capture syncs the stream: never with a window in flight).
+    bool capture_all(std::string& err);
+    bool pl_launch(int T, const int32_t* tokens, int64_t pos0, std::string& err);
+    /// Stage a window ahead of its launch (positions, and the PLE rows from `ple_prev` = the two tokens before the
+    /// window as they WILL be, their pages prefetched).  A later `pl_launch` of the same window (T, pos0, tokens, and
+    /// `ss.ple_prev` equal to `ple_prev` by then) skips the staging; anything else stages again.
+    bool prestage(int T, const int32_t* tokens, int64_t pos0, const int32_t ple_prev[2], std::string& err);
+    /// 1: every layer served; 0: the GPU has not reached the next layer yet; -1: an error (`err`).
+    int service(PoolMultiFn pool, void* user, std::string& err);
+    bool in_flight() const { return fl_active_; }
+    /// The window's graph (and its profile copy) completed; false while it runs.  An error sets `err`.
+    bool done(std::string& err);
+    /// After `done`: the profile, the last stage's host sampling and picks (`out` may be null on an earlier stage).
+    bool pl_finish(int32_t* out, std::string& err);
+    /// The commit without a host sync; `ss.ple_prev` advances now (host side).  A second call for the same window
+    /// (after its state was restored) replays it with another count.
+    bool pl_commit_async(int n_keep, std::string& err);
+    /// Fold another verifier's counters and GPU profile into this one's (the two verifiers of one stage report once).
+    void absorb_stats(Verifier& o);
+    /// The watchdog's line for a pipelined verifier: in flight, layers served, the GPU's ring and flags, its events.
+    void diag_pipelined(std::FILE* f, const char* name) const;
 
     /// Measurement hook (STRATA_LOGPOS): after run(), write one line per row t of the last window's head -
     /// "pos target logprob top top_logprob hit extra_logprob target_logprob_without_extra" - where row t is the
@@ -225,14 +269,21 @@ private:
     int row_base_ = 0;                     ///< ... its hand-off rows start here (a pipeline group's own rows)
     int brow_[8] = {};                     ///< ... and row t is slot brow_[t]
     bool last_batch_ = false;              ///< the last run was a batch window (set_plan_slot: one group)
-    std::map<uint64_t, cudaGraphExec_t> exec_bm_, commit_bm_;   ///< key: batch_key(rows, S, hand-off base)
+    std::map<std::vector<int>, cudaGraphExec_t> exec_bm_, commit_bm_;   ///< full row layout avoids slot-ID collisions
+    std::map<std::vector<int>, uint64_t> bm_used_;   ///< last use of each captured layout (LRU, only with a graph limit)
+    uint64_t bm_tick_ = 0;
+    size_t batch_graph_limit_ = 0;         ///< 0: keep every captured batch graph (0.1.39); N: LRU-evict beyond N layouts
     int last_rows_[8] = {};                ///< the slots of the last batch window's rows
-    uint64_t bkey(const int* rows, int S, int hbase) const {   // #871: the doorbell variant has its own graphs
-        return batch_key(rows, S, hbase) | (ar_off_ ? (1ull << 63) : 0ull);
+    std::vector<int> bkey(const int* rows, int S, int hbase) const {   // #871: the doorbell variant has its own graphs
+        std::vector<int> k = batch_key(rows, S, hbase);
+        k.push_back(ar_off_ ? 1 : 0);
+        return k;
     }
-    static uint64_t batch_key(const int* rows, int S, int hbase) {
-        uint64_t k = (uint64_t) hbase << 40 | (uint64_t) S << 32;
-        for (int t = 0; t < S; ++t) k |= (uint64_t) (rows[t] & 15) << (4 * t);
+    static std::vector<int> batch_key(const int* rows, int S, int hbase) {
+        std::vector<int> k;
+        k.reserve((size_t) S + 1);
+        k.push_back(hbase);
+        for (int t = 0; t < S; ++t) k.push_back(rows[t]);
         return k;
     }
     // batch_launch / batch_poll
@@ -249,6 +300,19 @@ private:
     int64_t last_pos_b_[8] = {};
     bool capture_batch(const int* rows, int S, int hbase, std::string& err);
     void collect_profile();   ///< STRATA_VERIFY_PROFILE: add the last window's stamps to prof_sum_
+    void accumulate_profile(const unsigned long long* stamps);   ///< one window's stamps (host copy) into prof_sum_
+    // pipelined windows (pl_launch ...)
+    cudaStream_t ext_stream_ = nullptr;   ///< set_stream: the stage's shared stream (not destroyed here)
+    bool always_publish_ = false;
+    void pl_stage(int T, const int32_t* tokens, int64_t pos0, const int32_t ple_prev[2]);
+    cudaEvent_t ev_done_ = nullptr, ev_commit_ = nullptr;
+    unsigned long long* prof_pin_ = nullptr;   ///< pinned host copy of the stamps (pipelined windows)
+    bool fl_active_ = false, fl_prof_ = false, fl_ple_ = false, commit_live_ = false, pl_prestaged_ = false;
+    int fl_T_ = 0;
+    int64_t fl_k_ = 0, fl_total_ = 0;
+    double fl_since_ms_ = 0, fl_flush_ms_ = 0, fl_launch_ms_ = 0;
+    int32_t pl_prev_[2] = {-1, -1};
+    std::vector<uint32_t> pl_ple_rows_;   ///< the window's PLE rows (T x PLE_N_HEADS), gathered when layer 0 is served
     bool capture_commit_batch(const int* rows, int S, int hbase, std::string& err);
     bool stage_batch(const int* rows, int S, int hbase, const int32_t* tokens, const int64_t* pos, std::string& err);
     strata::kernels::SamplerParams sampling_ = [] {

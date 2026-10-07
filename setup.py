@@ -201,7 +201,9 @@ UNSLOTH_RAM_LEFT_GB = 24        # RAM beside the budget: the OS, the engine, and
 # from the final context (final / 262144, at least 1) itself (below), keeps an explicit
 # --rope-scaling/--rope-scale, and refuses an explicit --rope-scaling none there - the stock angles past
 # the trained range are out of spec.
-CONTEXTS = [8192, 32768, 65536, 131072, 262144, 393216, 524288]
+# 204800 (200K) sits between 128K and 256K: it is inside the trained 262144, so it needs no rope scaling and
+# costs ~2.8 GB of 8-bit KV with IQ3_S (vs ~3.6 GB at 256K) - a middle step for PCs that cannot hold 256K.
+CONTEXTS = [8192, 32768, 65536, 131072, 204800, 262144, 393216, 524288]
 # The model families: the same architecture, weights in the same three GSQ-RCO sizes, different files.
 FAMILIES = {
     "qwen": {"title": "Qwen3.8-Flash-Next", "by": "Qwen; GSQ-RCO quants by ISTA-DASLab",
@@ -276,9 +278,28 @@ def fail(msg, hint=None):
     sys.exit(1)
 
 
+def flush_typed_ahead() -> None:
+    """#841: keys pressed while setup was busy (a download, a build) are not answers to the next question: Enter pressed
+    to "wake" a slow step answered "Go on anyway?" with its default.  Dropped before a question is asked, on a terminal
+    only (a pipe or a test keeps its input)."""
+    try:
+        if not sys.stdin.isatty():
+            return
+        if WIN:
+            import msvcrt
+            while msvcrt.kbhit():
+                msvcrt.getwch()
+        else:
+            import termios
+            termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
+    except (ImportError, OSError, ValueError, AttributeError):
+        pass
+
+
 def ask(question, choices, default, yes):
     if yes:
         return default
+    flush_typed_ahead()
     while True:
         try:
             a = input(f"{question} [{default}]: ").strip()
@@ -378,21 +399,61 @@ def cpu_cores():
                     classes.append(raw[at + 9])
                 at += size
         else:
-            seen = {}
-            for cpu in sorted(Path("/sys/devices/system/cpu").glob("cpu[0-9]*"), key=lambda p: int(p.name[3:])):
-                cap = cpu / "cpu_capacity"
-                pkg, core = cpu / "topology" / "physical_package_id", cpu / "topology" / "core_id"
-                if not cap.exists():
-                    return None
-                key = (pkg.read_text().strip(), core.read_text().strip()) if pkg.exists() and core.exists() else cpu.name
-                seen.setdefault(key, int(cap.read_text().strip()))
-            classes = list(seen.values())
+            classes = linux_core_classes()
+            if classes is None:
+                return None
     except (OSError, ValueError, AttributeError):
         return None
     if not classes or max(classes) == min(classes):
         return None
     p = sum(1 for c in classes if c == max(classes))
     return p, len(classes) - p
+
+
+def linux_core_classes(sys_root: str = "/sys"):
+    """One class per physical core on Linux: 1 for a P-core, 0 for an E-core; None when the kernel does not say.
+    #798: Intel's hybrid PMU lists (cpu_core/cpus, cpu_atom/cpus) when they exist; else cpu_capacity, where an E-core is
+    one under 90% of the largest - Turbo Boost Max 3.0 gives the "favored" P-cores a slightly higher capacity (1024
+    against 1012), so "below the maximum" counted 2 of a Core Ultra 7 270K Plus's 8 P-cores."""
+    pmu = linux_hybrid_pmu(sys_root + "/devices")
+    seen = {}
+    for cpu in sorted((Path(sys_root) / "devices" / "system" / "cpu").glob("cpu[0-9]*"), key=lambda p: int(p.name[3:])):
+        cap = cpu / "cpu_capacity"
+        pkg, core = cpu / "topology" / "physical_package_id", cpu / "topology" / "core_id"
+        if not cap.exists() and pmu is None:
+            return None
+        key = (pkg.read_text(encoding="utf-8").strip(), core.read_text(encoding="utf-8").strip()) \
+            if pkg.exists() and core.exists() else cpu.name
+        if pmu is not None:
+            seen.setdefault(key, 0 if int(cpu.name[3:]) in pmu[1] else 1)
+        else:
+            seen.setdefault(key, int(cap.read_text(encoding="utf-8").strip()))
+    classes = list(seen.values())
+    if pmu is None:
+        top = max(classes, default=0)
+        classes = [1 if c * 10 >= top * 9 else 0 for c in classes]
+    return classes
+
+
+def cpulist(text: str) -> set:
+    """A kernel cpulist ("0-7,16") as a set of CPU numbers."""
+    out = set()
+    for part in text.strip().split(","):
+        lo, _, hi = part.strip().partition("-")
+        if lo.isdigit():
+            out.update(range(int(lo), int(hi or lo) + 1))
+    return out
+
+
+def linux_hybrid_pmu(root: str = "/sys/devices"):
+    """#798: (P-core CPUs, E-core CPUs) from Intel's hybrid PMU lists (cpu_core/cpus, cpu_atom/cpus), or None on a CPU
+    that has no such lists."""
+    try:
+        p = cpulist((Path(root) / "cpu_core" / "cpus").read_text(encoding="utf-8"))
+        e = cpulist((Path(root) / "cpu_atom" / "cpus").read_text(encoding="utf-8"))
+    except OSError:
+        return None
+    return (p, e) if p and e else None
 
 
 def hybrid_pool_workers(cores) -> int | None:
@@ -601,6 +662,13 @@ def gpus():
     return found
 
 
+def gpu_drives_display(g) -> bool:
+    """#779: True when nvidia-smi says this card has a display attached (display_active Enabled): its desktop needs
+    VRAM too, and a full expert cache beside it has crashed laptops."""
+    text = out(["nvidia-smi", "-i", str(g.get("index", 0)), "--query-gpu=display_active", "--format=csv,noheader"])
+    return text.strip().lower() == "enabled"
+
+
 GPU_PICK = None                                         # --gpu N (issue #51); None: the card with the most VRAM
 SPLIT_MIN_VRAM_GB = 8                                   # a card sharing a model holds the dense weights and its own
                                                         # prompt buffers too (docs/MULTI_GPU.md)
@@ -785,7 +853,7 @@ def engine_archs(toolkit=13):
     """The GPU generations the installed engine has code for: (archs, ptx), or None when there is none."""
     info = engine_dir(toolkit) / "BUILD.json"
     try:
-        meta = json.loads(info.read_text())
+        meta = json.loads(info.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
     return [int(x) for x in meta.get("archs", [])], bool(meta.get("ptx"))
@@ -794,7 +862,7 @@ def engine_archs(toolkit=13):
 def engine_archs_hip():
     """The AMD architectures the installed HIP engine was compiled for ("gfx1201", ...), or None."""
     try:
-        meta = json.loads((ROOT / "engine" / "BUILD.json").read_text())
+        meta = json.loads((ROOT / "engine" / "BUILD.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
     return [str(x) for x in meta.get("archs", [])] if meta.get("backend") == "hip" else None
@@ -899,20 +967,24 @@ def unsloth_split_need_gb(model="UD-Q4_K_XL") -> float:
     return MODELS[model]["download_gb"] + UNSLOTH_RAM_LEFT_GB
 
 
-def split_budget(cfg: dict) -> bool:
+def split_budget(cfg: dict, yes: bool = False, explicit: bool = False) -> bool:
     """#498: a UD-Q4_K_XL config (its RAM budget, --resident-budget-gib) started on several GPUs.  The engine refuses
     the budget with a layer split (it exited with code 2), so the split runs without it - all the experts loaded into
-    RAM at start - where the RAM holds the GGUFs and 24 GB more; else setup stops, before the config is saved.  True
-    when the config changed."""
+    RAM at start - where the RAM holds the GGUFs and 24 GB more; else setup says so and asks (#737: a recommendation,
+    not a wall - 128 GB ran it fine): a "no" stops, before the config is saved; `explicit` (--gpus) with --yes goes on.
+    True when the config changed."""
     a = cfg.get("args", [])
     if "--resident-budget-gib" not in a:
         return False
     model = budget_model(cfg)
     need, ram = unsloth_split_need_gb(model), ram_gb()
     if ram < need:
-        fail(f"{model} cannot share its RAM budget across GPUs (the engine has no layer split with it), and without "
-             f"the budget it needs ~{need:.0f} GB of RAM (its GGUF files and {UNSLOTH_RAM_LEFT_GB} GB more); this PC "
-             f"has {ram:.0f} GB", "start it on one GPU: START-HERE.bat --gpu N (Linux: ./setup.sh --gpu N)")
+        confirm_risk(f"{model} cannot share its RAM budget across GPUs (the engine has no layer split with it), and "
+                     f"without the budget it needs ~{need:.0f} GB of RAM (its GGUF files and {UNSLOTH_RAM_LEFT_GB} GB "
+                     f"more); this PC has {ram:.0f} GB. The estimate is a worst case: a 128 GB PC ran it (#737), but "
+                     "it may page or stall here.", explicit, yes,
+                     f"{model} on several GPUs needs ~{need:.0f} GB of RAM; this PC has {ram:.0f} GB",
+                     "start it on one GPU: START-HERE.bat --gpu N (Linux: ./setup.sh --gpu N)")
     i = a.index("--resident-budget-gib")
     del a[i:i + 2]
     ok(f"{model} on several GPUs: no RAM budget (the engine has none with a layer split) - all its experts are "
@@ -1126,6 +1198,8 @@ def download(url, dst: Path, what=None):
         return
     have = part.stat().st_size if part.exists() else 0
     for attempt in range(30):
+        if total and have >= total:                    # stopped after the last byte, before the rename: nothing to
+            break                                      # ask for (a range past the end is a 416, retried 30 times)
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "strata-setup", "Range": f"bytes={have}-"})
             with urllib.request.urlopen(req, timeout=60) as r, open(part, "ab" if have else "wb") as f:
@@ -1311,6 +1385,11 @@ def check_shards(shards):
         if have < need:
             fail(f"{s.name} is short: {have:,} of {need:,} bytes ({need - have:,} missing)",
                  "delete it and run setup again (or copy the whole file into --gguf-dir)")
+        if len(g.tensors) == 1 and have - need >= 64:       # (a few bytes may be the last tensor's alignment padding)
+            # #657: a shard that holds one tensor (the PLE table) is exactly as long as that tensor; extra bytes are a
+            # damaged or wrong file that the engine would refuse at start ("PLE table size mismatch")
+            fail(f"{s.name} is longer than its tensor: {have:,} bytes, {need:,} expected ({have - need:,} extra)",
+                 f"delete {s.name} and its .done mark and run setup again")
 
 
 def get_llama_cpp():
@@ -1395,7 +1474,7 @@ def pip_install(packages, what):
     requirements (#214) recorded bare names: those packages are kept as they are (nothing is reinstalled), and the
     pinned dependencies it already has count as installed."""
     stamp = Path(sys.prefix) / ".strata-pip.json"
-    have = json.loads(stamp.read_text()) if stamp.exists() else []
+    have = json.loads(stamp.read_text(encoding="utf-8")) if stamp.exists() else []
     bare = {p.lower() for p in have if req_name(p) == p.lower()}
     need = [p for p in packages if p not in have and req_name(p) not in bare
             and not (bare and "==" in p and _installed(req_name(p)))]
@@ -1550,7 +1629,8 @@ _WIN_AMD_DID = {0x744C: "gfx1100", 0x7448: "gfx1100", 0x745E: "gfx1100",        
                 0x7480: "gfx1102",                                                  # RX 7600 / 7600 XT
                 0x7590: "gfx1200",                                                  # RX 9060 XT
                 0x7550: "gfx1201", 0x7551: "gfx1201",                               # RX 9070 / 9070 XT, AI PRO R9700
-                0x73BF: "gfx1030", 0x73AF: "gfx1030", 0x73A5: "gfx1030"}            # RX 6800 / 6800 XT / 6900 XT / 6950 XT
+                0x73BF: "gfx1030", 0x73AF: "gfx1030", 0x73A5: "gfx1030",            # RX 6800 / 6800 XT / 6900 XT / 6950 XT
+                0x73DF: "gfx1031"}                                                  # RX 6700 XT / 6750 XT / 6800M (#881)
 _WIN_AMD_NAME = ((re.compile(r"\b9070\b|R9700", re.I), "gfx1201"),
                  (re.compile(r"\b9060\b", re.I), "gfx1200"),
                  (re.compile(r"RX\s*7900|W7900|W7800", re.I), "gfx1100"),
@@ -1663,7 +1743,7 @@ def hip_devices(probe: Path | None = None, text: str | None = None) -> list[dict
     if text is None:
         probe = probe or ROOT / "engine" / ("strata-device.exe" if WIN else "strata-device")
         try:
-            hip_engine = json.loads((probe.parent / "BUILD.json").read_text()).get("backend") == "hip"
+            hip_engine = json.loads((probe.parent / "BUILD.json").read_text(encoding="utf-8")).get("backend") == "hip"
         except (OSError, ValueError):
             hip_engine = False
         if not probe.exists() or not hip_engine:
@@ -1704,7 +1784,7 @@ def hip_devices(probe: Path | None = None, text: str | None = None) -> list[dict
 def hip_lib_dirs(eng: Path) -> list[Path]:
     """Where the ready-made Windows HIP engine's ROCm DLLs are (its BUILD.json "lib_dirs", relative to engine/)."""
     try:
-        rel = json.loads((eng / "BUILD.json").read_text()).get("lib_dirs") or []
+        rel = json.loads((eng / "BUILD.json").read_text(encoding="utf-8")).get("lib_dirs") or []
     except (OSError, ValueError):
         rel = []
     return [eng / d for d in rel if (eng / d).is_dir()]
@@ -1771,7 +1851,7 @@ def get_prebuilt_hip(url_base, gpu, updating=False) -> Path | None:
     info = eng / "BUILD.json"
     if info.exists() and (eng / EXE).exists():
         try:
-            meta = json.loads(info.read_text())
+            meta = json.loads(info.read_text(encoding="utf-8"))
         except ValueError:
             meta = {}
         ver = tuple(int(x) for x in str(meta.get("version", "0")).split(".")[:3] if x.isdigit())
@@ -1804,7 +1884,7 @@ def get_prebuilt_hip(url_base, gpu, updating=False) -> Path | None:
     with zipfile.ZipFile(z) as f:
         f.extractall(tmp)
     try:
-        meta = json.loads((tmp / "BUILD.json").read_text())
+        meta = json.loads((tmp / "BUILD.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         meta = {}
     ver = tuple(int(x) for x in str(meta.get("version", "0")).split(".")[:3] if x.isdigit())
@@ -1814,17 +1894,14 @@ def get_prebuilt_hip(url_base, gpu, updating=False) -> Path | None:
     elif ver < WIN_HIP_MIN_ENGINE:
         why = f"it is version {meta.get('version')}; this setup needs {'.'.join(map(str, WIN_HIP_MIN_ENGINE))}"
     elif gpu["arch"] not in meta.get("archs", []):
-        why = f"it is built for {', '.join(meta.get('archs', []))}; your GPU is {gpu['arch']}"
+        why = (f"it is built for {', '.join(meta.get('archs', []))}; your GPU is {gpu['arch']}.  A card it has no code "
+               "for runs from a self-build of the engine: see docs/AMD_HIP.md (--build)")   # #881
     if why:
         warn(f"the ready-made AMD engine at {base} cannot be used: {why}")
         shutil.rmtree(tmp, ignore_errors=True)
         drop_archive(z)
         return None
-    for p in tmp.iterdir():
-        dst = eng / p.name
-        if dst.exists():
-            shutil.rmtree(dst) if dst.is_dir() else dst.unlink()
-        p.replace(dst)
+    install_unpacked(tmp, eng)
     shutil.rmtree(tmp, ignore_errors=True)
     drop_archive(z)
     hip_runtime_beside_exe(eng)                        # #468 #461
@@ -1836,7 +1913,7 @@ def get_prebuilt_hip(url_base, gpu, updating=False) -> Path | None:
 def rocm_version(root):
     """(major, minor) of a ROCm install, from rocm-core's header; None when it has none."""
     try:
-        text = (Path(root) / "include" / "rocm-core" / "rocm_version.h").read_text()
+        text = (Path(root) / "include" / "rocm-core" / "rocm_version.h").read_text(encoding="utf-8")
         return tuple(int(re.search(rf"#define\s+ROCM_VERSION_{k}\s+(\d+)", text).group(1)) for k in ("MAJOR", "MINOR"))
     except (OSError, AttributeError, ValueError):
         return None
@@ -1874,7 +1951,7 @@ def rocm_root(archs):
              "wheels come per family", "install ROCm 7 system-wide, or use cards of one family (--gpu N for one card)")
     index = indexes[0]
     stamp = Path(sys.prefix) / ".strata-rocm.json"
-    have = json.loads(stamp.read_text()) if stamp.exists() else {}
+    have = json.loads(stamp.read_text(encoding="utf-8")) if stamp.exists() else {}
     if have.get("version") != ROCM_VERSION or have.get("index") != index:
         say(f"  Installing ROCm {ROCM_VERSION} for AMD GPUs into .venv (AMD's TheRock wheels, ~10 GB, no sudo) ...")
         pip = [sys.executable, "-m", "pip", "install", "--quiet", "--disable-pip-version-check", "--index-url", index]
@@ -1904,7 +1981,7 @@ def hipblaslt_version(lib_dirs):
     header of the ROCm whose libraries the engine loads; None when not found."""
     for d in lib_dirs:
         try:
-            text = (Path(d).parent / "include" / "hipblaslt" / "hipblaslt-version.h").read_text()
+            text = (Path(d).parent / "include" / "hipblaslt" / "hipblaslt-version.h").read_text(encoding="utf-8")
             v = [int(re.search(rf"#define\s+HIPBLASLT_VERSION_{k}\s+(\d+)", text).group(1))
                  for k in ("MAJOR", "MINOR", "PATCH")]
         except (OSError, AttributeError, ValueError):
@@ -1920,7 +1997,7 @@ def hipblaslt_table(arch, lib_dirs, ver=None):
     ver = ver or hipblaslt_version(lib_dirs)
     table = ROOT / "tools" / "hip" / f"{arch}-hipblaslt-{ver}.txt"
     if ver is not None and table.exists():
-        head = table.read_text().split("\n", 2)[:2]
+        head = table.read_text(encoding="utf-8").split("\n", 2)[:2]
         if f"STRATA_HIPBLASLT_TUNING_V1 {arch} {ver}" in (h.strip() for h in head):
             ok(f"hipBLASLt tuning table: {table.name} (faster prompts)")
             return table
@@ -1939,7 +2016,7 @@ def build_engine_hip(gpu, llama, vision="none") -> Path:
     eng = ROOT / "engine"
     eng.mkdir(exist_ok=True)
     stamp = eng / "BUILD.json"
-    meta = json.loads(stamp.read_text()) if stamp.exists() else {}
+    meta = json.loads(stamp.read_text(encoding="utf-8")) if stamp.exists() else {}
     src, vsrc = source_hash(ENGINE_SOURCES), source_hash(VISION_SOURCES)
     archs = sorted(set(gpu.get("archs") or [gpu["arch"]]))
     has_archs = set(archs) <= set(meta.get("archs", []))
@@ -2002,7 +2079,8 @@ def build_vision_cpu(eng: Path, stamp: Path, meta: dict, llama, vsrc) -> Path:
     if not ((eng / VEXE).exists() and meta.get("vision_src") == vsrc):
         say("  Compiling the image encoder (for the CPU) ...")
         cmake_build(ROOT / "tools" / "vision", ROOT / "build-vision", "strata-vision",
-                    [f"-DLLAMA_DIR={llama}", "-DSTRATA_VISION_CUDA=OFF"], None, "")
+                    [f"-DLLAMA_DIR={llama}", "-DSTRATA_VISION_CUDA=OFF"], find_vcvars() if WIN else None,
+                    "build-vision-cpu.bat" if WIN else "")   # #881: MSVC's environment on Windows, as the CUDA path has
         shutil.copy2(ROOT / "build-vision" / "bin" / VEXE, eng / VEXE)
     stamp.write_text(json.dumps({**meta, "vision": "cpu", "vision_src": vsrc}, indent=1))
     ok(f"engine: {eng / EXE}, image encoder (CPU): {eng / VEXE}")
@@ -2026,6 +2104,70 @@ def prebuilt_bases(url_base) -> list[str]:
     return [PREBUILT_TAG_URL.format(version=source_version()), base]
 
 
+PREVIOUS_ENGINE = ".previous"
+
+
+def engine_version_of(folder: Path) -> str:
+    try:
+        return str(json.loads((folder / "BUILD.json").read_text(encoding="utf-8")).get("version", "?"))
+    except (OSError, ValueError):
+        return "?"
+
+
+def install_unpacked(tmp: Path, eng: Path) -> None:
+    """#670: the unpacked engine (tmp) replaces the installed one in `eng`, which is kept, one generation, in
+    eng/.previous (about 210 MiB): a new engine that turns out bad has a way back (`setup.py --rollback-engine`).  The
+    swap is all or nothing: a failure part-way puts the old files back instead of leaving a mix of old and new."""
+    prev = eng / PREVIOUS_ENGINE
+    new = list(tmp.iterdir())
+    old = [eng / p.name for p in new if p.name != PREVIOUS_ENGINE and (eng / p.name).exists()]
+    shutil.rmtree(prev, ignore_errors=True)
+    moved, placed = [], []
+    try:
+        if old:
+            prev.mkdir()
+        for dst in old:
+            shutil.move(str(dst), str(prev / dst.name))
+            moved.append(dst)
+        for p in new:
+            p.replace(eng / p.name)
+            placed.append(eng / p.name)
+    except OSError:
+        for dst in placed:                             # back to the old engine, whole
+            shutil.rmtree(dst) if dst.is_dir() else dst.unlink(missing_ok=True)
+        for dst in moved:
+            shutil.move(str(prev / dst.name), str(dst))
+        shutil.rmtree(prev, ignore_errors=True)
+        raise
+    if moved:
+        ok(f"the engine it replaced ({engine_version_of(prev)}) is kept in {prev}; "
+           "setup.py --rollback-engine puts it back")
+
+
+def rollback_engine(toolkit=13) -> int:
+    """#670: `setup.py --rollback-engine`: the engine kept in engine/.previous becomes the installed one again, and the
+    one it replaces is kept in its place (run it again to go forward)."""
+    eng = engine_dir(toolkit)
+    prev = eng / PREVIOUS_ENGINE
+    if not prev.is_dir() or not any(prev.iterdir()):
+        warn(f"no earlier engine is kept in {prev} (one is kept when an update replaces the engine)")
+        return 1
+    swap = eng / ".swap"
+    shutil.rmtree(swap, ignore_errors=True)
+    swap.mkdir()
+    was = engine_version_of(eng)
+    for p in list(prev.iterdir()):                     # what the earlier engine has: the current copy goes aside
+        cur = eng / p.name
+        if cur.exists():
+            shutil.move(str(cur), str(swap / p.name))
+        shutil.move(str(p), str(cur))
+    for p in list(swap.iterdir()):
+        shutil.move(str(p), str(prev / p.name))
+    shutil.rmtree(swap, ignore_errors=True)
+    ok(f"engine {engine_version_of(eng)} is installed again (it replaced {was}, which is kept in {prev})")
+    return 0
+
+
 def get_prebuilt(url_base, gpu, vision, updating=False, toolkit=13) -> Path | None:
     """The ready-made engine in engine/ (kept between runs), or None when there is none for this PC.
     updating: called to replace an installed engine, which starts instead when this fails (no compile).
@@ -2033,8 +2175,8 @@ def get_prebuilt(url_base, gpu, vision, updating=False, toolkit=13) -> Path | No
     eng = engine_dir(toolkit)
     asset = CUDA12_ASSET if int(toolkit) == 12 else PREBUILT_ASSET
     info = eng / "BUILD.json"
-    if info.exists() and (eng / EXE).exists() and json.loads(info.read_text()).get("backend") != "hip":
-        meta = json.loads(info.read_text())
+    if info.exists() and (eng / EXE).exists() and json.loads(info.read_text(encoding="utf-8")).get("backend") != "hip":
+        meta = json.loads(info.read_text(encoding="utf-8"))
         ver = tuple(int(x) for x in str(meta.get("version", "0")).split(".")[:3] if x.isdigit())
         if meta.get("source") == "local":              # compiled here: build_engine checks its source and cards
             return None
@@ -2072,9 +2214,13 @@ def get_prebuilt(url_base, gpu, vision, updating=False, toolkit=13) -> Path | No
     download(base + asset, z, "Strata engine")
     tmp = eng / "_unpack"
     shutil.rmtree(tmp, ignore_errors=True)
-    with zipfile.ZipFile(z) as f:
-        f.extractall(tmp)
-    meta = json.loads((tmp / "BUILD.json").read_text())
+    try:
+        with zipfile.ZipFile(z) as f:
+            f.extractall(tmp)
+    except zipfile.BadZipFile:                         # not a zip, or a damaged one: a kept .done mark would make
+        drop_archive(z)                                # every later run fail on it instead of downloading it again
+        raise
+    meta = json.loads((tmp / "BUILD.json").read_text(encoding="utf-8"))
     if tuple(int(x) for x in str(meta.get("version", "0")).split(".")[:3] if x.isdigit()) < MIN_ENGINE:
         need = ".".join(map(str, MIN_ENGINE))
         if updating:                                   # these files are newer than the published release (#58)
@@ -2095,11 +2241,7 @@ def get_prebuilt(url_base, gpu, vision, updating=False, toolkit=13) -> Path | No
         shutil.rmtree(tmp, ignore_errors=True)
         drop_archive(z)
         return None
-    for p in tmp.iterdir():
-        dst = eng / p.name
-        if dst.exists():
-            shutil.rmtree(dst) if dst.is_dir() else dst.unlink()
-        p.replace(dst)
+    install_unpacked(tmp, eng)
     shutil.rmtree(tmp, ignore_errors=True)
     drop_archive(z)
     if not (eng / EXE).exists():
@@ -2127,7 +2269,7 @@ def update_installed_engine(url_base, toolkit=None) -> None:
     info = eng / "BUILD.json"
     if not info.exists() or not (eng / EXE).exists():
         return
-    meta_text = info.read_text()
+    meta_text = info.read_text(encoding="utf-8")
     meta = json.loads(meta_text)
     if meta.get("backend") == "hip" and WIN:           # AMD on Windows: the ready-made HIP engine, when older
         ver = tuple(int(x) for x in str(meta.get("version", "0")).split(".")[:3] if x.isdigit())
@@ -2302,6 +2444,9 @@ def cmake_build(src, bdir, target, defs, vcvars, bat_name):
     # A failed build is tried once more: CUDA 13.0's ptxas now and then fails to parse a PTX file it just wrote, and
     # the same command then gets past it (issue #45); a second attempt only compiles what is still missing.
     if WIN:
+        if vcvars is None:                             # #881: the build needs MSVC's environment
+            fail("the Visual Studio C++ build tools were not found",
+                 "install them (Visual Studio 2019 or 2022, workload 'Desktop development with C++') and run setup again")
         bat = ROOT / bat_name
         q = lambda c: " ".join(f'"{x}"' if " " in str(x) else str(x) for x in c)  # noqa: E731
         bat.write_text(f'@echo off\r\ncall "{vcvars}" >nul\r\n{q(conf)} || exit /b 1\r\n{q(build)} && exit /b 0\r\n'
@@ -2369,7 +2514,7 @@ def build_engine(gpu, vision, yes, llama, toolkit=None) -> Path:
     eng = engine_dir(toolkit)
     eng.mkdir(exist_ok=True)
     stamp = eng / "BUILD.json"
-    meta = json.loads(stamp.read_text()) if stamp.exists() else {}
+    meta = json.loads(stamp.read_text(encoding="utf-8")) if stamp.exists() else {}
     want_vision = vision != "none"
     local = meta.get("source") == "local"
     src, vsrc = source_hash(ENGINE_SOURCES), source_hash(VISION_SOURCES)
@@ -2541,8 +2686,17 @@ def unsloth_together(a, model, ram, gpu, chosen) -> bool:
     names = " + ".join(gpu_name(g) for g in chosen)
     need = unsloth_split_need_gb(model)
     if ram < need:
-        warn(f"{model} runs on one GPU here: on several it has no RAM budget and needs ~{need:.0f} GB of RAM (its GGUF "
-             f"files and {UNSLOTH_RAM_LEFT_GB} GB more), this PC has {ram:.0f} - using {gpu_name(gpu)} only")
+        note = (f"{model} on several GPUs has no RAM budget and needs ~{need:.0f} GB of RAM (its GGUF files and "
+                f"{UNSLOTH_RAM_LEFT_GB} GB more), this PC has {ram:.0f}; the estimate is a worst case (#737: a 128 GB PC "
+                "ran it)")
+        if a.gpus and a.resident_budget_gib is None:    # #737: asked for by name: a question, not a refusal
+            confirm_risk(note + ", but it may page or stall here", True, a.yes,
+                         f"{model} on several GPUs needs ~{need:.0f} GB of RAM; this PC has {ram:.0f} GB",
+                         f"start it on one GPU: --gpus {gpu['index']}", "  Use them together anyway?")
+            ok(f"{model} on {names}, as you chose (--gpus), with {ram:.0f} GB of RAM")
+            return True
+        warn(f"{note} - using {gpu_name(gpu)} only (--gpus " + ",".join(str(g["index"]) for g in chosen) +
+             " uses them together anyway)")
         return False
     if a.resident_budget_gib is not None:
         warn(f"--resident-budget-gib has no layer split: {model} runs on one GPU with it - using {gpu_name(gpu)} only "
@@ -2611,8 +2765,10 @@ def ctx_ram_need(model, ctx, low_ram=False):
 
 def ram_ctx(model, ram, low_ram=False) -> int:
     """#406: the longest context the RAM rule recommends: 128K, or longer where the estimate fits this PC's RAM.  It
-    is part of the recommended default (the smaller of it and the GPU's rule); a longer choice is kept, with a note."""
-    return max(c for c in CONTEXTS if c <= 131072 or (ctx_ram_need(model, c, low_ram) or 0) <= ram)
+    is part of the recommended default (the smaller of it and the GPU's rule); a longer choice is kept, with a note.
+    The 200K menu step is never the recommendation (#608)."""
+    # 204800 (#608) is a menu step between 128K and 256K, never the recommendation: where 256K does not fit, 128K stays
+    return max(c for c in CONTEXTS if c <= 131072 or (c != 204800 and (ctx_ram_need(model, c, low_ram) or 0) <= ram))
 
 
 def settings_path() -> Path:
@@ -2767,7 +2923,7 @@ def data_folder(requested: str | None) -> tuple:
                 (folder / d).rmdir()                    # empty now
             except OSError:
                 pass
-        for c in folder.glob("strata-*.json"):
+        for c in model_config_files(folder):
             repoint_config(c, folder, dest)
         if has_data(folder):
             elsewhere.append(folder)                    # in use, or a copy the data folder already has
@@ -2821,6 +2977,35 @@ def carry_over(old: dict, cfg: dict) -> list[str]:
         if isinstance(mm, str) and Path(mm).name != Path(str(nv.get("mmproj"))).name and Path(mm).is_file():
             nv["mmproj"] = mm
             kept.append("vision mmproj")
+    kept += carry_profile_args(old, cfg)
+    return kept
+
+
+def flag_value(args: list, flag: str):
+    """The value after `flag` in an argument list, or None."""
+    for i, a in enumerate(args[:-1]):
+        if a == flag:
+            return str(args[i + 1])
+    return None
+
+
+def carry_profile_args(old: dict, cfg: dict) -> list[str]:
+    """#775: a learned expert profile the user wired in by hand (--expert-profile <their file>, --expert-profile-save
+    <file>) survives a setup run: setup writes the shipped profile, which a measured one of their own beats (2.5-3.1x at
+    256K on a 16 GB card in the report).  Their --expert-profile replaces the shipped one only when it is another file
+    that still exists; --expert-profile-save is kept when the new config has none.  The names kept are returned."""
+    oargs, nargs = old.get("args"), cfg.get("args")
+    if not isinstance(oargs, list) or not isinstance(nargs, list):
+        return []
+    kept = []
+    mine, shipped = flag_value(oargs, "--expert-profile"), flag_value(nargs, "--expert-profile")
+    if mine and shipped and Path(mine).name != Path(shipped).name and Path(mine).is_file():
+        nargs[nargs.index("--expert-profile") + 1] = mine
+        kept.append("args --expert-profile")
+    save = flag_value(oargs, "--expert-profile-save")
+    if save and flag_value(nargs, "--expert-profile-save") is None:
+        nargs += ["--expert-profile-save", save]
+        kept.append("args --expert-profile-save")
     return kept
 
 
@@ -2883,13 +3068,19 @@ def readable_config(path: Path) -> bool:
     return False
 
 
+def model_config_files(folder: Path) -> list:
+    """#346: the strata-*.json files of a folder that can be model configs. The server keeps a config's Chat settings
+    next to it as strata-<model>.shared-settings.json: it matches the pattern but is no config (no exe, no args)."""
+    return [p for p in folder.glob("strata-*.json") if not p.name.endswith(".shared-settings.json")]
+
+
 def previous_config(elsewhere_first: list, settings: dict):
     """The most recently used model config of another Strata folder on this PC, for a folder that has none yet.  One
     that does not parse (an empty or cut-off file, #459) is skipped with a warning: the newest readable one is used,
     and with none this copy is set up as a fresh install."""
     cands = []
     for folder in [*elsewhere_first, *other_installs(settings)]:
-        cands += list(folder.glob("strata-*.json"))
+        cands += model_config_files(folder)
     cands = [c for c in dict.fromkeys(cands) if c.is_file()]
     return next((c for c in sorted(cands, key=lambda p: p.stat().st_mtime, reverse=True) if readable_config(c)), None)
 
@@ -2945,7 +3136,7 @@ def model_config(path: Path) -> bool:
 
 
 def installed_configs():
-    return [p for p in sorted(ROOT.glob("strata-*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    return [p for p in sorted(model_config_files(ROOT), key=lambda p: p.stat().st_mtime, reverse=True)
             if model_config(p)]
 
 
@@ -2960,7 +3151,7 @@ def engine_version(exe: Path) -> tuple:
     engine is not necessarily the source's version: when compiling a `git pull` fails, the previous engine is kept
     (issue #49)."""
     try:
-        meta = json.loads((Path(exe).parent / "BUILD.json").read_text())
+        meta = json.loads((Path(exe).parent / "BUILD.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         meta = {}
     v = str(meta.get("version") or "")
@@ -3203,7 +3394,7 @@ def start(cfg_path: Path, port: int | None, gpu: int | list | None = None, open_
                      "set it up for these cards: ./setup.sh --setup --backend hip --gpus " + ",".join(map(str, gpu)))
             cfg["gpu"], cfg["gpus_asked"] = gpu, True
             cfg["layer_split"] = layer_split or cfg.get("layer_split") or "auto"
-            split_budget(cfg)                          # #498: before it is saved (it stops when the RAM is short)
+            split_budget(cfg, yes, True)               # #498: before it is saved (asks when the RAM is short, #737)
             write_config(cfg_path, cfg)
             gpu = None
         elif gpu is not None:
@@ -3231,7 +3422,7 @@ def start(cfg_path: Path, port: int | None, gpu: int | list | None = None, open_
         check_gpus(gpu, found, yes=yes, named=True)
         cfg["gpu"], cfg["gpus_asked"] = gpu, True
         cfg["layer_split"] = layer_split or cfg.get("layer_split") or "auto"
-        split_budget(cfg)                              # #498: before it is saved (it stops when the RAM is short)
+        split_budget(cfg, yes, True)                   # #498: before it is saved (asks when the RAM is short, #737)
         recommend_remote_expert_opt(cfg)
         write_config(cfg_path, cfg)
         gpu = None
@@ -3432,6 +3623,7 @@ def parallel_note(asked: int | None, vram_gbs, arena_gb: float, ctx: int, kv: st
     return lines
 
 
+DISPLAY_RESERVE_MIB = 1500     # #779: the tip for an NVIDIA card that also drives a display
 DESKTOP_RESERVE_MIB = 3072     # #560 #516: what kept a KDE/Wayland desktop alive beside a full expert cache
 
 
@@ -3496,7 +3688,7 @@ def ensure_engine_for(cards, cfg_path: Path, cfg: dict, yes: bool) -> dict:
         return cfg
     eng = engine_dir(tk)
     info = eng / "BUILD.json"
-    meta = json.loads(info.read_text())
+    meta = json.loads(info.read_text(encoding="utf-8"))
     say()
     say("  The installed engine has no code for " + ", ".join(f"{g['name']} (sm_{g['arch']})" for g in missing) +
         ": it is compiled for " + ("these cards" if len(cards) > 1 else "it") + " now.")
@@ -3504,7 +3696,7 @@ def ensure_engine_for(cards, cfg_path: Path, cfg: dict, yes: bool) -> dict:
     archs = sorted({int(x) for x in meta.get("archs", [])} | {int(g["arch"]) for g in cards})
     vision = meta.get("vision") or ("gpu" if (eng / VEXE).exists() else "none")
     build_engine({**main, "archs": archs}, vision, yes, get_llama_cpp(), toolkit=tk)
-    dirs = json.loads(info.read_text()).get("cuda_dirs") or []
+    dirs = json.loads(info.read_text(encoding="utf-8")).get("cuda_dirs") or []
     cfg["lib_dirs"] = dirs + [d for d in cfg.get("lib_dirs") or [] if d not in dirs]
     write_config(cfg_path, cfg)
     return cfg
@@ -3514,7 +3706,7 @@ def get_cuda12_engine(url_base, gpu, vision, yes, build=False) -> Path:
     """The experimental CUDA 12 engine for these cards (gpu["archs"]): the ready-made one (Windows) with NVIDIA's
     CUDA 12 libraries, or compiled here with a CUDA 12.x toolkit (Linux, --build, or no ready-made one)."""
     eng = None if build else get_prebuilt(url_base, gpu, vision, toolkit=12)
-    if eng is not None and json.loads((eng / "BUILD.json").read_text()).get("source") != "local":
+    if eng is not None and json.loads((eng / "BUILD.json").read_text(encoding="utf-8")).get("source") != "local":
         pip_cuda_libs(12)
         if vision != "none" and not (eng / VEXE).exists():
             eng = None
@@ -3523,7 +3715,7 @@ def get_cuda12_engine(url_base, gpu, vision, yes, build=False) -> Path:
 
 def engine_lib_dirs(eng: Path, toolkit=13) -> list:
     """The library folders a CUDA engine loads from: its own (a compiled one: the toolkit's), else pip's wheels."""
-    meta = json.loads((eng / "BUILD.json").read_text())
+    meta = json.loads((eng / "BUILD.json").read_text(encoding="utf-8"))
     return meta.get("lib_dirs") or meta.get("cuda_dirs") or cuda_lib_dirs(toolkit)
 
 
@@ -3682,6 +3874,8 @@ def main() -> int:
     ap.add_argument("--update", action="store_true",
                     help="update the installed engine, Python packages and model settings as a start would, without "
                          "starting the model (UPDATE.bat / update.sh run it after a git pull)")
+    ap.add_argument("--rollback-engine", action="store_true",
+                    help="put back the engine an update replaced (kept in engine/.previous), and keep the current one there")
     ap.add_argument("--build", action="store_true", help="compile the engine instead of using the ready-made one")
     ap.add_argument("--cuda", choices=["12", "13", "auto"], default=os.environ.get("STRATA_CUDA") or None,
                     help="NVIDIA: the CUDA toolkit of this model's engine. auto (default): CUDA 13, the ready-made "
@@ -3740,6 +3934,9 @@ def main() -> int:
     roots = [data, *elsewhere]
     if a.models_dir is None:
         a.models_dir = str(data / "models")
+
+    if a.rollback_engine:                              # #670
+        return rollback_engine(12 if a.cuda == "12" else 13)
 
     # ---- 0. already installed: just start it
     have = installed_configs()
@@ -4221,16 +4418,16 @@ def main() -> int:
     else:
         eng = None if a.build or hip or not X86 else get_prebuilt(a.prebuilt, gpu, vision, **({"toolkit": 12} if cuda_tk == 12
                                                                                     else {}))
-    if eng is not None and not hip and json.loads((eng / "BUILD.json").read_text()).get("source") != "local":
+    if eng is not None and not hip and json.loads((eng / "BUILD.json").read_text(encoding="utf-8")).get("source") != "local":
         pip_cuda_libs(cuda_tk)
         if vision != "none" and not (eng / VEXE).exists():
             warn("the ready-made engine has no image encoder: compiling it")
             eng = None
         else:
-            vision = prebuilt_vision(json.loads((eng / "BUILD.json").read_text()), gpu, vision)
+            vision = prebuilt_vision(json.loads((eng / "BUILD.json").read_text(encoding="utf-8")), gpu, vision)
     if eng is None:
         eng = build_engine_hip(gpu, llama, vision) if hip else build_engine(gpu, vision, a.yes, llama, toolkit=cuda_tk)
-    meta = json.loads((eng / "BUILD.json").read_text())
+    meta = json.loads((eng / "BUILD.json").read_text(encoding="utf-8"))
     if hip and WIN:                                    # the ready-made engine's rocm/bin, first on the engine's PATH
         lib_dirs = [str(d) for d in hip_lib_dirs(eng)]
     else:
@@ -4281,6 +4478,9 @@ def main() -> int:
         else:
             download(fam["mmproj_hf"] + fam["mmproj"], mmproj, "vision encoder")
         ok(f"vision encoder: {mmproj}")
+        if vision == "cpu" and "BF16" in mmproj.name:       # a tip only (recommend, never force; #625)
+            say("       tip: on the CPU a Q8_0 copy of this encoder is a third smaller and about as exact (embedding "
+                "cosine 0.999 vs BF16); see 'A Q8_0 encoder' in docs/DETAILS.md")
 
     # ---- 6. the pack and the MTP draft layer
     step(6, "preparing the model for Strata")
@@ -4291,7 +4491,7 @@ def main() -> int:
         if not (pack / "index.txt").exists() or not (pack / "experts.bin").exists():   # index.txt is written last
             say("  Converting the Q2_0 experts for the AVX-512 kernel (one time, ~40 GB written, 2-5 min) ...")
             run([sys.executable, str(ROOT / "tools" / "strata_pack.py"), "build", "--gguf", str(shards[0]),
-                 "--out", str(pack), "--skip-hash"], env=env)
+                 "--out", str(pack), "--skip-hash", "--force"], env=env)   # --force: #634 refuses an occupied pack
             run([sys.executable, str(ROOT / "tools" / "pack_index.py"), "--pack", str(pack)], env=env)
         if not (pack / "tokenizer" / "vocab.json").exists():
             run([sys.executable, str(ROOT / "tools" / "strata_tokenizer.py"), "--gguf", str(shards[0]),
@@ -4438,6 +4638,9 @@ def main() -> int:
     elif hip and a.vram_reserve_mib is None and linux_desktop():
         for line in desktop_reserve_note():              # #560 #516: a recommendation: nothing changes
             say("  " + line)
+    if not hip and not multi and a.vram_reserve_mib is None and gpu_drives_display(gpu):
+        say("  tip: this card drives a display. If the PC freezes or the screen goes black once the model is loaded "
+            f"(#779), keep more VRAM free: run setup again with --vram-reserve-mib {DISPLAY_RESERVE_MIB}")   # a tip only
     if esp is not None:
         # the package's profile, with llama.cpp's flags (the engine takes the same ones)
         args += ["--control-vector-scaled", f"{esp}:1.0", "--control-vector-layer-range", "4", "44",
