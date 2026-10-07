@@ -2,6 +2,7 @@
 #include "strata/prefill/kernels.hpp"
 #include "strata/core/fp16_mode.hpp"
 #include "strata/kernels/mrope.hpp"
+#include "strata/kernels/gfx_arch.hpp"
 #include "strata/kernels/router_top10.hpp"
 
 #include <cuda_fp16.h>
@@ -1559,7 +1560,7 @@ bool gr_upmix(const uint16_t* lo16, const uint16_t* w_up, const float* R, const 
         int dev = 0;
         cudaDeviceProp p;
         if (cudaGetDevice(&dev) != cudaSuccess || cudaGetDeviceProperties(&p, dev) != cudaSuccess) return false;
-        return std::strncmp(p.gcnArchName, "gfx11", 5) == 0;
+        return strata::kernels::gfx_arch_is_gfx11_wmma(p.gcnArchName);
     }();
     if (!gfx11 || T <= 0) return false;
     gr_upmix_kernel<<<dim3(N / UM_D, (unsigned) ((T + UM_T - 1) / UM_T)), 256, 0, (cudaStream_t) stream>>>(

@@ -3,6 +3,7 @@
 #include <cstdlib>
 #include <cstring>
 #include "strata/kernels/qsa_select.hpp"
+#include "strata/kernels/gfx_arch.hpp"
 
 #include <cuda_runtime.h>
 #if !defined(__HIPCC__)
@@ -452,7 +453,7 @@ bool sel_gfx12_device() {
         cudaDeviceProp prop;
         ok[dev] = (cudaGetDeviceProperties(&prop, dev) == cudaSuccess &&
                    (std::strncmp(prop.gcnArchName, "gfx1200", 7) == 0 || std::strncmp(prop.gcnArchName, "gfx1201", 7) == 0 ||
-                    std::strncmp(prop.gcnArchName, "gfx110", 6) == 0 || std::strncmp(prop.gcnArchName, "gfx115", 6) == 0))
+                    strata::kernels::gfx_arch_is_gfx11_wmma(prop.gcnArchName)))
                       ? 1 : 2;
         cudaGetLastError();
     }

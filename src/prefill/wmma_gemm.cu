@@ -23,6 +23,9 @@
 #include <hip/hip_bfloat16.h>
 
 #include <cstdlib>
+#include "strata/kernels/gfx_arch.hpp"
+
+#include <atomic>
 #include <cstring>
 
 // STRATA_WMMA_GFX11 is defined by the BUILD (CMakeLists.txt, from CMAKE_HIP_ARCHITECTURES), not inferred
@@ -35,6 +38,24 @@
 
 using v8fp32 = float __attribute__((ext_vector_type(8)));
 
+// Does the CURRENT device run the gfx11 WMMA kernels of this file?  Exactly the targets whose intrinsics are selected
+// below (gfx1100 / 1101 / 1102 / 1150 / 1151): a gfx11 part outside the list (gfx1103, gfx1152) has no device code
+// here, so it takes the hipBLASLt / hipBLAS paths instead of running a kernel that is not there.  Cached per device
+// (hipGetDeviceProperties is not cheap, and a mixed-GPU box has more than one answer).
+static bool strata_wmma_gfx11_device() {
+    static std::atomic<int> cache[64];   // 0 unknown, 1 yes, 2 no
+    int dev = 0;
+    if (hipGetDevice(&dev) != hipSuccess || dev < 0 || dev >= 64) return false;
+    int c = cache[dev].load(std::memory_order_acquire);
+    if (c == 0) {
+        hipDeviceProp_t prop{};
+        const bool ok = hipGetDeviceProperties(&prop, dev) == hipSuccess && strata::kernels::gfx_arch_is_gfx11_wmma(prop.gcnArchName);
+        c = ok ? 1 : 2;
+        cache[dev].store(c, std::memory_order_release);
+    }
+    return c == 1;
+}
+
 template <typename ElemT>
 struct WmmaTraits;
 
@@ -45,7 +66,8 @@ struct WmmaTraits<_Float16> {
 #if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1150__) || defined(__gfx1151__)
         return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c);
 #else
-        (void) a; (void) b; return c;   // not a gfx11 device pass: never launched (runtime gate)
+        (void) a; (void) b; (void) c;
+        __builtin_trap();   // a device pass without the gfx11 intrinsic: the runtime gate never launches it, and a stray launch must not return zeros
 #endif
     }
 };
@@ -57,7 +79,8 @@ struct WmmaTraits<__bf16> {
 #if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1150__) || defined(__gfx1151__)
         return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, c);
 #else
-        (void) a; (void) b; return c;   // not a gfx11 device pass: never launched (runtime gate)
+        (void) a; (void) b; (void) c;
+        __builtin_trap();   // see above
 #endif
     }
 };
@@ -246,12 +269,7 @@ static inline bool strata_wmma_gemm_dispatch(const uint16_t* X, const uint16_t* 
     if (T <= 0 || N <= 0 || K <= 0) return false;
     // Runtime gate (review): run only on gfx11 devices, whatever this build compiled for.  The build-time
     // STRATA_WMMA_GFX11 macro controls whether the intrinsics compile; this check controls whether they run.
-    {
-        int dev = 0;
-        hipDeviceProp_t prop{};
-        if (hipGetDevice(&dev) != hipSuccess || hipGetDeviceProperties(&prop, dev) != hipSuccess) return false;
-        if (std::strncmp(prop.gcnArchName, "gfx11", 5) != 0) return false;
-    }
+    if (!strata_wmma_gfx11_device()) return false;
     if (K % 16 != 0) return false;
     if (beta != 0.0f && beta != 1.0f) return false;
     if (ldy <= 0) ldy = N;
@@ -636,13 +654,7 @@ bool strata_pf_hcdown_bf16(const uint16_t* X, int64_t ldx, const uint16_t* Wd, c
                            int64_t ni, float* lo, float* inj, int64_t T, int64_t K, void* stream) {
     if (!X || !Wd || !Wi || !lo || !inj || T < 64 || nd < 1 || ni < 0 || K % 64 != 0 || ldx < K || ldx % 8 != 0) return false;
     if (T > (1LL << 30) || K > (1LL << 30) || ldx > (1LL << 30)) return false;
-    static const bool gfx11 = [] {
-        int dev = 0;
-        hipDeviceProp_t prop{};
-        if (hipGetDevice(&dev) != hipSuccess || hipGetDeviceProperties(&prop, dev) != hipSuccess) return false;
-        return std::strncmp(prop.gcnArchName, "gfx11", 5) == 0;
-    }();
-    if (!gfx11) return false;
+    if (!strata_wmma_gfx11_device()) return false;
     const int64_t mt = (T + pfg::BM - 1) / pfg::BM;
     const unsigned grid = (unsigned) (mt * ((nd + ni + 127) / 128));
     pfg::kernel_hcdown<<<grid, 256, 0, static_cast<hipStream_t>(stream)>>>(X, (int) ldx, Wd, Wi, (int) nd, (int) ni,
@@ -655,13 +667,7 @@ bool strata_pf_hcdown_exact_bf16(const uint16_t* X, int64_t ldx, const uint16_t*
     if (!X || !W || !Y || T < 1 || N != pfg::HX_N || K != pfg::HX_K || ldx < K || ldx % 8 != 0 || ldx > (1LL << 30) ||
         T > (1LL << 30))
         return false;
-    static const bool gfx11 = [] {
-        int dev = 0;
-        hipDeviceProp_t prop{};
-        if (hipGetDevice(&dev) != hipSuccess || hipGetDeviceProperties(&prop, dev) != hipSuccess) return false;
-        return std::strncmp(prop.gcnArchName, "gfx11", 5) == 0;
-    }();
-    if (!gfx11) return false;
+    if (!strata_wmma_gfx11_device()) return false;
     const unsigned grid = (unsigned) (2 * ((T + pfg::HX_BM - 1) / pfg::HX_BM));
     pfg::kernel_hcd_exact<<<grid, pfg::HX_NT, 0, static_cast<hipStream_t>(stream)>>>(X, (int) ldx, W, Y, (int) T);
     return hipGetLastError() == hipSuccess;
@@ -679,13 +685,7 @@ bool strata_pf_gemm_f16_ld(const uint16_t* X, int64_t ldx, const uint16_t* W, in
     if (ldy <= 0) ldy = N;
     if (ldx < K || ldw < K || ldx % 8 != 0 || ldw % 8 != 0 || ldx > (1LL << 30) || ldw > (1LL << 30)) return false;
     if (ldy < N || T > (1LL << 30) || N > (1LL << 30) || K > (1LL << 30)) return false;
-    static const bool gfx11 = [] {
-        int dev = 0;
-        hipDeviceProp_t prop{};
-        if (hipGetDevice(&dev) != hipSuccess || hipGetDeviceProperties(&prop, dev) != hipSuccess) return false;
-        return std::strncmp(prop.gcnArchName, "gfx11", 5) == 0;
-    }();
-    if (!gfx11) return false;
+    if (!strata_wmma_gfx11_device()) return false;
     hipStream_t s = static_cast<hipStream_t>(stream);
     const int acc = beta == 1.0f ? 1 : 0;
     const int64_t mt = (T + pfg::BM - 1) / pfg::BM;

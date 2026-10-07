@@ -26,8 +26,14 @@ bool strata_pf_gemm_f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t 
 /// S23 (STRATA_PF_HCDOWN=1): lo[t, n] = sum_k X[t, k] Wd[n, k] (n < nd) and inj[t, n] = sum_k X[t, k] Wi[n, k]
 /// (n < ni) in one BF16 WMMA GEMM over X (T x K, token stride ldx >= K, a multiple of 8; Wd / Wi row-major, stride
 /// K); lo T x nd and inj T x ni, FP32.  K a multiple of 64, T >= 64.  False (nothing launched) otherwise / off gfx11.
+#if defined(STRATA_USE_HIP)
 bool strata_pf_hcdown_bf16(const uint16_t* X, int64_t ldx, const uint16_t* Wd, const uint16_t* Wi, int64_t nd,
                            int64_t ni, float* lo, float* inj, int64_t T, int64_t K, void* stream = nullptr);
+#else
+// wmma_gemm.cu is part of the AMD builds only: another build has no such kernel (prefill.cpp then stops with its error)
+inline bool strata_pf_hcdown_bf16(const uint16_t*, int64_t, const uint16_t*, const uint16_t*, int64_t, int64_t, float*, float*,
+                                   int64_t, int64_t, void* = nullptr) { return false; }
+#endif
 /// S (STRATA_HCD_EXACT=1): Y[t, n] = sum_k X[t, k] W[n, k] for N 320, K 10240 (BF16, FP32 out, X token stride ldx >= K, a
 /// multiple of 8), bitwise equal to hipBLASLt solution 1176 / 1177 for that shape (its k order, StaggerU included).
 /// False (nothing launched) for any other shape / off gfx11.

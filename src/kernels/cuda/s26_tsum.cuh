@@ -24,8 +24,8 @@ template <int O>
 __device__ __forceinline__ float xmov(float v) { return __shfl_xor_sync(0xffffffffu, v, O); }
 #endif
 
-constexpr int pow2_ceil(int t) { return t <= 1 ? 1 : t <= 2 ? 2 : t <= 4 ? 4 : t <= 8 ? 8 : t <= 16 ? 16 : 32; }
-constexpr int log2c(int p) { return p <= 1 ? 0 : p == 2 ? 1 : p == 4 ? 2 : p == 8 ? 3 : p == 16 ? 4 : 5; }
+__host__ __device__ constexpr int pow2_ceil(int t) { return t <= 1 ? 1 : t <= 2 ? 2 : t <= 4 ? 4 : t <= 8 ? 8 : t <= 16 ? 16 : 32; }
+__host__ __device__ constexpr int log2c(int p) { return p <= 1 ? 0 : p == 2 ? 1 : p == 4 ? 2 : p == 8 ? 3 : p == 16 ? 4 : 5; }
 
 template <int O>
 __device__ __forceinline__ float tplain(float x) {

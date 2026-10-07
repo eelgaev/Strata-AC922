@@ -643,7 +643,6 @@ const DevInfo& dev_info() {
     cudaGetLastError();
 #endif
     return d;
-#endif
 }
 
 }  // namespace

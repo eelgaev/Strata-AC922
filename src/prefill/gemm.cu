@@ -488,9 +488,24 @@ constexpr int64_t kXSliceElems = 16ll << 20;   // 32 MiB of FP16 activations per
 #endif
 bool Gemm::bf16_hcd_exact(const uint16_t* X, int64_t ldx, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K) {
 #if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
-    if (!hipblaslt_state_ || N != 320 || K != 10240 || T < 1) return false;
+    static std::atomic<bool> told{false};
+    if (!hipblaslt_state_ || N != 320 || K != 10240 || T < 1) {
+        if (N == 320 && K == 10240 && !told.exchange(true))
+            std::fprintf(stderr, "strata: STRATA_HCD_EXACT: no hipBLASLt tuning table is loaded, so the exact kernel has nothing to match: "
+                                 "the hyper-connection down projection stays on hipBLAS\n");
+        return false;
+    }
+    // The kernel copies hipBLASLt solution 1176 / 1177's summation order, which is only true of the library build the
+    // table was calibrated with: take it only when the table makes hipBLASLt pick one of those two for this T.
     const int id = hipblaslt_solution_for(hipblaslt_state_, strata::prefill::hipblaslt::InputType::bf16, T, N, K, N, 0.0f);
-    if (id != 1176 && id != 1177) return false;
+    if (id != 1176 && id != 1177) {
+        if (T >= 4096 && !told.exchange(true))   // (a short chunk may legitimately get another solution: not worth a line)
+            std::fprintf(stderr, "strata: STRATA_HCD_EXACT: the tuning table gives the hyper-connection down projection (N 320, K 10240) "
+                                 "solution %d at T %lld, not 1176 / 1177: hipBLASLt runs it (a changed table or library; "
+                                 "tools/hip/gfx1151-hipblaslt-100401.txt is the one measured)\n",
+                         id, (long long) T);
+        return false;
+    }
     return strata_pf_hcdown_exact_bf16(X, ldx, W, Y, T, N, K, stream_);
 #else
     (void) X; (void) ldx; (void) W; (void) Y; (void) T; (void) N; (void) K;

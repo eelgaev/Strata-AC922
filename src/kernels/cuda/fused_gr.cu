@@ -422,6 +422,7 @@ __global__ void __launch_bounds__(THREADS) gr_up_multi_t_kernel(GrMulti m) {
         for (int c = 0; c < HC; ++c) s += g[k][c][col];
         m.a[k].mixed[d0 + col] = s / (float) HC;
     }
+    if (m.a[0].q8_mixed != nullptr) gr_q8_tail(m, d0);   // S26 STRATA_QFUSE (as gr_up_multi_kernel)
 }
 #define STRATA_UP_T(TT) \
     case TT: if (m.a[0].w_f16) gr_up_multi_t_kernel<TT, true><<<UPM_BLOCKS, THREADS, 0, st>>>(m); \

@@ -972,7 +972,6 @@ const DevInfo& dev_info() {
     cudaGetLastError();
 #endif
     return d;
-#endif
 }
 
 // opt-in on top of STRATA_PF_FUSED=1: STRATA_PF_FUSED_KQ=1 takes UD-Q4_K_XL's formats (the output differs from the FP16

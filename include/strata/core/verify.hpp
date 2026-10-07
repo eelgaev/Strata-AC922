@@ -227,6 +227,9 @@ private:
     bool last_batch_ = false;              ///< the last run was a batch window (set_plan_slot: one group)
     std::map<uint64_t, cudaGraphExec_t> exec_bm_, commit_bm_;   ///< key: batch_key(rows, S, hand-off base)
     int last_rows_[8] = {};                ///< the slots of the last batch window's rows
+    uint64_t bkey(const int* rows, int S, int hbase) const {   // #871: the doorbell variant has its own graphs
+        return batch_key(rows, S, hbase) | (ar_off_ ? (1ull << 63) : 0ull);
+    }
     static uint64_t batch_key(const int* rows, int S, int hbase) {
         uint64_t k = (uint64_t) hbase << 40 | (uint64_t) S << 32;
         for (int t = 0; t < S; ++t) k |= (uint64_t) (rows[t] & 15) << (4 * t);
@@ -260,8 +263,16 @@ private:
     int device_ = -1;                    ///< the device `init` ran on: run/commit switch to it (layer split)
     std::atomic<bool> released_{false};  ///< #267: release_gpu_waits ran (maybe on the watchdog thread): no more windows
     bool all_resident_ = false;           ///< 100% of experts in [lb_, le_) resident in VRAM: zero-doorbell graph
+    /// #871: the zero-doorbell graph plans from the device residency table alone, so it is only right while every
+    /// expert of the stage is in VRAM.  A prompt loan, a VRAM shrink or an adaptive swap marks some -1 for a while:
+    /// every window then runs the doorbell graph (exec_nr_ / the batch key's top bit), the same as a stage that never
+    /// was all-resident.  refresh_ar() looks at the host table before each window.
+    bool ar_off_ = false;
+    bool ar_on() const { return all_resident_ && !ar_off_; }
+    void refresh_ar();
+    uint32_t* h_plan_err_ = nullptr; uint32_t* m_plan_err_ = nullptr;   // set by resident_plan on a -1 (all-resident graph)
+    const int32_t* h_res_ = nullptr;      ///< the host residency table (VerifyHits::h_res)
     bool device_plan_ = false;            ///< E-6: resident-only layers planned on the device (STRATA_VERIFY_DEVICE_PLAN)
-    bool resident_ = false;               ///< STRATA_VERIFY_RESIDENT: every expert resident, no host step per layer
     uint32_t* skip_ = nullptr;            ///< E-6: per group, the ring whose plan the device built (0: the host's)
     unsigned* qcnt_ = nullptr;             ///< S26 STRATA_QFUSE: the HC read's q8_1 group counters (n_embd / 32)
     unsigned long long* slot_off_d_ = nullptr;   ///< E-6: the slot offsets on the device
@@ -306,6 +317,7 @@ private:
     cudaStream_t sh_cs_ = nullptr;
     cudaEvent_t ev_fork_ = nullptr, ev_join_ = nullptr;
     cudaGraphExec_t exec_[9] = {};
+    cudaGraphExec_t exec_nr_[9] = {};   // #871: the doorbell variant of a stage that is all-resident otherwise
     cudaGraphExec_t commit_exec_ = nullptr;
 
     // mapped staging (host pointer, device alias)

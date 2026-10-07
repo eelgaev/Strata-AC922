@@ -927,7 +927,7 @@ static_assert(kVerifyMaxT * 10 <= kResidentPlanMax, "resident_plan: one thread p
 __global__ void __launch_bounds__(kResidentPlanMax) resident_plan_kernel(const int32_t* __restrict__ ids, int n, int k, const int32_t* __restrict__ res,
                                      int n_expert, const uint8_t* cache_base, const unsigned long long* slot_off,
                                      long long blob, int32_t* __restrict__ pl, long long capx, uint32_t* skip,
-                                     uint32_t ring) {
+                                     uint32_t ring, volatile uint32_t* plan_err) {
     __shared__ int32_t s_ids[kResidentPlanMax];
     __shared__ unsigned long long s_ptr[kResidentPlanMax];
     __shared__ int32_t s_first[kResidentPlanMax];
@@ -952,6 +952,10 @@ __global__ void __launch_bounds__(kResidentPlanMax) resident_plan_kernel(const i
     __syncthreads();
     if (s_bad) {
         if (tid == 0 && skip != nullptr) *skip = 0;
+        if (tid == 0 && skip == nullptr) {   // #871: the all-resident graph has no host plan to fall back on
+            pl[0] = 0; pl[1] = 0; pl[2] = 0;   // an empty plan: no expert runs on a stale pointer
+            if (plan_err != nullptr) { *plan_err = 1; __threadfence_system(); }
+        }
         return;
     }
 
@@ -1097,9 +1101,9 @@ __global__ void copy_or_zero_kernel(float4* __restrict__ dst, const volatile flo
 
 void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_layer, int n_expert,
                    const uint8_t* cache_base, const unsigned long long* slot_off, long long blob, int32_t* plan,
-                   long long capx, uint32_t* skip, uint32_t ring, void* stream) {
+                   long long capx, uint32_t* skip, uint32_t ring, void* stream, uint32_t* plan_err) {
     resident_plan_kernel<<<1, kResidentPlanMax, 0, (cudaStream_t) stream>>>(ids, n_entries, k, res_layer, n_expert, cache_base, slot_off,
-                                                              blob, plan, capx, skip, ring);
+                                                              blob, plan, capx, skip, ring, plan_err);
     check("resident_plan");
 }
 void wait_flag_ge_or(const uint32_t* flag, uint32_t value, const uint32_t* skip, void* stream) {

@@ -1780,8 +1780,13 @@ void launch_mmvq(const uint8_t* W, size_t rb, const block_q8_1* X, float* y, int
 // Bitwise equal to native_gu_multi_kernel / native_down_multi_kernel (S26 harness, real UD-IQ4_XS expert blobs, T 1-3,
 // memcmp of every output): each row's lane sums and warp_sum are the same; a warp interleaves RPW rows (more loads in
 // flight) and reads the chunk's activation rows from LDS and, for IQ3_S, the grid table from LDS (the same values).
+#if defined(__HIPCC__)
+#define STRATA_NT_LOAD(p) __builtin_nontemporal_load(p)
+#else   // (opt-in S26 kernels, AMD-tuned: a CUDA build compiles them with plain loads)
+#define STRATA_NT_LOAD(p) (*(p))
+#endif
 template<bool NT> __device__ __forceinline__ int ld16i(const uint16_t* p) {
-    if constexpr (NT) return (int) __builtin_nontemporal_load(p); else return (int) *p;
+    if constexpr (NT) return (int) STRATA_NT_LOAD(p); else return (int) *p;
 }
 template<bool NT> __device__ __forceinline__ int ldb2(const void* x, int i32) {
     const uint16_t* x16 = (const uint16_t*) x;
@@ -1790,7 +1795,7 @@ template<bool NT> __device__ __forceinline__ int ldb2(const void* x, int i32) {
     return x32;
 }
 template<bool NT> __device__ __forceinline__ int ld8i(const uint8_t* p) {
-    if constexpr (NT) return (int) __builtin_nontemporal_load(p); else return (int) *p;
+    if constexpr (NT) return (int) STRATA_NT_LOAD(p); else return (int) *p;
 }
 template<bool NT> __device__ __forceinline__ float ldhalf(const half* p) {
     return __half2float(__ushort_as_half((unsigned short) ld16i<NT>(reinterpret_cast<const uint16_t*>(p))));
@@ -1909,7 +1914,7 @@ __global__ void __launch_bounds__(256) s26_gu_l_kernel(const unsigned long long*
             __syncthreads();   // the previous chunk is done with s_x
             for (int i = threadIdx.x; i < n * xb; i += 256) {
                 const int c = i / xb, j = i - c * xb;
-                s_x[c * S26_XMAX + j] = xq[(size_t) ent_tok[e + c] * xb + j];
+                memcpy(&s_x[c * S26_XMAX + j], &xq[(size_t) ent_tok[e + c] * xb + j], sizeof(s_x[0]));
             }
 #pragma unroll
             for (int c = 0; c < GRP_NC; ++c) off[c] = min(c, n - 1) * S26_XMAX;
@@ -1993,7 +1998,7 @@ __global__ void __launch_bounds__(256) s26_down_l_kernel(const unsigned long lon
             __syncthreads();
             for (int i = threadIdx.x; i < n * hb; i += 256) {
                 const int c = i / hb, j = i - c * hb;
-                s_h[c * S26_HMAX + j] = hq[(size_t) (e + c) * hb + j];
+                memcpy(&s_h[c * S26_HMAX + j], &hq[(size_t) (e + c) * hb + j], sizeof(s_h[0]));
             }
             __syncthreads();
 #pragma unroll
@@ -2276,7 +2281,7 @@ __global__ void __launch_bounds__(256) s27_gu_kernel(const unsigned long long* _
             __syncthreads();   // the previous chunk is done with s_x
             for (int i = threadIdx.x; i < n * xb; i += 256) {
                 const int c = i / xb, j = i - c * xb;
-                s_x[c * S26_XMAX + j] = xq[(size_t) ent_tok[e + c] * xb + j];
+                memcpy(&s_x[c * S26_XMAX + j], &xq[(size_t) ent_tok[e + c] * xb + j], sizeof(s_x[0]));
             }
 #pragma unroll
             for (int c = 0; c < GRP_NC; ++c) off[c] = min(c, n - 1) * S26_XMAX;
@@ -2360,7 +2365,7 @@ __global__ void __launch_bounds__(256) s27_down_kernel(const unsigned long long*
             __syncthreads();
             for (int i = threadIdx.x; i < n * hb; i += 256) {
                 const int c = i / hb, j = i - c * hb;
-                s_h[c * S26_HMAX + j] = hq[(size_t) (e + c) * hb + j];
+                memcpy(&s_h[c * S26_HMAX + j], &hq[(size_t) (e + c) * hb + j], sizeof(s_h[0]));
             }
             __syncthreads();
 #pragma unroll
@@ -3102,11 +3107,11 @@ __global__ void __launch_bounds__(256) native_gu_fused_kernel(const unsigned lon
                 amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
                 sum += __shfl_xor_sync(0xffffffffu, sum, o);
             }
-            const float d = amax / 127.0f;
-            const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+            const float d = q8_1_finite(amax / 127.0f);   // #606, as q8_1_store: finite blocks bit for bit
+            const int8_t q = q8_1_quant(xi, d, amax);
             block_q8_1* y = hq + (size_t) (c0 + warp) * hb + blockIdx.x;
             y->qs[lane] = q;
-            if (lane == 0) y->ds = make_half2(d, sum);
+            if (lane == 0) y->ds = q8_1_ds(d, sum);
         }
     }
 }

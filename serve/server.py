@@ -743,6 +743,11 @@ class StrataEngine:
                 if len(f) >= 3 and f[1].isdigit() and f[2].isdigit():
                     self.progress = (int(f[1]), int(f[2]))
                     self.prefill_tok_s_mean = float(f[4]) if len(f) >= 5 else None
+                if not stopped and cancel.is_set():
+                    # #879: a Stop during the prompt read went out only after the first token (or after 10 s of
+                    # silence, which a stream of PP lines never allows): the engine read the whole prompt first
+                    self._send("STOP")
+                    stopped = True
                 yield None
             elif line.startswith("DONE"):
                 self._parse_done(line)
