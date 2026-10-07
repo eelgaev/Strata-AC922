@@ -139,6 +139,8 @@ MIN_ENGINE = (0, 1, 39)                # v0.1.39: the #577 file-tier regression 
 # a CPU without the ready-made engine compiles it with its own CUDA toolkit: 12.x runs on 525+ (minor-version
 # compatibility), and ppc64le's last driver is 550 (CUDA 12.4)
 MIN_DRIVER_LOCAL = 525
+# KV bytes per context token and attention layer: 8-bit 1056, rotated 4-bit 576, hybrid K8V4 (8-bit K, 4-bit V) 816
+KV_CELL_BYTES = {"q4_0": 576, "k8v4": 816}
 PY_PACKAGES = ["numpy", "jinja2", "regex", "pyyaml", "tqdm", "requests", "cmake", "ninja", "pillow", "psutil"]
 REQUIREMENTS = ROOT / "requirements.txt"   # the same packages and their dependencies, pinned (#214)
 
@@ -2597,7 +2599,7 @@ def low_ram_gpu_gb(model, vram_gb, ctx=32768, kv="int8") -> float:
     """About how many GB of the model's experts the GPU's cache holds: its VRAM minus ~5 GB for the dense weights,
     buffers and a 32K context's KV cache, minus the KV cache of a longer context (in VRAM in the low-RAM mode: its RAM
     has no room for KV streaming)."""
-    kv_tok = 13 * (576 if kv == "q4_0" else 1056)       # bytes per context token: 12 QSA layers + the draft layer
+    kv_tok = 13 * KV_CELL_BYTES.get(kv, 1056)           # bytes per context token: 12 QSA layers + the draft layer
     longer = max(0, ctx - 32768) * kv_tok / 1e9
     return max(0.0, min(MODELS[model]["arena_gb"], vram_gb - 5 - longer))
 
@@ -4568,19 +4570,12 @@ def main() -> int:
                  "--ple-io ram in the config's args keeps the table in RAM instead")
     # KV streaming: from 64K up the whole KV cache lives in RAM and only the part the attention reads (32K positions
     # per layer) stays in VRAM; the VRAM it frees holds more experts (+6% at 128K, +23% at 262K with Q2_0). It
-    # costs ~13.7 KB of RAM per context token with 8-bit KV (1.7 GB at 128K), 7.5 KB with 4-bit, so only when it fits.
-    kv_ram_gb = ctx * (13 * (576 if kv == "q4_0" else 1056)) / 1e9   # 12 QSA layers + the draft layer
-    # Hybrid K8V4 never streams its KV (mode 0 only, layer.hpp), so it is excluded from the WHOLE streaming
-    # decision rather than one threshold at a time - a future tier added to this chain cannot reintroduce the
-    # combination the engine refuses (PR review).
-    # --kv-streaming on|off overrides the RAM test (the owner's rule); k8v4 and WSL stay off - they cannot stream.
+    # costs ~13.7 KB of RAM per context token with 8-bit KV (1.7 GB at 128K), 10.6 KB with K8V4, 7.5 KB with 4-bit, so only
+    # when it fits.
+    kv_ram_gb = ctx * (13 * KV_CELL_BYTES.get(kv, 1056)) / 1e9   # 12 QSA layers + the draft layer
+    # --kv-streaming on|off overrides the RAM test (the owner's rule); WSL stays off - it cannot stream.
     stream_fits = ram >= MODELS[model]["ram_gb"] + kv_ram_gb + 1
-    if kv == "k8v4":
-        if ctx >= 65536:
-            ok("KV streaming off: not supported with --kv k8v4; the KV cache stays in VRAM")
-        if a.kv_streaming == "on":
-            warn("--kv-streaming on: the engine has no KV streaming with --kv k8v4 (it refuses the pair): off")
-    elif gpu.get("unified_memory") and ctx >= 65536:
+    if gpu.get("unified_memory") and ctx >= 65536:
         # streaming moves the KV cache to RAM to free VRAM for experts; with one memory for both it frees nothing
         ok("KV streaming off: unified memory (the GPU's memory is the system's RAM), there is no VRAM to free")
     elif is_wsl() and ctx >= 65536:

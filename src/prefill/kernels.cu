@@ -49,8 +49,17 @@ __device__ __forceinline__ uint16_t hf_sat(float f) { return hf(isnan(f) ? f : f
 // The 16-bit activation image the BF16-weight GEMMs read (STRATA_PREFILL_F16, see prefill_f16_mode()):
 // M 0 = BF16 (the default); 1 = the BF16-rounded value in FP16 (exact below 65504); 2 = FP16 straight from FP32.
 // 1 and 2 saturate at +-65504 like hf_sat.
+// HIP (#835): M 0 is upstream's runtime choice - FP16 where the GEMM library is fast only in FP16 (prompt_f16() in
+// gemm.cu: rocBLAS on gfx103x), set once per device by set_act_f16; CUDA's M 0 is always BF16.
+#if defined(__HIPCC__)
+__device__ int g_act_f16 = 0;
+#endif
 template <int M> __device__ __forceinline__ uint16_t act16(float f) {
+#if defined(__HIPCC__)
+    if constexpr (M == 0) return g_act_f16 ? hf_sat(f) : bf(f);
+#else
     if constexpr (M == 0) return bf(f);
+#endif
     else if constexpr (M == 1) return hf_sat(__uint_as_float((uint32_t) bf(f) << 16));
     else return hf_sat(f);
 }
@@ -237,7 +246,7 @@ __global__ void __launch_bounds__(256) gr_write_cvec_norm_rs_kernel(
 #pragma unroll
     for (int d = threadIdx.x; d < N; d += 256, ++k) {
         const float y = x[k] * rs * w[c * N + d];
-        const uint16_t h = bf(y);
+        const uint16_t h = act16<0>(y);
         xn16[t * ldx + (int64_t) c * N + d] = h;
         if (xn16_lo) xn16_lo[t * ldx + (int64_t) c * N + d] = bf_lo(y, h);
     }
@@ -1468,7 +1477,7 @@ __global__ void __launch_bounds__(256) gr_upmix_kernel(const uint16_t* __restric
         }
         s /= (float) HC;
         mixed[t * N + d] = s;
-        if (mixed16) mixed16[t * N + d] = bf(s);
+        if (mixed16) mixed16[t * N + d] = act16<0>(s);
         if (mixed_h) mixed_h[t * N + d] = hf(s);
     }
 }
@@ -1501,6 +1510,18 @@ void gr_inject_f32(const float* R, const float* rs, const float* w_norm, const f
     if (T <= 0) return;
     gr_inject_f32_kernel<<<(unsigned) T, 256, 0, (cudaStream_t) stream>>>(R, rs, w_norm, w_inject, inj);
     check("gr_inject_f32");
+}
+void set_act_f16(bool on) {
+#if !defined(__HIPCC__)
+    (void) on;   // CUDA: the activation image is always BF16
+    return;
+#else
+    const int v = on ? 1 : 0;
+    if (cudaMemcpyToSymbol(g_act_f16, &v, sizeof v) != cudaSuccess) {
+        std::fprintf(stderr, "prefill: setting the FP16 activation image failed: %s\n", cudaGetErrorString(cudaGetLastError()));
+        std::exit(1);
+    }
+#endif
 }
 void to_f16(const float* x, uint16_t* y, int64_t n, void* stream) {
     if (n <= 0) return;

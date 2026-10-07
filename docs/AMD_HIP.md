@@ -348,6 +348,19 @@ run it; the report below is from a community machine: an RX 6900 XT 16 GB (gfx10
   [AMD_HIP_PERFORMANCE.md](AMD_HIP_PERFORMANCE.md) cost 8.6 and 13.6 tok/s here (30 with the defaults): keep the
   defaults on a 16 GB card.
 - **hipBLASLt:** ROCm's hipBLASLt ships no gfx1030 kernels, so there is no table and the plain hipBLAS path runs.
+- **Prompt GEMMs in FP16 (#835):** rocBLAS on gfx1030 has tuned kernels for FP16-in / FP16-out GEMMs only; the prompt
+  path's FP16-in / FP32-out and BF16 products ran generic kernels about 6.6x slower (5.6 and ~5.3 TFLOPS against 37.7 at
+  N = 10240, T = 7313, K = 2560). `STRATA_HIP_PROMPT_F16=1` (opt-in, off by default; the engine prints a tip on gfx103x) runs the 16-bit prompt GEMMs FP16 in and out;
+  unset is the old path. `STRATA_DBG_NAN=1` also counts the non-finite FP16 outputs (a sum past 65504). The output is not bit-identical to it (an FP16 rounding of each GEMM's output replaces the BF16 rounding of
+  the BF16 GEMMs' activations); what the distribution check showed and did not show is in
+  [bench/results/2026-10-04-rdna2-fp16-prompt](../bench/results/2026-10-04-rdna2-fp16-prompt/README.md). Measured on a
+  second community machine - 2x RX 6900 XT 16 GB (one card for these numbers), Ryzen 5 5600X (6 cores, AVX2), 128 GB,
+  Ubuntu 26.04, ROCm 10.0.0, engine 0.1.39 built by hand with `-DSTRATA_PREFILL_MMQ=ON` as setup does, GSQ-RCO IQ3_S:
+  a 9.4K / 34.7K / 105.8K-token prompt reads at 744 / 915 / 926 tok/s instead of 439 / 466 / 461; decode is unchanged.
+  On that machine the HIP ctest passes 60 of 65 with and without this change: 2 skipped (`hip_prompt_attn_wmma`, no
+  matrix cores; `hip_prefill_hipblaslt_gemm`, no hipBLASLt table) and 3 that fail for reasons outside the engine
+  (`ple_parity` needs a Q2_0 PLE file that is not on that machine, `expert_multi_test` refuses the CPU without AVX-512,
+  `platform_memory_test` cannot `mlock` at the shell's default `ulimit -l`).
 - **gfx1031** (RX 6700 XT, #524): setup knows it (the `gfx103X-all` wheels, unvalidated); its reporter runs it daily
   on one card.
 - **Not validated:** gfx1032 (the same `dp4a` path, no hardware report), setup's own build path and the
@@ -433,6 +446,19 @@ prompt speed with and without it before keeping it.
 Shipped tables:
 
 - `gfx1100-hipblaslt-100100.txt`, `gfx1100-hipblaslt-100200.txt`: RX 7900 XTX.
+- `gfx1100-hipblaslt-100401.txt`: RX 7900 XTX, calibrated with the packaged ROCm 10.0.0
+  (`rocm/dev-ubuntu-24.04:10.0.0-full`, hipBLASLt 1.4.1) on a Ryzen 7 9800X3D, over the 26 dense GEMM
+  geometries of the shipped gfx1100 table. Without it, that stack reads a prompt through plain hipBLAS: on
+  Swift 1.5 IQ3_XXS at 262144 ctx, fresh-prompt prefill measured 682 -> 1,038 tok/s at 1.7K tokens and
+  857 -> 1,524 tok/s at 6.5K (medians of 3, decode unchanged), with `hip_prefill_hipblaslt_gemm` reporting
+  `fallbacks=0`. setup uses it only when the installed hipBLASLt reports 1.4.1.
+- `gfx1100-hipblaslt-100500.txt`: RX 7900 XTX (gfx1100, 24 GB), calibrated with a ROCm 10.2.0a20261003 nightly
+  SDK (`libamdhip64.so.7.17.26392`, hipBLASLt 1.5.0, version number 100500). Same 16 dense GEMM geometries at
+  T=4096 and T=8192 as the other gfx1100 tables (32 rows), calibrated with `tune_hipblaslt` run against that
+  library. On this ROCm the engine refuses the 100100/100200 tables (version mismatch) and prefills on plain
+  hipBLAS; with this table a 0.1.38-lineage nightly engine prefills a 131071-token prompt at 1687 tok/s vs 926
+  without it (median of 3 clean runs each, greedy; decode unchanged). Per-run data and the calibration command:
+  the `2026-10-04-community-rx7900xtx-hipblaslt-100500` folder of PR #745.
 - `gfx1201-hipblaslt-100500.txt`: Radeon AI PRO R9700 (gfx1201, 32 GB), calibrated with ROCm 10.2.0a20260914
   (AMD's `gfx120X-all` nightly, hipBLASLt 1.5.0, library build `d3164197`). 16 dense GEMM geometries at T=4096 and
   T=8192, 32 rows. setup uses it only when the installed hipBLASLt reports 1.5.0 (it is found in `/opt/rocm`

@@ -209,11 +209,11 @@ def install(argv) -> None:
 
     write = S.write_run_script
 
-    def write_run_script(model, cfg_path, port):
+    def write_run_script(model, cfg_path, port, open_browser=True):   # setup.write_run_script's signature (#870)
         cfg = json.loads(Path(cfg_path).read_text(encoding="utf-8"))
         cfg = to_sycl(cfg, exe, real_ram, keep.get(Path(cfg_path).name, {}))
         Path(cfg_path).write_text(json.dumps(cfg, indent=1), encoding="utf-8")
-        script = write(model, cfg_path, port)
+        script = write(model, cfg_path, port, open_browser)
         script.write_text(script.read_text().replace(str(ROOT / "serve" / "server.py"), str(SERVER)))
         return script
     S.write_run_script = write_run_script

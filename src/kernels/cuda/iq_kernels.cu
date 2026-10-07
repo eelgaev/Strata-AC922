@@ -1078,11 +1078,18 @@ struct IqGridWords {
 
 // mmvq_kernel with the columns taken NC at a time.  After warp_sum every lane holds the same sum, so lane c stores
 // column c.
+// #778: `__shared__ alignas(16)` does not compile for gfx1030 (HIP); the attribute after the declarator does, but nvcc
+// with MSVC as host does not take it.  Same layout either way.
+#if defined(__HIPCC__)
+#define STRATA_SHARED_ALIGN16_U32(name, ...) __shared__ uint32_t name[__VA_ARGS__] __attribute__((aligned(16)))
+#else
+#define STRATA_SHARED_ALIGN16_U32(name, ...) __shared__ alignas(16) uint32_t name[__VA_ARGS__]
+#endif
 template<int TY, int NC, bool STAGE_GRID = kStageIqGrid<TY>>
 __global__ void __launch_bounds__(128) mmvq_multi_kernel(const uint8_t* __restrict__ w, size_t row_bytes,
                                                          const block_q8_1* __restrict__ x, float* __restrict__ y,
                                                          int n_in, int n_out, int ncols) {
-    __shared__ alignas(16) uint32_t s_grid_buf[IqGridWords<TY, STAGE_GRID>::value];
+    STRATA_SHARED_ALIGN16_U32(s_grid_buf, IqGridWords<TY, STAGE_GRID>::value);
     const uint32_t* s_grid = stage_iq_grid<TY, STAGE_GRID>(s_grid_buf, threadIdx.y * 32 + threadIdx.x, 128);
     const int row = blockIdx.x * 4 + threadIdx.y;
     if (row >= n_out) return;
@@ -1150,7 +1157,7 @@ __global__ void __launch_bounds__(256) native_gu_multi_kernel(const unsigned lon
                                                               float* __restrict__ gate, float* __restrict__ up) {
     const int ng = *n_groups;
     if (blockIdx.y >= ng) return;
-    __shared__ alignas(16) uint32_t s_grid_buf[IqGridWords<TG, STAGE_GRID>::value];
+    STRATA_SHARED_ALIGN16_U32(s_grid_buf, IqGridWords<TG, STAGE_GRID>::value);
     const uint32_t* s_grid = stage_iq_grid<TG, STAGE_GRID>(s_grid_buf, threadIdx.x, 256);
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int row = blockIdx.x * GU_ROWS + warp;             // 0 .. 2*n_ff

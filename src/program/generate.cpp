@@ -38,6 +38,7 @@
 #include "strata/kernels/s2_expert_grouped.hpp"
 #include "strata/kernels/sampler.hpp"
 #include "strata/kernels/verify_kernels.hpp"
+#include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/shared_expert.hpp"
 #include "strata/kernels/native_moe.hpp"
 #include "strata/kernels/native_gdn.hpp"
@@ -157,6 +158,30 @@ bool pin_blobs_on() {
 #else
     return false;
 #endif
+}
+// #884 (HIP, opt-in STRATA_HIP_ADAPT_KERNEL_COPY=1): an adaptive swap's host-to-device copy as a kernel on the refill stream
+// instead of a copy-engine (SDMA) memcpy.  2x RX 6900 XT hung after a long prompt only with the MMQ prompt path, adaptive swaps
+// AND SDMA together (any one off avoids it; the barrier packet that never passes is a ROCm-side problem, #884).  This keeps
+// the swaps off SDMA without turning SDMA off for the prompt read (HSA_ENABLE_SDMA=0 costs 10-24% of it).  Needs the source to
+// be mapped, 16-byte aligned memory (the registered arena); anything else takes the normal cudaMemcpyAsync.
+cudaError_t adapt_copy_h2d(void* dst, const void* src, size_t bytes, cudaStream_t st) {
+#if defined(STRATA_USE_HIP)
+    static const bool kernel = [] {
+        const char* e = std::getenv("STRATA_HIP_ADAPT_KERNEL_COPY");
+        const bool on = e != nullptr && e[0] == '1';
+        if (on) std::fprintf(stderr, "strata: STRATA_HIP_ADAPT_KERNEL_COPY=1: adaptive swaps copy with a kernel, not SDMA (#884)\n");
+        return on;
+    }();
+    if (kernel && bytes % 16 == 0 && ((uintptr_t) src & 15) == 0 && ((uintptr_t) dst & 15) == 0) {
+        void* dsrc = nullptr;
+        if (cudaHostGetDevicePointer(&dsrc, const_cast<void*>(src), 0) == cudaSuccess && dsrc != nullptr) {
+            strata::kernels::copy_from_mapped((float*) dst, (const float*) dsrc, (int64_t) (bytes / 4), (void*) st);
+            return cudaGetLastError();
+        }
+        (void) cudaGetLastError();   // not registered / not mapped: the ordinary copy
+    }
+#endif
+    return cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, st);
 }
 int pin_blobs(std::vector<std::pair<uintptr_t, uintptr_t>> r, std::vector<void*>& live) {
     int failed = 0;   // ranges left pageable (a copy from them still works, through the driver's staging)
@@ -628,7 +653,7 @@ void usage() {
                  "  --kv q4_0            4-bit K/V after a Hadamard rotation (PR #21): half of int8's memory,\n"
                  "                       slightly lower precision (see bench/results/2026-09-27-kv-q4)\n"
                  "  --kv k8v4            hybrid: INT8 K (exact attention scores) + rotated Q4_0 V, 816 B/cell\n"
-                 "                       (vs int8's 1,056); not with --kv-resident\n"
+                 "                       (vs int8's 1,056); streams with --kv-resident too\n"
                  "  --kv-resident N      KV streaming: keep N cells of each QSA layer in VRAM (min 20480) and the\n"
                  "                       whole K/V in pinned RAM; the freed VRAM goes to expert slots. 0 (default):\n"
                  "                       all of it in VRAM. A context of N cells or fewer is not streamed\n"
@@ -2058,10 +2083,6 @@ int main(int argc, char** argv) {
     strata::core::qsa_set_kv_hybrid(o.kv == "k8v4");   // K8V4: INT8 K + rotated Q4_0 V, 816 B/cell
     if (o.kv_resident < 0) {
         std::fprintf(stderr, "strata generate: --kv-resident must be >= 0\n");
-        return 2;
-    }
-    if (o.kv == "k8v4" && o.kv_resident > 0) {
-        std::fprintf(stderr, "strata generate: --kv k8v4 does not support --kv-resident streaming (yet)\n");
         return 2;
     }
     strata::core::qsa_set_kv_resident(o.kv_resident);
@@ -6452,9 +6473,9 @@ int main(int argc, char** argv) {
                 GpuStage* gs = stn > 0 ? stages[(size_t) stn - 1].get() : nullptr;
                 const strata::core::OnDevice on(gs ? gs->dev : -1);
                 if (slot < 0 || b == nullptr ||
-                    cudaMemcpyAsync(gs ? gs->cache.device_slot(slot) : xcache.device_slot(slot), b,
-                                    (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer),
-                                    cudaMemcpyHostToDevice, gs ? gs->adapt_stream : adapt_stream) != cudaSuccess) {
+                    adapt_copy_h2d(gs ? gs->cache.device_slot(slot) : xcache.device_slot(slot), b,
+                                   (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer),
+                                   gs ? gs->adapt_stream : adapt_stream) != cudaSuccess) {
                     std::fprintf(stderr, "strata serve: adaptive swap copy failed (layer %d, slot %d, pinned %d): %s\n",
                                  (int) s.layer, (int) slot, pin_live.empty() ? 0 : 1, cudaGetErrorString(cudaGetLastError()));
                     return false;
@@ -9968,8 +9989,8 @@ int main(int argc, char** argv) {
                 const uint8_t* b = srcp->blob(s.layer, s.in);
                 // asynchronous: the copies run while the MTP drafts; the next window waits for them
                 if (slot < 0 || b == nullptr ||
-                    cudaMemcpyAsync(xcache.device_slot(slot), b, (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer),
-                                    cudaMemcpyHostToDevice, adapt_stream) != cudaSuccess) {
+                    adapt_copy_h2d(xcache.device_slot(slot), b, (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer),
+                                   adapt_stream) != cudaSuccess) {
                     std::fprintf(stderr, "strata generate: an adaptive refill failed\n");
                     return false;
                 }

@@ -241,6 +241,12 @@ if(STRATA_BUILD_TESTS)
   add_executable(gguf_split_test tests/core/gguf_split_test.cpp)
   target_link_libraries(gguf_split_test PRIVATE strata_artifact)
   add_test(NAME gguf_split_test COMMAND gguf_split_test)
+
+  # the hipBLASLt tuning header's architecture gate: RDNA4 siblings share solution IDs, RDNA3 siblings share
+  # theirs, cross-family pairs and version mismatches stay rejected (synthetic tables: no model, no GPU)
+  add_executable(tuning_header_arch_family_test tests/prefill/tuning_header_arch_family_test.cpp)
+  target_include_directories(tuning_header_arch_family_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/prefill")
+  add_test(NAME tuning_header_arch_family_test COMMAND tuning_header_arch_family_test)
 endif()
 
 # ---- strata_plan ----------------------------------------------------------
@@ -526,6 +532,10 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(hip_prefill_gemm PRIVATE strata_prefill strata_hip_runtime)
     add_test(NAME hip_prefill_gemm COMMAND hip_prefill_gemm)
     list(APPEND _strata_hip_tests hip_prefill_gemm)
+    add_executable(hip_gemm_f16_io_parity tests/hip/gemm_f16_io_parity.cpp)
+    target_link_libraries(hip_gemm_f16_io_parity PRIVATE strata_prefill strata_hip_runtime)
+    add_test(NAME hip_gemm_f16_io_parity COMMAND hip_gemm_f16_io_parity)
+    list(APPEND _strata_hip_tests hip_gemm_f16_io_parity)
     add_executable(hip_q2_zero tests/hip/q2_zero.cpp)
     target_link_libraries(hip_q2_zero PRIVATE strata_kernels strata_hip_runtime)
     add_test(NAME hip_q2_zero COMMAND hip_q2_zero)
