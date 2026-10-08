@@ -1386,7 +1386,14 @@ void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64
         std::exit(1);
     }
 #if !defined(__HIPCC__)
-    if (reach > fit)   // past the register kernel's reach
+    // Turing prefill (the `counted` bound) above ~90K cells (22,528 blocks): the wide kernel, which reads the keys
+    // coalesced, instead of the register kernel's uncoalesced per-thread runs (PR #743: 131K, 1.03 -> 0.75 ms); the
+    // same ids.  STRATA_TOPK_STREAM=0 restores the register kernel there.
+    static const bool turing_wide = [] {
+        const char* v = std::getenv("STRATA_TOPK_STREAM");
+        return v == nullptr || v[0] != '0';
+    }();
+    if (reach > fit || (turing_wide && counted && reach > 22528))   // past the register kernel's reach, or Turing's band
         block_topk_wide_kernel<<<(unsigned) nq, TK_T, 0, (cudaStream_t) stream>>>(scores, steps, max_blocks, cap, ids);
     else
 #endif

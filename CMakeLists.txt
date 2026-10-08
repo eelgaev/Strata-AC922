@@ -81,6 +81,13 @@ option(STRATA_PREFILL_MMQ "Build the optional GGML MMQ prefill path for HIP" OFF
 # every kernel when it starts (CUDA_MODULE_LOADING=EAGER), so these took ~5 MB of VRAM - 1-3 expert slots - from every
 # model, and the UD-Q4_K_XL prompt is SSD-bound with or without them (docs/UNSLOTH_Q4.md)
 option(STRATA_MMQ_KQUANTS "Build the MMQ prompt kernels for Q4_K / Q5_K / Q5_1 / Q6_K: the CUDA experts of Unsloth's UD-Q4_K_XL, and on HIP the dense GGUF projections (STRATA_DENSE_MMQ)" OFF)
+# CUDA: Q6_K gate/up in the grouped expert kernels (Unsloth's UD-Q6_K_XL, docs/UNSLOTH_Q6.md).  Off by default: every
+# grouped-kernel instance is loaded when the engine starts (CUDA_MODULE_LOADING=EAGER), so one more costs VRAM that
+# every other model would lose as expert slots (PR #860 review)
+option(STRATA_Q6K_EXPERTS "Build the Q6_K gate/up grouped expert kernels (UD-Q6_K_XL)" OFF)
+if(STRATA_Q6K_EXPERTS)
+  add_compile_definitions(STRATA_Q6K_EXPERTS=1)
+endif()
 option(STRATA_ORCA_Q4KS_MMQ "Build the GGML Q5_0 MMQ instance for OrcaRouter Q4_K_S" OFF)
 if(STRATA_PREFILL_MMQ AND NOT STRATA_ENABLE_HIP)
   message(FATAL_ERROR "STRATA_PREFILL_MMQ requires STRATA_ENABLE_HIP=ON")
@@ -1015,6 +1022,34 @@ else()
                               PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx512vbmi;-mf16c;-mfma")
   set_source_files_properties(src/kernels/cpu/q2_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
 endif()
+# AVX-VNNI (Alder Lake, Sapphire Rapids and later): the AVX-2 expert kernels' vpdpwssd / vpdpbusd copies (q2_avx2.cpp,
+# iq_avx2.cpp; *_rows.inl), taken at run time where cpu_avxvnni_ok().  GCC and Clang compile only those functions with
+# target("avxvnni") - never -mavxvnni on a file, which would let the compiler use it anywhere - and MSVC takes the
+# intrinsics under /arch:AVX2.  A compiler without them (GCC < 11, Clang < 12) builds the files without the copies.
+include(CheckCXXSourceCompiles)
+if(MSVC)
+  set(CMAKE_REQUIRED_FLAGS "/arch:AVX2")
+else()
+  set(CMAKE_REQUIRED_FLAGS "-mavx2 -mfma -mf16c")
+endif()
+check_cxx_source_compiles([=[
+#include <immintrin.h>
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((target("avxvnni")))
+#endif
+static __m256i dots(__m256i a, __m256i b) { return _mm256_dpbusd_avx_epi32(_mm256_dpwssd_avx_epi32(a, a, b), a, b); }
+int main() {
+    volatile int x = 1;
+    return _mm256_extract_epi32(dots(_mm256_set1_epi32(x), _mm256_set1_epi32(x)), 0) == 0;
+}
+]=] STRATA_HAVE_AVXVNNI_INTRINSICS)
+unset(CMAKE_REQUIRED_FLAGS)
+if(STRATA_HAVE_AVXVNNI_INTRINSICS)
+  set(_strata_avxvnni STRATA_AVXVNNI=1)
+else()
+  set(_strata_avxvnni STRATA_AVXVNNI=0)
+endif()
+set_property(SOURCE src/kernels/cpu/q2_avx2.cpp APPEND PROPERTY COMPILE_DEFINITIONS ${_strata_avxvnni})
 find_package(Threads REQUIRED)
 target_link_libraries(strata_kernels_cpu PUBLIC Threads::Threads)
 
@@ -1115,6 +1150,7 @@ if(STRATA_NATIVE_EXPERTS)
     set_source_files_properties(src/kernels/cpu/kq_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
     set_source_files_properties(src/kernels/cpu/kq_avx1.cpp PROPERTIES COMPILE_OPTIONS "-mavx")
   endif()
+  set_property(SOURCE src/kernels/cpu/iq_avx2.cpp APPEND PROPERTY COMPILE_DEFINITIONS ${_strata_avxvnni})
   if(STRATA_ISA_FLOOR STREQUAL "avx")
     target_compile_definitions(strata_kernels_cpu PRIVATE STRATA_ISA_FLOOR_AVX=1)
   elseif(STRATA_ISA_FLOOR STREQUAL "none")
@@ -1134,6 +1170,16 @@ if(STRATA_NATIVE_EXPERTS)
   if(STRATA_BUILD_TESTS)
     add_test(NAME router_dot_parity COMMAND router_dot_parity)
     add_test(NAME router_dot_parity_avx COMMAND ${CMAKE_COMMAND} -E env STRATA_FORCE_ISA=avx $<TARGET_FILE:router_dot_parity>)
+  endif()
+  # the AVX-2 expert kernels' variants (iq_avx2.cpp, q2_avx2.cpp) bit for bit against each other at 1..8 tokens and
+  # against ggml-cpu's dot, on random blocks; --bench: ms per expert on one thread, the weights streamed from DRAM
+  if(STRATA_CPU_X86)   # x86 only (cpuid.h, the AVX-2 kernels); non-x86 builds have portable.cpp instead
+    add_executable(iq_avx2_parity src/kernels/cpu/iq_avx2_parity.cpp)
+    target_link_libraries(iq_avx2_parity PRIVATE strata_kernels_cpu)
+    if(STRATA_BUILD_TESTS)
+      add_test(NAME iq_avx2_parity COMMAND iq_avx2_parity)
+      add_test(NAME iq_avx2_parity_iq3s_mt1 COMMAND ${CMAKE_COMMAND} -E env STRATA_IQ3S_MT1=1 $<TARGET_FILE:iq_avx2_parity>)
+    endif()
   endif()
   set(_strata_mmq_types q2_0 iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl iq4_xs q8_0)
   # #296: OrcaRouter Q4_K_S's Q5_0 experts (Q4_K and Q5_1 come with STRATA_MMQ_KQUANTS on CUDA, S5's branch)
@@ -1160,6 +1206,9 @@ if(STRATA_NATIVE_EXPERTS)
     set(_strata_mmq_cuda_types ${_strata_mmq_types})
     if(STRATA_MMQ_KQUANTS)
       list(APPEND _strata_mmq_cuda_types q4_k q5_k q5_1)
+      if(STRATA_Q6K_EXPERTS)   # UD-Q6_K_XL gate/up (docs/UNSLOTH_Q6.md)
+        list(APPEND _strata_mmq_cuda_types q6_k)
+      endif()
     endif()
     foreach(_t IN LISTS _strata_mmq_cuda_types)
       target_sources(strata_mmq PRIVATE ${_strata_mmq}/template-instances/mmq-instance-${_t}.cu)
@@ -1287,7 +1336,15 @@ if(STRATA_NATIVE_EXPERTS)
       # noise, not a kernel bug -- see the PR).
       # q4_0/q4_0 and q4_0/q4_1: a plain llama-quantize Q4_0 file (bartowski's Qwen3.8-Flash-Next-Q4_0: gate/up Q4_0,
       # down Q4_0 on 42 layers and Q4_1 on 6)
-      foreach(_pair q4_K/q5_1 q4_K/q8_0 q5_K/q8_0 q8_0/q8_0 q4_K/q5_0 q5_0/q8_0 q4_0/q4_0 q4_0/q4_1)
+      # q6_K/q8_0: Unsloth UD-Q6_K_XL gate/up Q6_K with Q8_0 down (docs/UNSLOTH_Q6.md). Layer 2 is q8_0/q8_0, already listed.
+      set(_strata_parity_pairs q4_K/q5_1 q4_K/q8_0 q5_K/q8_0 q8_0/q8_0 q4_K/q5_0 q5_0/q8_0 q4_0/q4_0 q4_0/q4_1)
+      if(STRATA_Q6K_EXPERTS)
+        list(APPEND _strata_parity_pairs q6_K/q8_0)
+      else()   # a pair without GPU kernels (Q6_K gate/up) is refused by native_expert_supported, not run
+        add_test(NAME native_expert_parity_refuses_q6_K COMMAND native_expert_parity --synthetic q6_K/q8_0)
+        set_tests_properties(native_expert_parity_refuses_q6_K PROPERTIES WILL_FAIL TRUE)
+      endif()
+      foreach(_pair ${_strata_parity_pairs})
         string(REPLACE "/" "_" _name "${_pair}")
         add_test(NAME native_expert_parity_${_name} COMMAND native_expert_parity --synthetic ${_pair})
         set_tests_properties(native_expert_parity_${_name} PROPERTIES TIMEOUT 120)
@@ -1295,9 +1352,6 @@ if(STRATA_NATIVE_EXPERTS)
       add_test(NAME native_expert_parity_q5_1_min COMMAND native_expert_parity --q5_1-min)
       # #290: the BF16 token embedding (--embd-gguf) gathered and dequantized bit for bit
       add_test(NAME native_expert_parity_bf16_embd COMMAND native_expert_parity --bf16-embd)
-      # a pair without GPU kernels (Q6_K gate/up) is refused by native_expert_supported, not run
-      add_test(NAME native_expert_parity_refuses_q6_K COMMAND native_expert_parity --synthetic q6_K/q8_0)
-      set_tests_properties(native_expert_parity_refuses_q6_K PROPERTIES WILL_FAIL TRUE)
     endif()
   endif()
   # #296's real-weight checks (OrcaRouter Q4_K_S files; docs/ORCA_Q4_K_S.md) - test programs, not part of a release
@@ -1340,6 +1394,14 @@ if(STRATA_BUILD_TESTS)
     add_executable(expert_multi_test src/kernels/cpu/expert_multi_test.cpp)
     target_link_libraries(expert_multi_test PRIVATE strata_kernels_cpu)
     add_test(NAME expert_multi_test COMMAND expert_multi_test)
+  endif()
+
+  # PR #706: the opt-in AVX-2 Q2_0 bit-plane kernel (STRATA_Q2_BITPLANE=1) against the legacy one, bitwise alone/window
+  if(STRATA_BUILD_TESTS AND CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64|x64|X86")
+    add_executable(q2_bitplane_parity src/kernels/cpu/q2_bitplane_parity.cpp)
+    target_link_libraries(q2_bitplane_parity PRIVATE strata_kernels_cpu)
+    add_test(NAME q2_bitplane_parity COMMAND q2_bitplane_parity)
+    set_tests_properties(q2_bitplane_parity PROPERTIES ENVIRONMENT "STRATA_Q2_BITPLANE=1")
   endif()
 
   add_executable(expert_parity src/kernels/cpu/expert_parity.cpp)

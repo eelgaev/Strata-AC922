@@ -284,19 +284,25 @@ double ms_since(Clock::time_point t) { return std::chrono::duration<double, std:
 struct Alloc {
     uint8_t* base = nullptr;
     uint64_t cap = 0, used = 0;
+    uint64_t failed_bytes = 0;          ///< the take that could not be allocated; the failure message names it
+    uint64_t granule = 0;               ///< count_only: each take rounds up to this (cudaMalloc's 2 MiB pages: owned buffers)
     bool count_only = false;
     std::vector<void*>* owned = nullptr;
     template <typename T> T* take(size_t n, bool& ok) {
-        const uint64_t bytes = ((uint64_t) n * sizeof(T) + 256 + 255) & ~255ull;
-        if (count_only) { used += bytes; return nullptr; }
+        uint64_t bytes = ((uint64_t) n * sizeof(T) + 256 + 255) & ~255ull;
+        if (count_only) {
+            if (granule > 0) bytes = (bytes + granule - 1) / granule * granule;
+            used += bytes;
+            return nullptr;
+        }
         if (base != nullptr) {
-            if (used + bytes > cap) { ok = false; return nullptr; }
+            if (used + bytes > cap) { ok = false; failed_bytes = bytes; return nullptr; }
             T* p = (T*) (base + used);
             used += bytes;
             return p;
         }
         void* p = nullptr;
-        if (cudaMalloc(&p, bytes) != cudaSuccess) { ok = false; return nullptr; }
+        if (cudaMalloc(&p, bytes) != cudaSuccess) { ok = false; failed_bytes = bytes; return nullptr; }
         owned->push_back(p);
         used += bytes;
         return (T*) p;
@@ -924,7 +930,13 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         set_act_f16(m.f16_io);
     }
     if (!carve(T, &o)) {
-        err = "prefill: device buffers for a chunk of " + std::to_string(chunk) + " tokens do not fit";
+        size_t fb = 0, tb = 0;
+        cudaMemGetInfo(&fb, &tb);
+        (void) cudaGetLastError();
+        err = "prefill: device buffers for a chunk of " + std::to_string(chunk) + " tokens do not fit (" +
+              std::to_string(fb >> 20) + " of " + std::to_string(tb >> 20) + " MiB free at the failure; " +
+              std::to_string(o.used >> 20) + " MiB taken, the failing buffer wanted " +
+              std::to_string(o.failed_bytes >> 20) + " MiB)";
         return false;
     }
     return true;
@@ -1005,10 +1017,22 @@ bool Prefill::carve(size_t T, void* alloc) {
         if (!m.mmq_ctx) m.mmq_ctx = std::make_unique<mmq::Context>();
     }
     m.ring = ring_slots(T);
-    for (int i = 0; i < m.ring; ++i) {
-        m.stage_dev[i] = o.take<uint8_t>((size_t) MAXBLOB(), ok);
-        m.stage_live[i] = false;                        // a new buffer: nothing of an earlier layout to wait for
-        m.used_of[i] = i;
+    if (o.base == nullptr && m.ring > 0) {
+        // OWNED buffers: the ring in ONE allocation.  384 separate 2.7 MiB cudaMallocs each round up to a 2 MiB page
+        // (~1.3 MiB a slot, ~0.5 GiB in all) that no count ever saw.  A borrowed region keeps its per-slot layout (and
+        // so its price, `bytes_needed`: the loans' slot counts do not move).
+        uint8_t* ring_base = o.take<uint8_t>((size_t) m.ring * (size_t) MAXBLOB(), ok);
+        for (int i = 0; ok && i < m.ring; ++i) {
+            m.stage_dev[i] = ring_base + (size_t) i * (size_t) MAXBLOB();
+            m.stage_live[i] = false;
+            m.used_of[i] = i;
+        }
+    } else {
+        for (int i = 0; i < m.ring; ++i) {
+            m.stage_dev[i] = o.take<uint8_t>((size_t) MAXBLOB(), ok);
+            m.stage_live[i] = false;                        // a new buffer: nothing of an earlier layout to wait for
+            m.used_of[i] = i;
+        }
     }
     m.ple_emb = o.take<float>(T * N, ok);
     m.ple_norm = o.take<float>((size_t) strata::kernels::NG_HC_DIM, ok);
@@ -1037,7 +1061,13 @@ bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::
     void* ws = o.take<uint8_t>(GEMM_WS, ok);
     if (ok) m.gemm.rebind(gs, GEMM_SCRATCH, ws, GEMM_WS);
     if (!ok || !carve((size_t) chunk, &o)) {
-        err = "prefill: device buffers for a chunk of " + std::to_string(chunk) + " tokens do not fit";
+        size_t fb = 0, tb = 0;
+        cudaMemGetInfo(&fb, &tb);
+        (void) cudaGetLastError();
+        err = "prefill: device buffers for a chunk of " + std::to_string(chunk) + " tokens do not fit (" +
+              std::to_string(fb >> 20) + " of " + std::to_string(tb >> 20) + " MiB free at the failure; " +
+              std::to_string(o.used >> 20) + " MiB taken, the failing buffer wanted " +
+              std::to_string(o.failed_bytes >> 20) + " MiB)";
         return false;
     }
     return true;
@@ -1461,13 +1491,26 @@ void Prefill::set_ring_budget(int slots, int64_t small_max) {
     g_ring_small_max = small_max > 0 ? small_max : 0;
 }
 double Prefill::pinned_share() { return g_pinned_share; }
+int64_t Prefill::stream_all_min_tokens() { return stream_all_min(); }
 
 uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk) {
+    return bytes_needed_impl(g, ss, chunk, false);
+}
+
+// What `init` really allocates when the prompt path owns its buffers (no loan): every cudaMalloc rounds up to a 2 MiB
+// page, and the ring is one allocation (carve).  `bytes_needed` stays the borrowed region's sum.
+uint64_t Prefill::bytes_needed_owned(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk) {
+    return bytes_needed_impl(g, ss, chunk, true);
+}
+
+uint64_t Prefill::bytes_needed_impl(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk,
+                                    bool owned_pages) {
     // the same allocation sequence as `init`, counted
     const size_t T = (size_t) chunk;
     bool ok = true;
     Alloc o;
     o.count_only = true;
+    if (owned_pages) o.granule = 2ull << 20;
     o.take<uint16_t>((size_t) GEMM_SCRATCH, ok);
     o.take<uint8_t>(GEMM_WS, ok);
     auto f = [&](size_t n) { o.take<float>(n, ok); };
@@ -1504,7 +1547,11 @@ uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::Session
         o.take<uint8_t>(MMQ_GROUP * mp.gu_max + MMQ_TAIL, ok);
         o.take<uint8_t>(MMQ_GROUP * mp.d_max + MMQ_TAIL, ok);
     }
-    for (int i = 0; i < ring_slots(T); ++i) o.take<uint8_t>((size_t) MAXBLOB(), ok);
+    if (owned_pages) {
+        if (ring_slots(T) > 0) o.take<uint8_t>((size_t) ring_slots(T) * (size_t) MAXBLOB(), ok);   // one allocation
+    } else {
+        for (int i = 0; i < ring_slots(T); ++i) o.take<uint8_t>((size_t) MAXBLOB(), ok);
+    }
     f(T * N);
     f((size_t) strata::kernels::NG_HC_DIM);
     strata::kernels::KvHostPools stage;

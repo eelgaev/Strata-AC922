@@ -3137,9 +3137,11 @@ int main(int argc, char** argv) {
     //     for the ~0.1% of the mass it pushes out of its cache);
     //   - which experts a cache holds: its layers' profiled pairs, hottest first, until its free VRAM (less the
     //     reserve, the prompt path's buffers and, on a later GPU, 1 GiB for its windows and the drafter) is used;
-    //     the routed mass of rank r is taken as (r+1)^-1.2 (fits the sweep's hit rates: K=24/26/28 predicted
-    //     99.53/99.34/99.15%, measured 99.5/99.4/99.0%).
-    // Up to 3 GPUs every placement is tried; beyond, the layers are shared in proportion to speed.
+    //     the routed mass a cache holds follows the COVERAGE CURVE below, not the (r+1)^-1.2 this used to use.
+    // Up to 4 GPUs every placement is tried; beyond, the layers are shared in proportion to speed.
+    // A FOUR-WAY PLACEMENT USED TO BE THE PROPORTIONAL GUESS AND NOTHING ELSE.  That formula reads only
+    // `layer_ms`, so on four GPUs the free VRAM a placement leaves for expert caches - the whole point of
+    // the search - never entered it.  It does now; see the ns == 4 branch below.
     // STRATA_SPLIT_MISS_MS tunes the miss cost (a slower CPU: higher).
     // THE PROMPT PATH'S BUFFERS ARE BORROWED FROM THE CACHE, NOT WITHHELD BESIDE IT.  With borrowing the cache
     // is sized first and at full size, and the prompt path is laid out in the tail of it (`Prefill::relayout`),
@@ -3226,9 +3228,50 @@ int main(int argc, char** argv) {
                          (double) cap[(size_t) i] / 1073741824.0);
         }
         const double miss_ms = std::getenv("STRATA_SPLIT_MISS_MS") ? std::atof(std::getenv("STRATA_SPLIT_MISS_MS")) : 190.0;
-        std::vector<double> mass(profile.size());
+        // ---- THE COVERAGE CURVE: HOW MUCH ROUTED MASS A CACHE HOLDS, AND WHY IT IS NO LONGER A POWER LAW.
+        //
+        // `mass[r]` used to be (r+1)^-1.2, fitted to the 5080+3090 sweep.  That fit is still right ON THE RIG IT
+        // WAS FITTED TO - at 20,000 pairs held it predicts 99.35% of the routed mass and that rig measured 99.4%.
+        // It is wrong on the IQ3_S 4-way rig, badly: it claims the top 5,805 pairs hold 94.9% of the mass, and
+        // that rig measures 69.2% (four boots, 14.9M decode lookups).  No exponent reconciles them, because the
+        // curve is a property of the MODEL'S ROUTING, not a universal constant - and the profile file carries
+        // only a RANKING, with no counts, so it cannot be read off the data either.  (tools/make_profile.py has
+        // the frequencies, and drops them; see the note there.)
+        //
+        // What the two rigs do agree on is that the hit rate follows the HELD COUNT and almost nothing else: two
+        // different splits held 14,541 and 14,384 pairs and measured 92.2% and 89.8% of the routed mass.  So the
+        // curve is taken over the held FRACTION f, as H(f) = 1 - (1 - f)^b, and each rank's mass is that curve's
+        // increment, which makes any prefix of N pairs sum to exactly H(N/total) while a cache holding
+        // colder-than-prefix pairs still scores below it.
+        //
+        // b = 3 IS CHOSEN TO LEAVE THE PREVIOUSLY VALIDATED REGIME WHERE IT WAS.  At 20,000 held (f = 0.8138) it
+        // gives 99.35%, against the old fit's 99.35% and that rig's measured 99.4% - the 2-GPU placement is
+        // untouched.  At f = 0.59 it gives 93.2% against 92.2% measured.  Below f ~ 0.5 the two curves diverge,
+        // and that is the whole point: it is exactly the regime where the old one was wrong, and where it told
+        // the search that stranding a card's VRAM costs almost nothing.
+        //
+        // THE CURVE IS A FIT TO ONE MODEL'S TRAFFIC.  STRATA_SPLIT_COVER_B overrides b for a model whose routing
+        // is sharper or flatter, and STRATA_SPLIT_MISS_MS still scales the miss cost it feeds.
+        const size_t n_ranked = profile.size();
+        const double cover_b = std::getenv("STRATA_SPLIT_COVER_B") ? std::atof(std::getenv("STRATA_SPLIT_COVER_B")) : 3.0;
+        std::vector<double> mass(n_ranked);
         double total_mass = 0;
-        for (size_t r = 0; r < profile.size(); ++r) total_mass += (mass[r] = std::pow((double) r + 1.0, -1.2));
+        // Up to 3 GPUs the 0.1.39 curve (r+1)^-1.2 is kept, so 2- and 3-GPU placements do not move (the new curve is a
+        // fit to a 4-way rig and was not measured on them); STRATA_SPLIT_COVER_B asks for the coverage curve at any
+        // GPU count.
+        // ac922: STRATA_SPLIT_CURVE=0139 keeps the 0.1.39 curve on 4 GPUs too - there the coverage curve put UD-Q4_K_XL at
+        // 11/24/36 (a 13-layer stage paces the prompt pipeline) where 12/24/36 measured balanced and fastest
+        static const bool curve_0139 = [] { const char* v = std::getenv("STRATA_SPLIT_CURVE"); return v && std::string(v) == "0139"; }();
+        const bool coverage_curve = (ns >= 4 && !curve_0139) || std::getenv("STRATA_SPLIT_COVER_B") != nullptr;
+        for (size_t r = 0; r < n_ranked; ++r) {
+            if (!coverage_curve) {
+                total_mass += (mass[r] = std::pow((double) r + 1.0, -1.2));
+                continue;
+            }
+            const double hi = std::pow(1.0 - (double) r / (double) n_ranked, cover_b);
+            const double lo = std::pow(1.0 - (double) (r + 1) / (double) n_ranked, cover_b);
+            total_mass += (mass[r] = hi - lo);
+        }
         auto cost = [&](int64_t l) -> int64_t {
             return native_pack ? ((int64_t) lay.blob_bytes(l) + 255) / 256 * 256 : (int64_t) lay.max_blob;
         };
@@ -3267,20 +3310,43 @@ int main(int argc, char** argv) {
         };
         std::vector<int64_t> best, at((size_t) ns - 1);
         double best_ms = 1e30, best_mass = 0;
-        int64_t best_held = 0;
+        int64_t best_held = 0, tried = 0;
+        // TIES GO TO THE BALANCED PLACEMENT.  When every placement holds the whole profile (the model fits the cards,
+        // as IQ3_S does on two or more 32 GB cards) the predicted decode window is the same for all of them - the
+        // layers' times just add - and which one "won" was floating-point noise in the sum: 3 layers on the first
+        // card, 30 on the second.  A prompt flows through the stages as a pipeline, so its speed is the slowest stage's:
+        // measured on 4x R9700 with --trim-stage-weights, 6,36,41 read a 32K prompt at 1,750 tok/s and 12,24,36 at 2,780,
+        // same decode speed, same tokens.  Among placements whose window time agrees to 1e-6 ms the one with the
+        // smallest slowest stage (layers x ms per layer) is kept; an earlier one stays on a second tie.
+        double best_max = 1e30;
+        auto stage_max = [&](const std::vector<int64_t>& cuts) {
+            double m = 0;
+            for (int i = 0; i < ns; ++i) {
+                const int64_t lb = i == 0 ? 0 : cuts[(size_t) i - 1], le = i + 1 < ns ? cuts[(size_t) i] : g.n_layers;
+                m = std::max(m, (double) (le - lb) * layer_ms[(size_t) i]);
+            }
+            return m;
+        };
+        const double tie_eps = 1e-6;
+        // ac922: STRATA_SPLIT_BALANCE=PCT widens the tie to PCT% of the best window, so a placement predicted only a
+        // little faster for decode does not unbalance the prompt pipeline (4x V100, UD-Q4_K_XL: 11/24/36 was predicted
+        // ahead of 12/24/36 by its cache coverage, and its 13-layer stage paces every prompt). Unset: upstream's 1e-6 ms.
+        static const double bal_tol = [] { const char* v = std::getenv("STRATA_SPLIT_BALANCE"); return v ? std::max(0.0, std::atof(v)) / 100.0 : 0.0; }();
+        auto tie_at = [&](double ref) { return std::max(tie_eps, ref < 1e29 ? ref * bal_tol : 0.0); };
         auto consider = [&]() {
             double hm = 0;
             int64_t held = 0;
             const double ms = predict(at, hm, held);
-            if (ms < best_ms) { best = at; best_ms = ms; best_mass = hm; best_held = held; }
+            ++tried;
+            const double mx = stage_max(at);
+            if (ms < best_ms - tie_at(best_ms) || (ms <= best_ms + tie_at(best_ms) && mx < best_max - tie_eps)) {
+                best = at; best_ms = std::min(ms, best_ms); best_mass = hm; best_held = held; best_max = mx;
+            }
         };
         const int64_t L = g.n_layers;
-        if (ns == 2) {
-            for (int64_t k = 2; k < L; ++k) { at[0] = k; consider(); }
-        } else if (ns == 3) {
-            for (int64_t k1 = 2; k1 + 1 < L; ++k1)
-                for (int64_t k2 = k1 + 1; k2 < L; ++k2) { at[0] = k1; at[1] = k2; consider(); }
-        } else {
+        // share the layers in proportion to speed: the fallback beyond four GPUs, and the only placement a
+        // model too small to hold four stages has (see the ns == 4 branch).
+        auto proportional = [&]() {
             double total = 0;
             for (const double c : layer_ms) total += 1.0 / c;
             double acc = 0;
@@ -3290,13 +3356,90 @@ int main(int argc, char** argv) {
                                                      i == 0 ? 2 : at[(size_t) i - 1] + 1, L - (ns - 1 - i));
             }
             consider();
+        };
+        if (ns == 2) {
+            for (int64_t k = 2; k < L; ++k) { at[0] = k; consider(); }
+        } else if (ns == 3) {
+            for (int64_t k1 = 2; k1 + 1 < L; ++k1)
+                for (int64_t k2 = k1 + 1; k2 < L; ++k2) { at[0] = k1; at[1] = k2; consider(); }
+        } else if (ns == 4) {
+            // ---- EVERY FOUR-WAY PLACEMENT IS TRIED.  This branch used to share the layers in proportion to
+            // speed and score that ONE candidate, and that formula reads only `layer_ms` - never the free VRAM.
+            // So on a four-GPU rig cache capacity did not influence the placement AT ALL, and the card with
+            // the most room left could be handed the fewest layers: on the 3060/3060/5060/5060 box CUDA1 ended
+            // up with 1,841 MiB no cache could use while CUDA2 ran 15 layers it could only hold a third of.
+            // All C(L-3,3) placements - 15,180 at 48 layers - are now scored.
+            //
+            // A STAGE'S FILL DEPENDS ONLY ON ITS OWN RANGE AND ITS OWN FREE VRAM.  `predict` hands each ranked
+            // pair to the one stage that owns its layer and each stage stops at its first pair that does not
+            // fit, so the four fills are independent and a placement's held mass is a SUM over its four
+            // ranges.  That is what makes this affordable: each distinct range is walked once and memoised,
+            // 1,121 walks instead of 15,180 - measured at 14 ms against 740 ms, for the same answer.
+            // `le` runs to L inclusive, so a row is L+1 wide - keying on a stride of L would put the last
+            // stage's [lb, L) one past the end of the vector.
+            //
+            // NOTE: on v0.1.39 the search only runs under `--layer-split auto`, where every card still holds
+            // the whole model's dense weights, so `cap[i]` is already net of them and the stage's room is what
+            // `predict` subtracts - the session.  (On the branch this came from the carve reached `auto` too,
+            // and each stage's own weight bytes were taken off here as well.)
+            const size_t stride = (size_t) L + 1;
+            std::vector<double> held_mass_at((size_t) ns * (size_t) L * stride, -1.0);
+            std::vector<int64_t> held_at(held_mass_at.size(), 0);
+            auto range_hold = [&](int i, int64_t lb, int64_t le) -> size_t {
+                const size_t key = ((size_t) i * (size_t) L + (size_t) lb) * stride + (size_t) le;
+                if (held_mass_at[key] < 0.0) {
+                    // one stage's own carve, exactly as `predict` prices it
+                    const int64_t room = cap[(size_t) i] -
+                        (int64_t) strata::core::session_bytes(g, o.max_context, K, lb, le);
+                    double hm = 0;
+                    int64_t used = 0, cnt = 0;
+                    for (size_t r = 0; r < profile.size(); ++r) {
+                        const int64_t l = profile[r].first;
+                        if (l < lb || l >= le) continue;
+                        if (used + cost(l) > room) break;   // the fill stops exactly where predict's does
+                        used += cost(l);
+                        hm += mass[r];
+                        ++cnt;
+                    }
+                    held_mass_at[key] = hm;
+                    held_at[key] = cnt;
+                }
+                return key;
+            };
+            const double denom = std::max(total_mass, 1e-9);
+            for (int64_t k1 = 2; k1 + 2 < L; ++k1)
+                for (int64_t k2 = k1 + 1; k2 + 1 < L; ++k2)
+                    for (int64_t k3 = k2 + 1; k3 < L; ++k3) {
+                        const size_t a = range_hold(0, 0, k1), b = range_hold(1, k1, k2);
+                        const size_t c = range_hold(2, k2, k3), d = range_hold(3, k3, L);
+                        const double hm = held_mass_at[a] + held_mass_at[b] + held_mass_at[c] + held_mass_at[d];
+                        const double ms = miss_ms * (1.0 - hm / denom) +
+                                          (double) k1 * layer_ms[0] + (double) (k2 - k1) * layer_ms[1] +
+                                          (double) (k3 - k2) * layer_ms[2] + (double) (L - k3) * layer_ms[3];
+                        ++tried;
+                        const double mx = stage_max({k1, k2, k3});
+                        if (ms < best_ms - tie_at(best_ms) || (ms <= best_ms + tie_at(best_ms) && mx < best_max - tie_eps)) {
+                            best = {k1, k2, k3};
+                            best_ms = std::min(ms, best_ms);
+                            best_max = mx;
+                            best_mass = hm / denom;
+                            best_held = held_at[a] + held_at[b] + held_at[c] + held_at[d];
+                        }
+                    }
+            // Four stages into fewer than five layers: nothing was enumerated, so keep the old guess rather
+            // than leave `best` empty - an empty split would leave every stage's lb/le unset.
+            if (best.empty()) proportional();
+        } else {
+            // Beyond four GPUs the placements outnumber any budget worth spending at startup (C(46,4) is
+            // 163,185 at five).  Nothing on this rig reaches it.
+            proportional();
         }
         split_at = best;
         std::string ks;
         for (const int64_t k : split_at) ks += (ks.empty() ? "" : ",") + std::to_string(k);
         std::fprintf(stderr, "strata generate: layer split auto: K=%s - predicted %.1f ms per decode window; the caches "
-                             "hold %lld of %zu profiled pairs (~%.1f%% of the routed mass)\n", ks.c_str(), best_ms,
-                     (long long) best_held, profile.size(), 100.0 * best_mass);
+                             "hold %lld of %zu profiled pairs (~%.1f%% of the routed mass), best of %lld placements\n",
+                     ks.c_str(), best_ms, (long long) best_held, profile.size(), 100.0 * best_mass, (long long) tried);
     }
     for (size_t i = 0; i < split_at.size(); ++i)
         if (split_at[i] >= g.n_layers) {
@@ -3807,6 +3950,19 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: --pipeline-windows %d: %lld MiB of CUDA0 kept out of the expert cache "
                              "(the second verifier%s)\n", o.pipeline_windows, (long long) (pipe_first >> 20),
                      o.pipeline_windows >= 2 ? ", the GDN snapshots" : "");
+    // The MiB the prompt path's OWN buffers (no loan) take, which the cache sizing leaves out.  0.1.39's rule is
+    // 160 + chunk * 680 / 1024 (~16 GiB at 24576 against ~2.4 GiB really allocated); STRATA_OWNED_PRICE=exact prices the
+    // real allocation instead (Prefill::bytes_needed_owned: 2 MiB pages, the ring in one piece, as PR #796 measured)
+    // and gives that cache the difference.  A recommendation to try, so it is not the default.
+    auto owned_prefill_mib = [&]() -> int64_t {
+        if (!(o.prefill_chunk > 0 && !pf_borrow)) return 0;
+        static const bool exact = [] { const char* v = std::getenv("STRATA_OWNED_PRICE"); return v != nullptr && std::string(v) == "exact"; }();
+        if (!exact) return 160 + (o.prefill_chunk * 680) / 1024;
+        const int64_t mib = ((int64_t) strata::prefill::Prefill::bytes_needed_owned(g, ss, o.prefill_chunk) + (1 << 20) - 1) >> 20;
+        std::fprintf(stderr, "strata generate: STRATA_OWNED_PRICE=exact: the prompt path's own buffers for a %lld-token chunk: %lld MiB (the 0.1.39 rule: %lld MiB)\n",
+                     (long long) o.prefill_chunk, (long long) mib, (long long) (160 + (o.prefill_chunk * 680) / 1024));
+        return mib + 64;   // a margin for the allocator
+    };
     if (o.expert_cache < 0) {
         size_t free_b = 0, total_b = 0;
         free_b = strata::core::device_free_bytes(); (void) total_b;
@@ -3814,7 +3970,7 @@ int main(int argc, char** argv) {
         // under WDDM an over-subscribed allocation does not fail, it pages to system memory and crawls.
         // (with borrowing - the default with a profile - the prompt path lends cache slots instead; `pf_borrow` is
         // the predicate a local `borrow` was here, hoisted above so both cache-size branches read the same one)
-        const int64_t prefill_mib = (o.prefill_chunk > 0 && !pf_borrow) ? 160 + (o.prefill_chunk * 680) / 1024 : 0;
+        const int64_t prefill_mib = owned_prefill_mib();
         // the draft layer's head and logits are allocated when it binds, after this: 0.1.27's CJK subset made them
         // ~110-180 MiB larger, and out of the reserve they left 16 GB cards below the stall line (#199)
         int64_t mtp_bind = (!o.mtp.empty() && native_head.loaded())
@@ -3885,7 +4041,7 @@ int main(int argc, char** argv) {
         // slots instead and `prefill_mib` is 0, so only the reserve is checked)
         size_t free_b = 0, total_b = 0;
         free_b = strata::core::device_free_bytes(); (void) total_b;
-        const int64_t prefill_mib = (o.prefill_chunk > 0 && !pf_borrow) ? 160 + (o.prefill_chunk * 680) / 1024 : 0;
+        const int64_t prefill_mib = owned_prefill_mib();
         const int64_t reserve = (((int64_t) o.vram_reserve_mib + prefill_mib) << 20) + pipe_first;
         const int64_t fit = std::max<int64_t>(((int64_t) free_b - reserve) / (int64_t) strata::kernels::cpu::expert_layout().max_blob, 0);
         if (o.expert_cache > fit) {
@@ -5086,6 +5242,24 @@ int main(int argc, char** argv) {
         const int64_t rounded = tokens > std::numeric_limits<int64_t>::max() - 255
                                     ? tokens
                                     : ((tokens + 255) / 256) * 256;
+        return std::min(max_chunk, rounded);
+    };
+    // STRATA_PREFILL_EQUAL=1 (opt-in, PR #693): a segment of `tokens` reads in n = ceil(tokens / max_chunk) chunks of EQUAL
+    // size (ceil(tokens / n) rounded up to 256) instead of full chunks and a short last one.  A chunk of
+    // stream_all_min_tokens() or more streams every expert the GPU does not hold, whatever its length, so a prompt's cost
+    // is its number of such chunks and equal chunks borrow no more slots than that count needs.  A last chunk below
+    // stream_all_min_tokens() stays as it is (it moves only the experts its own tokens route to).  Used ONLY where a
+    // segment's chunk is chosen (the serve lend, generate's prompt); `request_chunk` is unchanged because
+    // STRATA_SPLIT_SMALL_OWN uses it too.  The chunk geometry changes the rounding, so it is off by default.
+    static const bool equal_chunks = [] { const char* e = std::getenv("STRATA_PREFILL_EQUAL"); return e != nullptr && e[0] == '1'; }();
+    auto equal_chunk = [&](int64_t tokens, int64_t max_chunk) -> int64_t {
+        const int64_t plain = request_chunk(tokens, max_chunk);
+        if (!equal_chunks || tokens <= 0 || max_chunk <= 0) return plain;
+        const int64_t n = tokens / max_chunk + (tokens % max_chunk != 0);
+        const int64_t last = tokens - (n - 1) * max_chunk;
+        if (n <= 1 || last < strata::prefill::Prefill::stream_all_min_tokens()) return plain;
+        const int64_t per = tokens / n + (tokens % n != 0);
+        const int64_t rounded = per > std::numeric_limits<int64_t>::max() - 255 ? per : ((per + 255) / 256) * 256;
         return std::min(max_chunk, rounded);
     };
     // The prompt path's chunk and the slots it borrows for its buffers: the requested chunk halved until it fits,
@@ -7995,6 +8169,11 @@ int main(int argc, char** argv) {
                         refuse(err);
                         continue;
                     }
+                    // the elastic K/V (--kv-grow) maps only the cells it has grown to: make room for the file's cells
+                    if (!kvg_ensure((int64_t) image.live.ids.size() + 256, [&] { cudaDeviceSynchronize(); apply_pending(true); })) {
+                        refuse("the K/V cannot grow to the saved conversation: no VRAM is left", strata::core::SessionError::memory);
+                        continue;
+                    }
                     conversations.take_reuse();   // retained K/V described the outgoing session
                     live_ok = false;
                     // host -> device in synchronous copies of the whole state: one bounded allowance
@@ -8738,7 +8917,7 @@ int main(int argc, char** argv) {
                 const auto t_ln = Clock::now();
                 // what this segment needs, capped by the configured chunk: a request lends only what its own
                 // prompt needs, so a large chunk costs a short prompt nothing
-                const int64_t want_full = request_chunk(tokens, o.prefill_chunk);
+                const int64_t want_full = equal_chunk(tokens, o.prefill_chunk);
                 // #340: a short enough request reads in the stages' own S-token chunks (nothing lent)
                 const int64_t want = split_small > 0 && tokens <= split_small_max ? std::min(want_full, split_small)
                                                                                  : want_full;
@@ -10126,7 +10305,7 @@ int main(int argc, char** argv) {
         if (!o.no_prefill_borrow && !host_res.empty() && d_res != nullptr) {
             int64_t chunk = o.prefill_chunk;
             int64_t k = plan_lend(chunk);             // auto: the largest chunk that fits; fixed: halved to fit
-            const int64_t request_sized = request_chunk(n_batched, chunk);
+            const int64_t request_sized = equal_chunk(n_batched, chunk);
             if (k > 0 && request_sized < chunk) {                     // no bigger than this prompt segment needs
                 chunk = request_sized;
                 k = lend_slots(chunk);
