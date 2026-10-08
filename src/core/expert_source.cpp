@@ -498,6 +498,7 @@ bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64
         layer_offsets_ = std::move(layer_offsets);
         layer_blob_bytes_ = std::move(layer_blob_bytes);
         if (!open_gguf(err)) { close(); return false; }
+        record_inputs(path, gguf_, layout, true);
         return true;
     }
 
@@ -585,6 +586,7 @@ bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64
     mapped_bytes_ = want;
     layer_offsets_ = std::move(layer_offsets);
     layer_blob_bytes_ = std::move(layer_blob_bytes);
+    record_inputs(path, gguf_, layout, false);
     return true;
 }
 
@@ -633,6 +635,7 @@ void FileExpertSource::close() {
     for (const Segment& s : complement_segs_) (void) cudaFreeHost(s.arena);   // set_arena_placement's, one per node
     if (!complement_segs_.empty()) complement_arena_ = nullptr;
     complement_segs_.clear();
+    inputs_.clear();
     if (complement_arena_ != nullptr) {
         if (complement_pinned_ && !complement_partial_) (void) cudaFreeHost(complement_arena_);
         else {
@@ -3063,6 +3066,17 @@ std::string expert_gguf_file(const std::string& gguf, const strata::kernels::cpu
 }
 }  // namespace
 
+void ExpertSource::record_inputs(const std::string& pack_experts, const std::string& gguf,
+                                 const strata::kernels::cpu::ExpertLayout& lay, bool from_gguf) {
+    static const char* roles[3] = {"gate", "up", "down"};
+    inputs_.clear();
+    if (!from_gguf) { inputs_.push_back({"pack experts.bin", pack_experts}); return; }
+    // the same resolution open_gguf / load_experts_gguf use: every (layer, role) tensor and the file it is read from
+    for (int64_t l = 0; l < lay.n_layers; ++l)
+        for (int r = 0; r < 3; ++r)
+            inputs_.push_back({"expert blk." + std::to_string(l) + ".ffn_" + roles[r], expert_gguf_file(gguf, lay, l, r)});
+}
+
 bool check_experts_gguf(const std::string& gguf, const strata::kernels::cpu::ExpertLayout& lay, std::string& err) {
     static const char* roles[3] = {"gate", "up", "down"};
     if (lay.gguf_off.size() != (size_t) (3 * lay.n_layers)) {
@@ -3361,6 +3375,7 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
             note_ = "mapped read-only from " + path + " (STRATA_ARENA_MMAP: not locked, not pinned)";
             gib_per_s_ = 0.0;
             load_seconds_ = load_read_s_ = load_copy_s_ = 0.0;
+            record_inputs(path, gguf_, lay, from_gguf);   // session files: the mapped experts.bin is a model input
             return true;
         }
     }
@@ -3533,6 +3548,7 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
     load_seconds_ = st.seconds;
     load_read_s_ = st.read_seconds;
     load_copy_s_ = st.copy_seconds;
+    record_inputs(path, gguf_, lay, from_gguf);
     return true;
 }
 
@@ -3542,6 +3558,7 @@ void ArenaExpertSource::close() {
 #endif
     map_ = nullptr;
     map_bytes_ = 0;
+    inputs_.clear();
     if (arena_ != nullptr) {
         delete (PinnedArena*) arena_;
         arena_ = nullptr;

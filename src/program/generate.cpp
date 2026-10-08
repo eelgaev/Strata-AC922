@@ -19,6 +19,7 @@
 #include "strata/core/remote_expert_opt.hpp"
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/conversation_snapshot.hpp"
+#include "strata/core/conversation_file.hpp"
 #include "strata/core/conversation_memory.hpp"
 #include "strata/core/coupled_draft.hpp"
 #include "strata/core/expert_source.hpp"
@@ -59,6 +60,7 @@
 #include "strata/core/load_converted.hpp"
 #include "strata/program/logits_selection.hpp"
 #include "strata/program/conv_cache.hpp"
+#include "strata/program/message_boundary.hpp"
 #include "strata/spec/draft_policy.hpp"
 #include "strata/spec/draft_source.hpp"
 #include "strata/spec/suffix_drafter.hpp"
@@ -86,6 +88,7 @@
 #include <array>
 #include <chrono>
 #include <algorithm>
+#include <memory>
 #include <iostream>
 #include <functional>
 #include <future>
@@ -379,6 +382,7 @@ struct Options {
     bool ple_sync_submit = false;      ///< A/B arm: submit reads on the token thread, no I/O worker
     std::string kv = "fp16";           ///< plan v0.3 P7: KV storage, fp16 (default) or int8 (half the VRAM)
     int64_t kv_resident = 0;           ///< KV streaming: resident cells per QSA layer (0: all in VRAM)
+    bool kv_grow = false;              ///< the elastic K/V (--kv-grow, STRATA_KV_GROW=1; kvg_ensure)
     std::string dump_residual;
     /// The head input, `bb.mixed`.  It exists so the head can be SPLIT: steps 1-4 (the per-stream norm, the two
     /// bf16 projections and the stream mean) recompute cheaply in Python, and only the 794 MB GEMV does not.
@@ -581,8 +585,11 @@ struct Options {
     int64_t conversation_cache_mib = 0; // opt-in host RAM for independent conversations
     int conversation_cache_slots = 4;
     int64_t conversation_cache_min_free_mib = 2560;
+    /// --serve SAVE: disk space a session file must leave free where it is written (MiB; 0 = no check)
+    int64_t session_min_free_mib = 4096;
     /// --serve: also keep a checkpoint every N freshly read prompt tokens (0 = only at the last turn boundary)
     int64_t prompt_cache_every = 16384;
+    bool prompt_cache_tail = false;   // optional extra checkpoint at an existing near-tail chunk boundary
     /// --serve: a prompt read from token 0 is also checkpointed at its first turn boundary - the end of the system
     /// prompt, which every chat of the same client shares - when that is at least N tokens (0 = never)
     int64_t prompt_cache_root = 2048;
@@ -657,6 +664,10 @@ void usage() {
                  "  --kv-resident N      KV streaming: keep N cells of each QSA layer in VRAM (min 20480) and the\n"
                  "                       whole K/V in pinned RAM; the freed VRAM goes to expert slots. 0 (default):\n"
                  "                       all of it in VRAM. A context of N cells or fewer is not streamed\n"
+                 "  --kv-grow            the K/V takes VRAM only for the cells the requests reach and the expert\n"
+                 "                       cache holds the rest, giving slots back as the context grows (one GPU, with\n"
+                 "                       --expert-profile; STRATA_KV_GROW=1/0 also). Default: the whole --max-context\n"
+                 "                       allocated at start\n"
                  "  --stream-token       enqueue token work on the session stream (experimental)\n"
                  "  --check-logits       copy and check all logits in the stream-token path\n"
                  "  --gr-fp32-activations  experimental CUDA-oracle GR activation precision\n"
@@ -712,7 +723,9 @@ void usage() {
                  "                       of RAM each; 0 = read every prompt from the start)\n"
                  "  --conversation-cache-mib N  --serve: RAM budget for parked conversations (default 0 = off)\n"
                  "  --conversation-cache-slots N  --serve: at most N parked conversations (default 4)\n"
-                 "  --conversation-cache-min-free-mib N  --serve: physical RAM floor when parking (default 2560)\n"
+                 "  --conversation-cache-min-free-mib N  --serve: physical RAM floor when parking or restoring a\n"
+                 "                       session file (default 2560)\n"
+                 "  --session-min-free-mib N  --serve: disk space a SAVE must leave free (default 4096; 0 = no check)\n"
                  "  --vram-elastic       --serve (#533, opt-in, NVIDIA): the expert cache in segments (--vram-segment-mib,\n"
                  "                       default 512), so the command `VRAM <reserve_mib>` (the server's POST /v1/vram) can\n"
                  "                       give VRAM back to other programs between requests and take it back later\n"
@@ -727,6 +740,8 @@ void usage() {
                  "                       (stage 0 runs the next window while stage 1 verifies this one); docs/MULTI_GPU.md\n"
                  "  --trim-stage-weights an explicit --layer-split: each GPU loads only its own layers' dense weights\n"
                  "  --prompt-cache-every N  --serve: also checkpoint every N fresh prompt tokens (default 16384, 0 = off)\n"
+                 "  --prompt-cache-tail  --serve, single GPU: one extra checkpoint near the prompt's end, at an existing\n"
+                 "                       chunk boundary (default off; requires --prompt-cache and --prompt-cache-every > 0)\n"
                  "  --turn-token ID      --serve: the token that opens a chat turn (default 248045, <|im_start|>)\n"
                  "  --tail-role-token ID --serve: a turn of this role right before the last turn is left out of\n"
                  "                       the conversation checkpoint (a trailing effort turn; default -1 = off)\n"
@@ -1254,13 +1269,6 @@ private:
     std::thread th_;   // last: started once the members above exist
 };
 
-int argmax(const std::vector<float>& v) {
-    int best = 0;
-    for (size_t i = 1; i < v.size(); ++i)
-        if (v[i] > v[best]) best = (int) i;
-    return best;
-}
-
 // ---- --serve's conversation cache.  A chat or an agent sends the whole conversation again with every request, and
 // reading it again is what made a long session wait minutes for every turn.  What a sequence leaves behind splits in
 // two, and only one half needs copying:
@@ -1311,8 +1319,10 @@ bool checkpoint_restore(const ConvCheckpoint& c, strata::core::SessionState& ss,
 
 // --control-vector-scaled: llama.cpp's `common_control_vector_load` (every file's `direction.<l>` times its scale,
 // summed; layer 0 has none) and `llama_adapter_cvec::apply` with the projection-mode patch (project: the unit
-// direction and its norm as the scale), into the tables `cvec_upload` takes.  `summary` is what INFO reports.
-bool load_control_vectors(const Options& o, const strata::core::ModelGeometry& g, std::string& summary, std::string& err) {
+// direction and its norm as the scale), into the tables `cvec_upload` takes.  `summary` is what INFO reports;
+// `digest` identifies the uploaded tables, mode and range exactly (a session file is bound to it).
+bool load_control_vectors(const Options& o, const strata::core::ModelGeometry& g, std::string& summary,
+                          uint64_t& digest, std::string& err) {
     const int64_t L = g.n_layers, N = g.n_embd;
     std::vector<float> data((size_t) (L * N), 0.0f);
     std::vector<bool> have((size_t) L, false);
@@ -1375,6 +1385,17 @@ bool load_control_vectors(const Options& o, const strata::core::ModelGeometry& g
     }
     if (steered == 0) { err = "the control vector has no direction in layers " + std::to_string(first) + ".." + std::to_string(last); return false; }
     if (!strata::kernels::cvec_upload(dir, s, o.cvec_mode, first, last, N, g.hc, err)) return false;
+    {
+        strata::core::SessionIdentityBuilder b(0x43564543ull);   // "CVEC"
+        b.i64("mode", o.cvec_mode);
+        b.i64("first", first);
+        b.i64("last", last);
+        b.i64("single", single);
+        b.bytes("dir", dir.data(), dir.size() * sizeof(float));
+        b.bytes("scale", s.data(), s.size() * sizeof(float));
+        digest = b.digest();
+        if (digest == 0) digest = 1;   // 0 means "none loaded"
+    }
     summary = std::string(o.cvec_mode == 0 ? "project" : "add") + ":" + std::to_string(first) + "-" + std::to_string(last) +
               (single >= 0 ? ":single" + std::to_string(single) : "");
     // the line llama.cpp's patched build prints, so a log shows the same thing
@@ -1607,6 +1628,8 @@ int main(int argc, char** argv) {
         else if (a == "--ple-sync-submit") o.ple_sync_submit = true;
         else if (a == "--kv") o.kv = next("--kv");
         else if (a == "--kv-resident") o.kv_resident = std::atoll(next("--kv-resident"));
+        else if (a == "--kv-grow") o.kv_grow = true;
+        else if (a == "--no-kv-grow") o.kv_grow = false;
         else if (a == "--stream-token") o.stream_token = true;
         else if (a == "--check-logits") o.check_logits = true;
         else if (a == "--gr-fp32-activations") o.gr_fp32_activations = true;
@@ -1716,7 +1739,7 @@ int main(int argc, char** argv) {
         else if (a == "--vision") o.vision = true;
         else if (a == "--prompt-cache") o.prompt_cache = std::max(0, std::atoi(next("--prompt-cache")));
         else if (a == "--conversation-cache-mib" || a == "--conversation-cache-slots" ||
-                 a == "--conversation-cache-min-free-mib") {
+                 a == "--conversation-cache-min-free-mib" || a == "--session-min-free-mib") {
             const std::string value = next(a.c_str());
             int64_t number = 0;
             const auto result = std::from_chars(value.data(), value.data() + value.size(), number);
@@ -1727,8 +1750,10 @@ int main(int argc, char** argv) {
             }
             if (a == "--conversation-cache-mib") o.conversation_cache_mib = number;
             else if (a == "--conversation-cache-min-free-mib") o.conversation_cache_min_free_mib = number;
+            else if (a == "--session-min-free-mib") o.session_min_free_mib = number;
             else o.conversation_cache_slots = (int) number;
         }
+        else if (a == "--prompt-cache-tail") o.prompt_cache_tail = true;
         else if (a == "--prompt-cache-every") o.prompt_cache_every = std::max(0LL, std::atoll(next("--prompt-cache-every")));
         else if (a == "--prompt-cache-root") o.prompt_cache_root = std::max(0LL, std::atoll(next("--prompt-cache-root")));
         else if (a == "--turn-token") o.turn_token = std::atoll(next("--turn-token"));
@@ -2684,9 +2709,10 @@ int main(int argc, char** argv) {
     strata::kernels::ple_set_native_postops(o.native_ple_postops);
     // before session_init: every graph captured from here on has the vector's kernels where it applies
     std::string cvec_summary = "0";
+    uint64_t cvec_digest = 0;   // a session file is bound to the loaded vector (0: none)
     if (!o.cvec_files.empty()) {
         std::string ce;
-        if (!load_control_vectors(o, g, cvec_summary, ce)) {
+        if (!load_control_vectors(o, g, cvec_summary, cvec_digest, ce)) {
             std::fprintf(stderr, "strata generate: control vector: %s\n", ce.c_str());
             return 2;
         }
@@ -3324,6 +3350,25 @@ int main(int argc, char** argv) {
     {
         const strata::core::OnDevice on0(0);
         const int64_t hi0 = multi_gpu ? split_at[0] : -1;
+        // the elastic K/V (--kv-grow, see kvg_ensure): one GPU, the whole K/V in VRAM (no streaming), a profiled cache
+        // that can give slots up, and every expert in RAM for the CPU to compute the ones it gives up
+        {
+            const char* ev = std::getenv("STRATA_KV_GROW");
+            bool remote = false;
+            for (const int r : o.expert_cache_remote) remote = remote || r > 0;
+            const bool asked = ev != nullptr && ev[0] != '\0' ? ev[0] != '0' : o.kv_grow;
+            const bool on = asked && !multi_gpu && o.kv_resident <= 0 &&
+                            !o.expert_profile.empty() && !o.resident_cpu_experts && o.expert_cache != 0 && !remote &&
+                            strata::core::vmm_available() &&
+                            // the batch slots carve their own K/V and --vram-elastic's cache is not one VMM range
+                            o.batch == 0 && !o.vram_elastic && o.peer_device < 0;
+            if (asked && !on)
+                std::fprintf(stderr, "strata generate: --kv-grow is off (one GPU, a profile, the whole K/V in VRAM, "
+                                     "every expert in RAM, no --batch, --vram-elastic or --peer-device)\n");
+            const char* iv = std::getenv("STRATA_KV_GROW_INIT");
+            strata::core::qsa_set_kv_elastic(on, iv != nullptr && std::atoll(iv) > 0 ? std::atoll(iv) : 16384);
+            strata::core::ExpertCache::set_vmm(on);
+        }
         if (cudaMalloc(&sbuf, strata::core::session_bytes(g, o.max_context, K, 0, hi0)) != cudaSuccess) {
             std::fprintf(stderr, "strata generate: session state allocation failed\n");
             return 1;
@@ -5153,6 +5198,208 @@ int main(int argc, char** argv) {
         }
         return 0;
     };
+    // ---- THE ELASTIC K/V (--kv-grow; vmm.hpp).  Allocated for the whole --max-context up front, the K/V of a 262K
+    // context (3.35 GiB with the drafter's at int8) takes VRAM the expert cache could hold more experts in.  Now the K/V pools hold physical memory only for the cells
+    // the requests reach.  When a request needs more, slots just below the prompt path's loan give up their experts
+    // (the CPU computes those from RAM, like any miss) and their whole chunks are mapped into the K/V; a later short
+    // request hands them back and the slots are refilled with the profile's hottest experts.  Neither side's
+    // addresses move, so every captured graph stays valid.  The context is never smaller: --max-context cells always
+    // fit, the cache simply holds fewer experts while a long one is live.
+    struct KvGrow {
+        bool on = false;
+        int64_t top = 0, lo = 0;          // slots [lo, top) hold no expert; their whole chunks may be with the K/V
+        int64_t floor = 128;              // the cache keeps at least these slots
+        int64_t step = 8192;              // the K/V grows in whole steps of cells
+        int64_t cells = 0;                // what every K/V pool holds now
+        std::vector<strata::core::VmmChunk> spare;   // out of the cache, not (yet) in the K/V
+        int64_t grows = 0, trims = 0, fresh = 0, evicted = 0, refilled = 0;
+    } kvg;
+    auto kvg_start = [&](int64_t top) {
+        kvg.on = strata::core::qsa_kv_elastic() && xcache.vmm_range() != nullptr && d_res != nullptr &&
+                 !host_res.empty() && srcp != nullptr && top > kvg.floor;
+        if (!kvg.on) return;
+        kvg.top = kvg.lo = top;
+        kvg.cells = strata::core::qsa_kv_elastic_cells();
+        if (const char* v = std::getenv("STRATA_KV_GROW_STEP"); v != nullptr && std::atoll(v) > 0) kvg.step = std::atoll(v);
+        // tests: the cache keeps this many slots (its size: the K/V grows into new VRAM only)
+        if (const char* v = std::getenv("STRATA_KV_GROW_FLOOR"); v != nullptr && std::atoll(v) > 0) kvg.floor = std::atoll(v);
+        std::fprintf(stderr, "strata generate: elastic K/V: %lld of %lld cells in VRAM (%.2f of %.2f GiB); the expert "
+                             "cache (%lld slots) gives the K/V room below slot %lld as the context grows\n",
+                     (long long) kvg.cells, (long long) o.max_context,
+                     (double) strata::core::qsa_kv_elastic_mapped_bytes() / 1073741824.0,
+                     (double) strata::core::qsa_kv_elastic_full_bytes() / 1073741824.0, (long long) xcache.slots(),
+                     (long long) top);
+    };
+    // Room for `cells` cells (rounded up to a step).  `quiesce` must leave nothing running on the device and land
+    // the adaptive tier's swaps (a swap in flight could still be writing a slot given up here).
+    auto kvg_ensure = [&](int64_t cells, const std::function<void()>& quiesce) -> bool {
+        if (!kvg.on || cells <= kvg.cells) return true;
+        const int64_t target = std::min<int64_t>(o.max_context, (cells + kvg.step - 1) / kvg.step * kvg.step);
+        const int64_t need = strata::core::qsa_kv_elastic_need(target);
+        if (need == 0) { kvg.cells = strata::core::qsa_kv_elastic_cells(); return true; }
+        quiesce();
+        strata::core::VmmRange& r = *xcache.vmm_range();
+        const uint64_t G = strata::core::vmm_granularity();
+        std::vector<int32_t> owner;   // slot -> residency index
+        // The slots given up are the ones just below the prompt path's loan, and the loan is most of the cache: they
+        // hold experts of middling heat.  So an expert there that is hotter than the coldest one in the loan region
+        // moves into that one's slot (a device copy), and the coldest is given up instead - the cache then holds what
+        // a smaller cache would.  Heat: the adaptive tier's routing counts, then the profile's rank.
+        std::vector<int32_t> rank;
+        std::vector<std::pair<float, int32_t>> cold;   // the loan region's residents, hottest first
+        auto heat = [&](int32_t i) -> float {
+            const float u = drive.d.usage.empty() ? 0.0f : drive.d.usage[(size_t) i];
+            return u * 1048576.0f - (float) rank[(size_t) i];
+        };
+        const auto& lay = strata::kernels::cpu::expert_layout();
+        int64_t gave = 0, moved = 0;
+        auto freeable = [&]() -> int64_t {   // mapped chunks wholly inside [lo, top): a chunk a live slot shares stays
+            const int64_t c0 = (int64_t) ((xcache.slot_offset(kvg.lo) + G - 1) / G);
+            const int64_t c1 = (int64_t) (xcache.slot_offset(kvg.top) / G);
+            int64_t k = 0;
+            for (int64_t c = c0; c < c1; ++c) k += r.mapped(c) ? 1 : 0;
+            return k;
+        };
+        while ((int64_t) kvg.spare.size() + freeable() < need && kvg.lo > kvg.floor) {
+            if (owner.empty()) {
+                owner.assign((size_t) xcache.slots(), -1);
+                for (size_t i = 0; i < host_res.size(); ++i)
+                    if (host_res[i] >= 0 && host_res[i] < xcache.slots()) owner[(size_t) host_res[i]] = (int32_t) i;
+                rank.assign(host_res.size(), (int32_t) profile.size());
+                for (size_t r = 0; r < profile.size(); ++r)
+                    rank[(size_t) profile[r].first * (size_t) g.n_expert + (size_t) profile[r].second] = (int32_t) r;
+                for (size_t i = 0; i < host_res.size(); ++i)
+                    if (host_res[i] >= kvg.top) cold.emplace_back(heat((int32_t) i), (int32_t) i);
+                std::sort(cold.begin(), cold.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+            }
+            --kvg.lo;
+            ++gave;
+            if (const int32_t oi = owner[(size_t) kvg.lo]; oi >= 0) {
+                const int64_t layer = oi / g.n_expert;
+                int32_t vi = -1;
+                if (!cold.empty() && cold.back().first < heat(oi)) {
+                    vi = cold.back().second;
+                    const int32_t vs = host_res[(size_t) vi];
+                    if (xcache.slot_offset(vs + 1) - xcache.slot_offset(vs) < lay.blob_bytes(layer) ||
+                        cudaMemcpy(xcache.device_slot(vs), xcache.device_slot((int32_t) kvg.lo),
+                                   (size_t) lay.blob_bytes(layer), cudaMemcpyDeviceToDevice) != cudaSuccess)
+                        vi = -1;
+                    else {
+                        cold.pop_back();
+                        host_res[(size_t) oi] = vs;
+                        host_res[(size_t) vi] = strata::core::kNotResident;
+                        ++moved;
+                    }
+                }
+                if (vi < 0) host_res[(size_t) oi] = strata::core::kNotResident;
+                ++kvg.evicted;
+            }
+        }
+        // a device-to-device cudaMemcpy does not wait for the copy: the moves still read the slots given up, and a
+        // chunk unmapped under a copy faults it (the error then sticks to whatever runs next)
+        if (gave > 0 && cudaDeviceSynchronize() != cudaSuccess) {
+            std::fprintf(stderr, "strata: moving experts for the K/V failed: %s\n", cudaGetErrorString(cudaGetLastError()));
+            return false;
+        }
+        {
+            const int64_t c0 = (int64_t) ((xcache.slot_offset(kvg.lo) + G - 1) / G);
+            const int64_t c1 = (int64_t) (xcache.slot_offset(kvg.top) / G);
+            for (int64_t c = c0; c < c1; ++c)
+                if (r.mapped(c))
+                    if (const strata::core::VmmChunk h = r.unmap(c)) kvg.spare.push_back(h);
+        }
+        if (gave > 0 &&
+            cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess) {
+            std::fprintf(stderr, "strata: the residency table upload failed: %s\n", cudaGetErrorString(cudaGetLastError()));
+            return false;
+        }
+        int64_t fresh = 0;
+        const bool ok = strata::core::qsa_kv_elastic_grow(target, [&]() -> strata::core::VmmChunk {
+            if (kvg.spare.empty()) { ++fresh; return 0; }   // the cache is at its floor: new memory
+            const strata::core::VmmChunk h = kvg.spare.back();
+            kvg.spare.pop_back();
+            return h;
+        });
+        kvg.fresh += fresh;
+        kvg.cells = strata::core::qsa_kv_elastic_cells();
+        ++kvg.grows;
+        std::fprintf(stderr, "strata: K/V grown to %lld cells (%.2f GiB); the expert cache gave %lld slots for it, "
+                             "%lld hotter experts moved to colder ones' slots (%lld of %lld slots hold experts)%s\n",
+                     (long long) kvg.cells, (double) strata::core::qsa_kv_elastic_mapped_bytes() / 1073741824.0,
+                     (long long) gave, (long long) moved, (long long) (kvg.lo + (xcache.slots() - kvg.top)),
+                     (long long) xcache.slots(),
+                     fresh > 0 ? " - and new VRAM, the cache being at its floor" : "");
+        if (!ok)
+            std::fprintf(stderr, "strata: the K/V could not grow to %lld cells (%s)\n", (long long) target,
+                         cudaGetErrorString(cudaGetLastError()));
+        return ok;
+    };
+    // A request that needs far fewer cells than the K/V holds gives the rest back: the slots refill with the
+    // profile's hottest experts the GPU does not hold.  Run on a quiet device (as kvg_ensure's `quiesce`).
+    auto kvg_trim = [&](int64_t cells) -> bool {
+        if (!kvg.on) return true;
+        const int64_t target = std::max<int64_t>(kvg.step, (cells + kvg.step - 1) / kvg.step * kvg.step);
+        if (kvg.cells < target + 2 * kvg.step || kvg.lo >= kvg.top) return true;
+        strata::core::qsa_kv_elastic_shrink(target, [&](strata::core::VmmChunk h) { kvg.spare.push_back(h); });
+        kvg.cells = strata::core::qsa_kv_elastic_cells();
+        strata::core::VmmRange& r = *xcache.vmm_range();
+        const uint64_t G = strata::core::vmm_granularity();
+        const int64_t c1 = (int64_t) (xcache.slot_offset(kvg.top) / G);
+        {   // one run from the lowest unmapped chunk, as long as the chunks handed back last (one access call)
+            const int64_t c0 = (int64_t) (xcache.slot_offset(kvg.lo) / G);
+            int64_t cend = c0, need = (int64_t) kvg.spare.size();
+            while (cend < c1 && need > 0) need -= r.mapped(cend++) ? 0 : 1;
+            if (!r.map_range(c0, cend, [&]() -> strata::core::VmmChunk {
+                    if (kvg.spare.empty()) return 0;
+                    const strata::core::VmmChunk h = kvg.spare.back();
+                    kvg.spare.pop_back();
+                    return h;
+                }))
+                std::fprintf(stderr, "strata: the expert cache could not take its VRAM back from the K/V\n");
+        }
+        const int64_t lo0 = kvg.lo;
+        while (kvg.lo < kvg.top) {   // a slot whose chunks are all mapped again holds an expert again
+            const int64_t a = (int64_t) (xcache.slot_offset(kvg.lo) / G);
+            const int64_t b = (int64_t) ((xcache.slot_offset(kvg.lo + 1) + G - 1) / G);
+            bool all = true;
+            for (int64_t c = a; c < b && all; ++c) all = r.mapped(c);
+            if (!all) break;
+            ++kvg.lo;
+        }
+        // the refills on one stream and one sync (a blocking copy each was a driver round trip per expert)
+        const auto& lay = strata::kernels::cpu::expert_layout();
+        std::vector<std::pair<size_t, int32_t>> filled;   // (residency index, slot), resident once the copies landed
+        size_t pi = 0;
+        for (int64_t s = lo0; s < kvg.lo; ++s) {
+            const uint64_t room = xcache.slot_offset(s + 1) - xcache.slot_offset(s);
+            for (; pi < profile.size(); ++pi) {
+                const int32_t l = profile[pi].first, e = profile[pi].second;
+                const size_t i = (size_t) l * (size_t) g.n_expert + (size_t) e;
+                if (host_res[i] >= 0 || lay.blob_bytes(l) > room) continue;
+                const uint8_t* b = srcp->blob(l, e);
+                if (b == nullptr) continue;
+                cudaMemcpyAsync(xcache.device_slot((int32_t) s), b, (size_t) lay.blob_bytes(l), cudaMemcpyHostToDevice,
+                                nullptr);
+                filled.emplace_back(i, (int32_t) s);
+                ++pi;
+                break;
+            }
+        }
+        if (cudaDeviceSynchronize() != cudaSuccess) {
+            std::fprintf(stderr, "strata: refilling the expert cache failed: %s\n", cudaGetErrorString(cudaGetLastError()));
+            return false;
+        }
+        for (const auto& [i, s] : filled) host_res[i] = s;
+        kvg.refilled += (int64_t) filled.size();
+        if (cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess)
+            return false;
+        for (const strata::core::VmmChunk h : kvg.spare) strata::core::vmm_chunk_free(h);   // new ones, if any
+        kvg.spare.clear();
+        ++kvg.trims;
+        std::fprintf(stderr, "strata: K/V trimmed to %lld cells; %lld slots back to the expert cache, refilled from "
+                             "the profile\n", (long long) kvg.cells, (long long) (kvg.lo - lo0));
+        return true;
+    };
     // ---- the resident RAM mode (--resident-experts / --resident-cpu-experts): the experts the GPU cache does not
     // hold are copied from experts.bin into RAM once, so no decode or prompt step reads the file (the plain mmap
     // mode reads them through the OS file cache, which a small-RAM PC keeps giving back to the SSD).  Built here,
@@ -5743,6 +5990,7 @@ int main(int argc, char** argv) {
                 }
             }
         }
+        kvg_start(borrow != nullptr ? (int64_t) lend_first : xcache.slots());
         // the penalty-history buffer: one row per verify-window row (`penalty_rows`), each the last
         // `penalty_last_n` tokens that row's pick follows, -1 padded in front.  Allocated once at the cap for
         // the widest window; a request without penalties gets a null buffer and takes the byte-for-byte
@@ -6078,12 +6326,87 @@ int main(int argc, char** argv) {
         bool live_ok = false;
         std::vector<ConvCheckpoint> checks;
         uint64_t check_clock = 0;   // the checkpoints' LRU clock; creation and every use advance it
+        int64_t tail_ckpt_len = -1;   // --prompt-cache-tail: the length of the one tail checkpoint alive (-1 = none)
         bool cvec_cached = true;   // the control vector's state the live session and the checkpoints were read with
         // without --mtp the conversation cache stays on: a parked image carries the draft layer's K/V only when there is one
         // (the snapshots accept a null draft)
         strata::core::ConversationCache conversations(
             o.prompt_cache > 0 ? (size_t) o.conversation_cache_mib * 1024 * 1024 : 0,
             (size_t) o.conversation_cache_slots);
+        // Disk sessions: what a session file is bound to.  The model fingerprint samples every model input this
+        // engine loaded, by role (conversation_file.hpp), once; the config fingerprint covers the RESOLVED settings
+        // that change what the saved bytes mean - the rope (K is cached post-RoPE), the loaded control vector, the
+        // K/V format and the arithmetic switches.  Sampling, seeds, draft tuning and the expert tier are not in it.
+        std::optional<uint64_t> model_fp, config_fp;
+        auto session_identity = [&](strata::core::SessionFileIdentity& id, std::string& e,
+                                    const std::function<void()>& next_file) -> bool {
+            if (!model_fp) {
+                // what the loaders actually resolved: the CLI inputs, the pack's files and - from the expert source
+                // itself - every file its experts were read from (native_experts.txt can name GGUFs per layer/role)
+                strata::core::SessionInputs in;
+                in.native_shards = o.native_shards;
+                in.native_dense = o.native_dense_gguf;
+                in.native_head = o.native_head_shards;
+                in.embedding = o.embd_gguf;
+                in.ple = o.ple_gguf;
+                in.pack = o.pack;
+                in.mtp = o.mtp.empty() ? std::string() : o.mtp + "/dense.bin";
+                if (srcp != nullptr) in.experts = srcp->model_inputs();
+                std::vector<strata::core::SessionModelFile> files = strata::core::session_model_inputs(in);
+                // the pack's other files the loader reads (weights.cpp, expert_layout.cpp)
+                if (!o.pack.empty()) {
+                    for (const char* n : {"index.txt", "dense.bin"}) files.push_back({std::string("pack ") + n, o.pack + "/" + n});
+                    for (const char* n : {"embd.bin", "extra.bin", "manifest.json"})
+                        files.push_back({std::string("pack ") + n, o.pack + "/" + n, true});
+                    if (srcp == nullptr) files.push_back({"pack experts.bin", o.pack + "/experts.bin", true});
+                }
+                if (!o.mtp.empty()) {
+                    for (const char* n : {"dense.txt", "experts.bin"}) files.push_back({std::string("mtp ") + n, o.mtp + "/" + n});
+                    files.push_back({"mtp draft_vocab.bin", o.mtp + "/draft_vocab.bin", true});
+                }
+                uint64_t fp = 0;
+                // each file is one blocking read of at most 2 MiB (head and tail): announced before it starts
+                if (next_file) next_file();
+                if (!strata::core::session_model_fingerprint(files, fp, e, next_file))
+                    return false;
+                model_fp = fp;
+            }
+            if (!config_fp) {
+                strata::core::SessionConfig c;
+                c.engine_version = STRATA_VERSION;
+#if defined(STRATA_USE_HIP)
+                c.backend = "hip";
+#else
+                c.backend = "cuda";
+#endif
+                c.kv = o.kv;
+                c.max_context = o.max_context;
+                c.kv_resident = o.kv_resident;
+                c.mtp_window = o.mtp.empty() ? -1 : o.mtp_window;
+                const char* rot = std::getenv("STRATA_KV_ROT");
+                c.kv_rot = rot != nullptr && rot[0] == '1';
+                c.rope = {(int64_t) rope_cfg.type, rope_cfg.freq_base, rope_cfg.factor, rope_cfg.freq_scale(),
+                          rope_cfg.orig_ctx, rope_cfg.ext_factor, rope_cfg.attn_factor, rope_cfg.beta_fast,
+                          rope_cfg.beta_slow};
+                c.cvec = cvec_digest;
+                c.switches = {
+                    {"no_ple", o.no_ple}, {"native_bf16", o.native_bf16}, {"native_bf16_extra", o.native_bf16_extra},
+                    {"native_ple_key", o.native_ple_key}, {"native_moe_combine", o.native_moe_combine},
+                    {"native_gdn", o.native_gdn}, {"native_flash_attn_short", o.native_flash_attn_short},
+                    {"native_qsa_indexer", o.native_qsa_indexer}, {"native_qsa", o.native_qsa},
+                    {"native_rope", o.native_rope}, {"native_ple_postops", o.native_ple_postops},
+                    {"native_router", o.native_router}, {"cpu_oracle_q8_0", o.cpu_oracle_q8_0},
+                    {"gr_fp32_activations", o.gr_fp32_activations}, {"gr_native_mmvf", o.gr_native_mmvf},
+                    {"native_preset", !o.native_preset.empty()}, {"shared_late", o.shared_late},
+                    {"keep_canonical", o.keep_canonical}, {"no_fused_gr", o.no_fused_gr},
+                    {"no_fast_attn", o.no_fast_attn}, {"no_fused_gdn", o.no_fused_gdn},
+                    {"no_fast_select", o.no_fast_select}, {"vision", o.vision}};
+                config_fp = strata::core::session_config_fingerprint(c);
+            }
+            id.model = *model_fp;
+            id.config = *config_fp;
+            return true;
+        };
         // Save only on a switch/rewind, not on each continuing request. No graph
         // addresses change: all parked images live in ordinary host vectors.
         auto park_current_body = [&](size_t held) -> bool {
@@ -6216,6 +6539,7 @@ int main(int argc, char** argv) {
             }
         };
         int64_t pp_total = 0, pp_from = 0, pp_next_check = 0;
+        bool pp_tail_saved = false;
         // #471: the position the prompt pass has read up to (a chunk's or a window's end): what a request cancelled
         // mid-read reports as read, instead of the whole prompt
         int64_t pp_reached = 0;
@@ -6244,11 +6568,15 @@ int main(int argc, char** argv) {
                        ") - a GPU hang; on Windows the driver is then reset";
             return false;
         };
-        auto checkpoint_at = [&](int64_t L, std::vector<ConvCheckpoint>* parts = nullptr) -> bool {
+        auto checkpoint_at = [&](int64_t L, std::vector<ConvCheckpoint>* parts = nullptr, bool as_tail = false) -> bool {
             ckpt_why.clear();
             if (o.prompt_cache <= 0 || L < 1) return true;
             for (ConvCheckpoint& c : checks)
-                if ((int64_t) c.ids.size() == L) { c.used = ++check_clock; return true; }
+                if ((int64_t) c.ids.size() == L) {
+                    c.used = ++check_clock;
+                    if (!as_tail && L == tail_ckpt_len) tail_ckpt_len = -1;   // a periodic one lands here: a normal item now
+                    return true;
+                }
             ConvCheckpoint c;
             c.ids.assign(cur.begin(), cur.begin() + L);
             c.imgs = imgs_below(req_imgs, L);
@@ -6271,13 +6599,29 @@ int main(int argc, char** argv) {
                 }
             }
             c.used = ++check_clock;
+            if (as_tail) {   // only one tail checkpoint stays alive: the previous request's goes
+                const int64_t old_tail = tail_ckpt_len;
+                checks.erase(std::remove_if(checks.begin(), checks.end(), [&](const ConvCheckpoint& k) {
+                                 return old_tail >= 0 && (int64_t) k.ids.size() == old_tail;
+                             }), checks.end());
+                tail_ckpt_len = L;
+            } else if (L == tail_ckpt_len) {
+                tail_ckpt_len = -1;   // the flagged tail was dropped and a normal checkpoint takes its length
+            }
             checks.push_back(std::move(c));
             while ((int) checks.size() > o.prompt_cache) {
                 std::vector<uint64_t> stamps;
+                std::vector<char> is_tail;
                 stamps.reserve(checks.size());
-                for (const ConvCheckpoint& k : checks) stamps.push_back(k.used);
-                const size_t victim = strata::program::conv_cache::eviction_victim(stamps.data(), stamps.size(),
-                                                                                   o.prompt_cache);
+                for (const ConvCheckpoint& k : checks) {
+                    stamps.push_back(k.used);
+                    is_tail.push_back(tail_ckpt_len >= 0 && (int64_t) k.ids.size() == tail_ckpt_len);
+                }
+                // the tail checkpoint serves only a branch of the last request: it leaves before a periodic one
+                std::unique_ptr<bool[]> tail_flags(new bool[is_tail.size()]);
+                for (size_t i = 0; i < is_tail.size(); ++i) tail_flags[i] = is_tail[i] != 0;
+                const size_t victim = strata::program::conv_cache::eviction_victim(
+                    stamps.data(), stamps.size(), o.prompt_cache, tail_flags.get());
                 checks.erase(checks.begin() + (std::ptrdiff_t) victim);
             }
             return true;
@@ -6304,7 +6648,13 @@ int main(int argc, char** argv) {
             strata::core::progress_at("reading the prompt (batched), done up to token", done);
             strata::core::progress_beat();
             std::fflush(stdout);
-            if (o.prompt_cache_every > 0 && done >= pp_next_check) {
+            const bool periodic_checkpoint = o.prompt_cache_every > 0 && done >= pp_next_check;
+            // Keep the prefill's existing chunk geometry. One extra near-tail checkpoint
+            // can serve a branch whose shared prefix ends before the final cached state.
+            const bool tail_checkpoint = o.prompt_cache_tail && o.prompt_cache > 0 && o.prompt_cache_every > 0 &&
+                !multi_gpu && !pp_tail_saved && pp_total - done > std::max<int64_t>(1, o.short_read) &&
+                pp_total - done <= T;   // this chunk's real size (--prefill auto chunks differ from o.prefill_chunk)
+            if (periodic_checkpoint || tail_checkpoint) {
                 bool saved = false;
                 if (multi_gpu) {   // the stages' parts, saved when each of them read this chunk
                     std::vector<ConvCheckpoint> parts;
@@ -6318,10 +6668,11 @@ int main(int argc, char** argv) {
                     for (const ConvCheckpoint& k : parts) complete = complete && !k.gdn.empty();
                     saved = !complete || checkpoint_at(done, &parts);   // an incomplete set: no checkpoint here
                 } else {
-                    saved = checkpoint_at(done);
+                    saved = checkpoint_at(done, nullptr, tail_checkpoint && !periodic_checkpoint);
                 }
                 if (!saved) { e = "saving a conversation checkpoint failed" + ckpt_why; return false; }
-                pp_next_check = done + o.prompt_cache_every;
+                if (periodic_checkpoint) pp_next_check = done + o.prompt_cache_every;
+                if (tail_checkpoint) pp_tail_saved = true;
             }
             return true;
         };
@@ -6882,6 +7233,8 @@ int main(int argc, char** argv) {
                         const uint64_t b = p.beats.load();
                         if (!p.busy.load() || b != last) { last = b; ticks_at = p.ticks.load(); since = now; continue; }
                         if (now - since < std::chrono::seconds(limit)) continue;
+                        // a blocking step's explicit allowance (session files): still within it, not yet stuck
+                        if (strata::core::progress_now_ms() < p.allow_until_ms.load()) continue;
                         std::fprintf(stderr, "strata serve: no progress for %d s during a request (%s) - stopping "
                                              "the engine so the server starts it again (issue #29)\n",
                                      limit, stage_text().c_str());
@@ -7451,11 +7804,226 @@ int main(int argc, char** argv) {
             if (line == "QUIT") break;
             // the watchdog watches a request from here until this iteration ends, whichever way it ends
             struct BusyScope {
-                BusyScope() { strata::core::progress().busy.store(true); strata::core::progress_at("request"); }
-                ~BusyScope() { strata::core::progress().busy.store(false); strata::core::progress_at("idle"); }
+                BusyScope() {
+                    strata::core::progress().allow_until_ms.store(0);
+                    strata::core::progress().busy.store(true);
+                    strata::core::progress_at("request");
+                }
+                ~BusyScope() {
+                    strata::core::progress().busy.store(false);
+                    strata::core::progress().allow_until_ms.store(0);
+                    strata::core::progress_at("idle");
+                }
             } busy_scope;
             stop_req.store(false);   // a STOP that arrived between requests is stale
             err.clear();
+            // Disk sessions: SAVE <path> | RESTORE <path>, between requests (the path runs to the end of the line,
+            // UTF-8).  The file holds what a parked conversation holds (conversation_file.hpp).  Answers: SAVED /
+            // RESTORED <tokens> <bytes> <ms>; SERR <invalid|storage|memory|io> <published 0|1> <reason> for a refusal
+            // or failure that leaves the engine in step (the live session as it was, unless published=1 says the new
+            // file already replaced the old one); FATAL <reason> (and the engine exits) for a restore transfer that
+            // failed after the device state was touched.  On the way: SESSION <done> <total> after every block of
+            // the file moved (at most 16 MiB), and SWAIT <phase> <seconds> before a step that blocks in one call
+            // (fingerprint file, state capture, file flush, rename + folder flush, validation, device transfer):
+            // that step is allowed <seconds> (session_phase_limit_s) by the watchdog and by the server, no more.
+            // (A verifier commit that fails before the command still answers ERR and exits, as for a request.)
+            if (line.rfind("SAVE ", 0) == 0 || line.rfind("RESTORE ", 0) == 0) {
+                const bool save = line[0] == 'S';
+                const std::string path = line.substr(save ? 5 : 8);
+                const auto t0 = Clock::now();
+                auto ms = [&] { return std::chrono::duration<double, std::milli>(Clock::now() - t0).count(); };
+                auto refuse = [&](const std::string& why, strata::core::SessionError kind = strata::core::SessionError::invalid,
+                                  bool published = false) {
+                    std::fprintf(stderr, "strata serve: session %s %s: %s\n", save ? "save" : "restore", path.c_str(),
+                                 why.c_str());
+                    std::string one = why;   // one protocol line
+                    for (char& c : one) if (c == '\n' || c == '\r') c = ' ';
+                    std::printf("SERR %s %d %s\n", strata::core::session_error_name(kind), published ? 1 : 0, one.c_str());
+                    std::fflush(stdout);
+                    err.clear();
+                };
+                auto moving = [&](uint64_t done, uint64_t total) {
+                    strata::core::progress_at(save ? "writing a session file, MiB" : "reading a session file, MiB",
+                                              (int64_t) (done >> 20));
+                    strata::core::progress_allow(0);   // a block moved: the ordinary watchdog limit again, and a beat
+                    std::printf("SESSION %llu %llu\n", (unsigned long long) done, (unsigned long long) total);
+                    std::fflush(stdout);
+                };
+                // a step that blocks in one call: its explicit allowance, on both sides, announced before it starts
+                auto blocking = [&](const char* phase, uint64_t bytes) {
+                    const int64_t s = strata::core::session_phase_limit_s(bytes);
+                    strata::core::progress_at(phase);
+                    strata::core::progress_allow(s);
+                    std::printf("SWAIT %s %lld\n", phase, (long long) s);
+                    std::fflush(stdout);
+                };
+                strata::core::progress_at(save ? "saving a session" : "restoring a session");
+                if (path.empty()) { refuse("missing path"); continue; }
+                if (!stages.empty() || multi_gpu) { refuse("session files do not support --layer-split"); continue; }
+                if (o.peer_device >= 1) { refuse("session files do not support --peer-device"); continue; }
+                if (o.batch > 0) { refuse("session files do not support --batch (parallel requests)"); continue; }
+                if (o.prompt_cache <= 0) { refuse("session files need --prompt-cache > 0"); continue; }
+                if (!ver.wait_commit(err)) {
+                    std::printf("ERR %s\n", err.c_str());
+                    return 1;
+                }
+                strata::core::SessionFileIdentity id;
+                try {
+                    if (!session_identity(id, err, [&] { blocking("fingerprint", 2u << 20); })) {
+                        refuse(err, strata::core::SessionError::io);
+                        continue;
+                    }
+                } catch (const std::bad_alloc&) {
+                    refuse("session identity: out of memory", strata::core::SessionError::memory);
+                    continue;
+                } catch (const std::exception& e) {
+                    refuse(std::string("session identity: ") + e.what(), strata::core::SessionError::io);
+                    continue;
+                }
+                if (save) {
+                    if (!live_ok || live.empty()) { refuse("no complete session to save"); continue; }
+                    size_t bytes = 0, kept = 0;
+                    double capture_ms = 0;
+                    try {
+                        // RAM PREFLIGHT for the save (not a reservation), BEFORE anything is copied: the deepest
+                        // checkpoint is chosen by reference, and the copies it will take (the list below and the one
+                        // in `meta`), the copied live running state with its tokens and images, the K/V source
+                        // directory and the 16 MiB write buffer are asked for above the parking floor.  Only the
+                        // deepest checkpoint goes to disk (the next turn's resume point); the K/V is streamed from
+                        // the authoritative pools straight into the file, without a full host capture.
+                        strata::core::SessionSaveLive sl;
+                        {
+                            strata::core::ConversationStateSizes z;
+                            std::string why;
+                            uint64_t state = UINT64_MAX;   // unknown sizes: the preflight refuses rather than guesses
+                            if (strata::core::conversation_session_sizes(g, ss, z, why)) {
+                                const uint64_t q = (uint64_t) std::max<int64_t>(ss.qsa_alloc, 0);
+                                const uint64_t per = (uint64_t) z.tail + z.dead + z.block_pos;
+                                if (q == 0 || per <= (UINT64_MAX - z.gdn - z.ple) / q) state = z.gdn + z.ple + q * per;
+                            }
+                            sl.state_bytes = state;
+                            sl.tokens = live.size();
+                            sl.images = live_imgs.size();
+                            sl.kv_layers = (uint64_t) std::max<int64_t>(ss.qsa_alloc, 0) + 1;
+                        }
+                        const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
+                        auto admit = [&](uint64_t need, std::string& why) {
+                            const auto avail = strata::core::conversation_available_memory();
+                            if (strata::core::conversation_memory_admit(avail, need, floor)) return true;
+                            why = "not enough RAM to save the session (" +
+                                  (need == UINT64_MAX ? std::string("unknown") : std::to_string(need >> 20)) +
+                                  " MiB plus a floor of " + std::to_string((long long) o.conversation_cache_min_free_mib) +
+                                  " MiB needed, " + (avail ? std::to_string(*avail >> 20) + " MiB available)"
+                                                           : "RAM telemetry unavailable)");
+                            return false;
+                        };
+                        std::vector<ConvCheckpoint> disk_checks;
+                        std::string why;
+                        if (!strata::core::session_save_checkpoints(checks, sl, admit, disk_checks, why)) {
+                            refuse(why, strata::core::SessionError::memory);
+                            continue;
+                        }
+                        kept = disk_checks.size();
+                        const strata::core::ConversationView view{live, live_imgs, disk_checks, cvec_cached};
+                        strata::core::SavedConversation meta;
+                        std::vector<strata::core::SessionKvSource> sources;
+                        // the live running state comes off the device in one synchronous copy
+                        blocking("capture", sl.state_bytes == UINT64_MAX ? 0 : sl.state_bytes);
+                        if (!strata::core::conversation_snapshot_sources(meta, sources, view, ss, g, mtp.kv_state(),
+                                                                         err)) {
+                            refuse(err, strata::core::SessionError::io);
+                            continue;
+                        }
+                        capture_ms = ms();
+                        strata::core::SessionWriteOptions wo;
+                        wo.min_free_bytes = (uint64_t) o.session_min_free_mib << 20;
+                        wo.progress = moving;
+                        wo.phase = blocking;
+                        strata::core::SessionStatus st;
+                        if (!strata::core::session_file_write(path, meta, sources, id, bytes, err, wo, &st)) {
+                            refuse(err, st.error, st.published);
+                            continue;
+                        }
+                        if (st.dir_flush_unsupported)
+                            std::fprintf(stderr, "strata serve: session saved to %s; this filesystem cannot flush a "
+                                                 "folder, so the new name is not flushed\n", path.c_str());
+                    } catch (const std::bad_alloc&) {
+                        refuse("not enough RAM to save the session", strata::core::SessionError::memory);
+                        continue;
+                    }
+                    std::fprintf(stderr, "strata serve: session saved %zu tokens, %zu of %zu checkpoints, %zu bytes to %s "
+                                 "in %.1f ms (state %.1f ms)\n", live.size(), kept, checks.size(), bytes,
+                                 path.c_str(), ms(), capture_ms);
+                    std::printf("SAVED %zu %zu %.1f\n", live.size(), bytes, ms());
+                } else {
+                    strata::core::SavedConversation image;
+                    size_t bytes = 0;
+                    try {
+                        // bounds this session can ever restore (geometry, layer range, tokens, checkpoints, every
+                        // state and K/V part), checked as the file is parsed and before each array is allocated; the
+                        // file size follows from them.  The RAM the parse needs at its peak is asked first.
+                        strata::core::SessionReadLimits limits;
+                        limits.progress = moving;
+                        const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
+                        limits.admit = [floor, &o](uint64_t need, std::string& why) {
+                            const auto avail = strata::core::conversation_available_memory();
+                            if (strata::core::conversation_memory_admit(avail, need, floor)) return true;
+                            why = "not enough RAM to read it (" + std::to_string(need >> 20) + " MiB plus a floor of " +
+                                  std::to_string((long long) o.conversation_cache_min_free_mib) + " MiB needed, " +
+                                  (avail ? std::to_string(*avail >> 20) + " MiB available)" : "RAM telemetry unavailable)");
+                            return false;
+                        };
+                        if (!strata::core::conversation_session_read_limits(
+                                limits, ss, g, mtp.kv_state(), (uint64_t) o.max_context,
+                                (uint64_t) std::max(o.prompt_cache, 1), err)) {
+                            refuse(err, strata::core::SessionError::io);
+                            continue;
+                        }
+                        strata::core::SessionStatus st;
+                        if (!strata::core::session_file_read(path, id, image, bytes, err, limits, &st)) {
+                            refuse(err, st.error);
+                            continue;
+                        }
+                    } catch (const std::bad_alloc&) {
+                        refuse("not enough RAM to read the session", strata::core::SessionError::memory);
+                        continue;
+                    }
+                    const double read_ms = ms();
+                    // the whole image against this engine, still without any device write
+                    blocking("validate", bytes);
+                    if (!strata::core::conversation_snapshot_validate(image, ss, g, mtp.kv_state(), err)) {
+                        refuse(err);
+                        continue;
+                    }
+                    conversations.take_reuse();   // retained K/V described the outgoing session
+                    live_ok = false;
+                    // host -> device in synchronous copies of the whole state: one bounded allowance
+                    blocking("transfer", bytes);
+                    if (strata::core::conversation_snapshot_restore(image, ss, g, mtp.kv_state(), err) !=
+                        strata::core::ConversationRestore::restored) {
+                        // validated above: a failure here is a transfer failure, after device writes began - never
+                        // decode from a partial state; the server starts the engine again
+                        std::fprintf(stderr, "strata serve: session restore %s: transfer failed: %s\n", path.c_str(),
+                                     err.c_str());
+                        std::printf("FATAL restoring the session file failed after the device state was changed: %s\n",
+                                    err.c_str());
+                        std::fflush(stdout);
+                        return 1;
+                    }
+                    live = std::move(image.live.ids);
+                    live_imgs = std::move(image.live.imgs);
+                    checks = std::move(image.checkpoints);
+                    for (const ConvCheckpoint& c : checks) check_clock = std::max(check_clock, c.used);
+                    cvec_cached = image.cvec;
+                    live_ok = true;
+                    std::fprintf(stderr, "strata serve: session restored %zu tokens, %zu checkpoints, %zu bytes from %s "
+                                 "in %.1f ms (read+check %.1f ms)\n", live.size(), checks.size(), bytes, path.c_str(),
+                                 ms(), read_ms);
+                    std::printf("RESTORED %zu %zu %.1f\n", live.size(), bytes, ms());
+                }
+                std::fflush(stdout);
+                continue;
+            }
             const bool geni = line.rfind("GENI ", 0) == 0;
             if (!geni && line.rfind("GEN ", 0) != 0) {
                 std::printf("ERR expected: GEN <max_new> <id,id,...> or GENI <max_new> <file> <id,id,...>\n");
@@ -7655,6 +8223,15 @@ int main(int argc, char** argv) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
             }
+            auto kv_quiesce = [&] { cudaDeviceSynchronize(); apply_pending(true); };
+            if (kvg.on) {   // the elastic K/V: this prompt's cells (it gives back what it does not need below)
+                // a failed growth may leave the tier half-changed: the engine stops (as for any CUDA failure)
+                if (!kvg_ensure(n + 256, kv_quiesce)) {
+                    std::printf("ERR the K/V cannot grow to this prompt: no VRAM is left\n");
+                    std::fflush(stdout);
+                    return 1;
+                }
+            }
             int64_t resume = 0;
             bool from_live = false;
             if (o.prompt_cache > 0 && want_cvec == cvec_cached) {
@@ -7757,6 +8334,11 @@ int main(int argc, char** argv) {
                                  std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
                 }
             }
+            // the elastic K/V: a parked conversation is restored whole, and it may be longer than this prompt
+            if (incoming && !kvg_ensure((int64_t) incoming->live.ids.size() + 256, kv_quiesce)) {
+                std::printf("ERR the K/V cannot grow to the parked conversation: no VRAM is left\n");
+                return 1;
+            }
             if (incoming) {
                 const auto t0 = Clock::now();
                 if (strata::core::conversation_snapshot_restore(*incoming, ss, g,
@@ -7828,6 +8410,16 @@ int main(int argc, char** argv) {
                              return (int64_t) c.ids.size() > resume || !starts_with(c.ids, c.imgs);
                          }), checks.end());
             live_ok = false;   // until this request has finished, the session is in between
+            // the elastic K/V: the outgoing session is parked and this request rewrites every cell from `resume` on,
+            // so cells past this prompt's are no longer anyone's - far more than it needs go back to the cache
+            if (kvg.on) {
+                kv_quiesce();
+                if (!kvg_trim(n + 256)) {
+                    std::printf("ERR the K/V could not give its VRAM back to the expert cache\n");
+                    std::fflush(stdout);
+                    return 1;
+                }
+            }
             int64_t reread_to = -1;   // STRATA_CKPT_REREAD only: read [0, reread_to) again instead of restoring
             if (resume == 0) {
                 strata::core::session_zero(ss, g, nullptr, main_cs);
@@ -7883,6 +8475,7 @@ int main(int argc, char** argv) {
             pp_reached = read_from;
             pp_t0 = r0;
             pp_next_check = reread_to > 0 || !req_ckpt ? INT64_MAX : resume + o.prompt_cache_every;   // ckpt=0: none
+            pp_tail_saved = reread_to > 0 || !req_ckpt;   // ckpt=0 (#861): no tail checkpoint either
             {
                 std::lock_guard<std::mutex> lk(part_mu);
                 part_at.clear();
@@ -8347,8 +8940,15 @@ int main(int argc, char** argv) {
                         if (i >= o.prompt_cache_root) root_at = i;
                         break;
                     }
+            static const bool message_checkpoint = [] {
+                const char* e = std::getenv("STRATA_CACHE_MESSAGE_BOUNDARY");
+                return e != nullptr && std::atoi(e) != 0;
+            }();
+            // Only add a snapshot; the existing token and image checks still decide reuse.
+            const int64_t message_at = message_checkpoint && !multi_gpu && o.prompt_cache > 0
+                ? strata::program::message_checkpoint_boundary(ids, resume, turn_at, o.turn_token) : -1;
             int64_t at = read_from;
-            for (const int64_t to : {reread_to, root_at, turn_at, n - 1}) {
+            for (const int64_t to : {reread_to, root_at, message_at, turn_at, n - 1}) {
                 if (to <= at) continue;
                 err.clear();
                 const bool win = windows_ok(at, to);
@@ -8385,10 +8985,14 @@ int main(int argc, char** argv) {
                     break;
                 }
                 at = to;
-                if ((to == turn_at || to == root_at) && !checkpoint_at(to)) {
+                if ((to == turn_at || to == root_at || to == message_at) &&
+                    !checkpoint_at(to, nullptr, to == message_at && to != turn_at && to != root_at)) {   // the tail kind leaves first
                     std::printf("ERR saving a conversation checkpoint failed%s\n", ckpt_why.c_str());
                     return 1;
                 }
+                if (trace && to == message_at)
+                    std::fprintf(stderr, "strata serve: message boundary checkpoint: %lld tokens, %lld tail\n",
+                                 (long long) message_at, (long long) (turn_at - message_at));
             }
             if (!refill(err)) {
                 std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
@@ -9105,6 +9709,12 @@ int main(int argc, char** argv) {
                     cudaMemcpy(d_hist, hist_stage.data(), (size_t) T * (size_t) hist_n * sizeof(int32_t),
                                cudaMemcpyHostToDevice);
                 }
+                // the elastic K/V: the window's cells and the drafter's beyond them
+                if (kvg.on && p + T + 64 > kvg.cells &&
+                    !kvg_ensure(p + T + 64, [&] { cudaDeviceSynchronize(); apply_pending(true); })) {
+                    std::printf("ERR the K/V cannot grow: no VRAM is left\n");
+                    return 1;
+                }
                 tr("window", p, T);
                 const Clock::time_point tw0 = Clock::now();
                 if (!ver.run(T, window.data(), p, win_pool_fn, win_pool_user, outv.data(), err) || drive.d.failed) {
@@ -9504,6 +10114,7 @@ int main(int argc, char** argv) {
     int64_t pos_start = 0;
     int64_t spec_pos = 0;   // plan v0.3 P6: where the speculative loop starts (0 = not used)
     strata::prefill::Prefill prefill;
+    bool kvg_started = false;   // the elastic K/V took this run's cells
     double prefill_batched_ms = 0;
     std::FILE* final_r = o.dump_final_r.empty() ? nullptr : std::fopen(o.dump_final_r.c_str(), "wb");
     std::vector<float> final_r_host(final_r ? (size_t) (g.hc * g.n_embd) : 0);
@@ -9531,6 +10142,10 @@ int main(int argc, char** argv) {
             const int64_t blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
             if (k > 0) {   // the lent slots are refilled after the prompt
                 const int32_t first = (int32_t) (xcache.slots() - k);
+                // the elastic K/V first: its hot experts move into slots of the loan, which are refilled after it
+                kvg_started = true;
+                kvg_start(first);
+                if (!kvg_ensure(n_prompt + o.max_new + 64, [] { cudaDeviceSynchronize(); })) return 1;
                 for (size_t i = 0; i < host_res.size(); ++i)
                     if (host_res[i] >= first) {
                         lent.emplace_back((int32_t) i, host_res[i]);
@@ -9564,6 +10179,11 @@ int main(int argc, char** argv) {
                 if (prefill.draft_kv(mtp, R_rows, nxt.data(), T, p0, e)) return true;   // E-9
                 return e.empty() && mtp.prefill(R_rows, nxt.data(), T, p0, e);
             };
+        }
+        if (!kvg_started) {   // the elastic K/V: every cell this run can reach (no loan)
+            kvg_started = true;
+            kvg_start(xcache.slots());
+            if (!kvg_ensure(n_prompt + o.max_new + 64, [] { cudaDeviceSynchronize(); })) return 1;
         }
         const Clock::time_point tp0 = Clock::now();
         if (!prefill.run(o.tokens.data(), n_batched, 0, err)) {
@@ -9610,6 +10230,11 @@ int main(int argc, char** argv) {
                      (long long) ps.experts_dma, ps.ms_experts_host, (long long) ps.experts_resident, ps.ms_ple);
     }
 
+    if (!kvg_started) {   // the elastic K/V of a prompt that was not read in batches
+        kvg_started = true;
+        kvg_start(xcache.slots());
+        if (!kvg_ensure(n_prompt + o.max_new + 64, [] { cudaDeviceSynchronize(); })) return 1;
+    }
     for (int64_t pos = pos_start;; ++pos) {
         // plan v0.3 P6: a native pack's last prompt token is the first verify window (T = 1)
         if (native_pack) { spec_pos = pos; break; }
@@ -10386,6 +11011,10 @@ int main(int argc, char** argv) {
                                               ? (double) xcache.resident() / (double) xcache.slots()
                                               : 0.0));
         }
+        if (kvg.on)
+            std::printf("%-24s %lld cells in VRAM, %lld grows, %lld trims, %lld experts given up, %lld refilled\n",
+                        "  elastic K/V", (long long) kvg.cells, (long long) kvg.grows, (long long) kvg.trims,
+                        (long long) kvg.evicted, (long long) kvg.refilled);
         if (tgraph.captured && tgraph.calls > 0) {
             const double per = (double) tgraph.calls;
             std::printf("%-24s wait for rings %.3f  pool %.3f ms/token  (%lld flushes over %lld positions)\n",
