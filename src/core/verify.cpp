@@ -2,6 +2,7 @@
 #include "strata/core/verify.hpp"
 #include "strata/core/weight_form.hpp"
 #include "strata/core/remote_expert_opt.hpp"
+#include "strata/core/dma_batch.hpp"
 #if defined(_WIN32)
 #include <intrin.h>
 #endif
@@ -104,6 +105,35 @@ const bool g_sh_stream = [] {
     return true;
 #endif
 }();
+
+// A one-token window always keeps its token, so its graph advances the sequence state itself (the GDN conv history
+// and recurrence state) and Verifier::commit launches no commit graph after it (eddoursul's fork, F7).  CUDA only:
+// HIP keeps the commit graph after every window (STRATA_ONE_TOKEN_COMMIT=0 does too).
+// The head's hyper-connection read for the window's tokens in one launch set (CUDA; HIP keeps gr_read per token;
+// STRATA_HEAD_MIX_MULTI=0 does too): bitwise the same sums.
+bool head_mix_multi_enabled() {
+#if defined(STRATA_USE_HIP)
+    return false;
+#else
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_HEAD_MIX_MULTI");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    return on;
+#endif
+}
+
+bool one_token_self_commit() {
+#if defined(STRATA_USE_HIP)
+    return false;
+#else
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_ONE_TOKEN_COMMIT");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    return on;
+#endif
+}
 
 bool mapped(size_t bytes, void** h, void** d) {
 #if defined(STRATA_USE_HIP)
@@ -509,6 +539,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         sh_bf16_ = b.take<uint16_t>(T * N); sh_gate_ = b.take<float>(T * (uint64_t) g.n_ff);
         sh_up_ = b.take<float>(T * (uint64_t) g.n_ff); sh_g_ = b.take<float>(T + 4);
         head_logits_ = b.take<float>(T * (uint64_t) n_vocab_);
+        arg_scratch_ = b.take<uint8_t>(strata::kernels::argmax_rows_scratch_bytes((int) T));
+        one_ = b.take<int32_t>(4);
         hist_snap_ = b.take<float>(T * HS);
         ple_key_ = b.take<float>(T * (uint64_t) strata::kernels::NG_HC_DIM); ple_val_ = b.take<float>(T * N);
     };
@@ -545,6 +577,13 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     Bump real;
     real.base = (uint8_t*) arena_;
     carve(real);
+    {
+        const int32_t one = 1;
+        if (cudaMemcpy(one_, &one, sizeof one, cudaMemcpyHostToDevice) != cudaSuccess) {
+            err = "verify: the arena could not be set";
+            return false;
+        }
+    }
     sink_.staging = (unsigned long long) staging_;
     sink_.staging_cap = kStagingBlobs;
     (void) TS;
@@ -665,6 +704,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     const bool ple_on = ss.ple.ready() && ple_stage();
     auto Rt = [&](int t) { return R_ + (size_t) t * HC * N; };
     const int G = (split_ && T >= 2 && !batch_rec_) ? 2 : 1;   // a batch window is one group
+    const bool self_commit = T == 1 && !batch_rec_ && !g_qfuse() && one_token_self_commit();   // see Verifier::commit
     static const bool dec_batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
     auto stamp = [&](int64_t l, int i, int grp) {
         if (prof_on_ && grp == 0) gpu_stamp(prof_, (int) (l * kProfPer + i), cs);
@@ -877,7 +917,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                           hb + (size_t) first * C, (int) C, (int) (2 * HK), EPS, t - first, cs, 0);
                     }
                 } else
-                gdn_conv_l2_multi(conv, qkv, (const float*) wc->data, hb, (int) C, (int) (2 * HK), EPS, n, cs, tb);
+                // a one-token window keeps its token: it advances the conv history and the state itself (commit)
+                gdn_conv_l2_multi(conv, qkv, (const float*) wc->data, hb, (int) C, (int) (2 * HK), EPS, n, cs, tb,
+                                  self_commit);
                 stamp(l, 3, grp);
                 if (wa->kind != wb->kind) { err = "verify: ssm_alpha and ssm_beta are in different forms"; return false; }
                 gdn_ab_multi(xm, wa->data, wb->data, (const float*) wdt->data,
@@ -900,7 +942,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     }
                 } else
                 gdn_step_norm_multi(state, hb, (int) C, gate, beta, z_, (const float*) wnm->data, EPS, y_, (int) HK,
-                                    (int) HV, te, nullptr, cs, tb, g_qfuse() ? (void*) xq_ : nullptr);
+                                    (int) HV, te, self_commit ? one_ : nullptr, cs, tb, g_qfuse() ? (void*) xq_ : nullptr);
                 stamp(l, 6, grp);
                 if (!g_qfuse()) native_quantize_q8_1(y_ + (size_t) tb * ZV, xq_, (int) ZV, n, cs);   // STRATA_QFUSE: done above
                 native_mmvq(wout->native_type, wout->native_data, xq_, bo_ + tb * N, (int) ZV, (int) N, n, cs);
@@ -1367,6 +1409,30 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 a.mixed = head_mixed_ + t * N;
             }
             fused_gr_read_multi(fa, T, xn_, cs);
+        } else if (head_mix_multi_enabled() && head_ != nullptr && head_->loaded() &&
+                   (hd->kind != WeightKind::F16InF32 || [] {
+                       // ac922: with STRATA_FP16=load's FP16 hc weights the one-read mixer rounds a few logits
+                       // differently from the per-token path (1e-4, 8 of 600 positions): opt-in, the default keeps
+                       // the per-token mixer's outputs
+                       static const bool on = [] { const char* v = std::getenv("STRATA_HEAD_MIX_F16"); return v && v[0] == '1'; }();
+                       return on;
+                   }())) {
+            // the final mixer, the window's tokens in one read (fused_gr_read_multi without the pending write: the
+            // last layer's write was done above; its sums are gr_read's)
+            // BF16, or FP16 under STRATA_FP16=load (the read takes either through w_f16, as the layers' hc reads do)
+            const bool hd16 = hd->kind == WeightKind::F16InF32;
+            if (hn->kind != WeightKind::F32 || (hd->kind != WeightKind::Bf16InF32 && !hd16) || hu->kind != hd->kind) {
+                err = "verify: the output_hc_* weights have the wrong engine forms";
+                return false;
+            }
+            FusedGrArgs fa[kFusedGrMaxT];
+            for (int t = 0; t < T; ++t) {
+                fa[t].R = Rt(t); fa[t].R_out = Rt(t); fa[t].apply = false;
+                fa[t].w_norm = (const float*) hn->data; fa[t].w_down = (const uint16_t*) hd->data;
+                fa[t].w_up = (const uint16_t*) hu->data; fa[t].eps = EPS; fa[t].w_f16 = hd16;
+                fa[t].lo = lo_ + t * g.hc_lr; fa[t].rs = rs_ + t * HC; fa[t].mixed = head_mixed_ + t * N;
+            }
+            fused_gr_read_multi(fa, T, xn_, cs);
         } else {
             for (int t = 0; t < T; ++t) {
                 BlockBuffers bb = ss.block;
@@ -1391,10 +1457,14 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         // Greedy, the default, is recorded here as before (no extra launch or sync per window). A request that
         // samples or penalizes is sampled again host-side after the replay (run()) with its own parameters and a
         // fresh draw counter: a captured sampler would bake them in and replay the same draws forever.
-        SamplerParams sp;
-        sp.greedy = true;
-        sp.temperature = 0.0f;
-        sample_tokens(head_logits_, T, (int) n_vocab_, nullptr, 0, sp, m_out_, cs);
+        if (argmax_rows_wanted()) {   // sm_80 to sm_89: the pick over many blocks a row (bitwise the one-block kernel's)
+            argmax_rows(head_logits_, T, (int) n_vocab_, arg_scratch_, m_out_, cs);
+        } else {
+            SamplerParams sp;
+            sp.greedy = true;
+            sp.temperature = 0.0f;
+            sample_tokens(head_logits_, T, (int) n_vocab_, nullptr, 0, sp, m_out_, cs);
+        }
     }
     stamp(g.n_layers, 1, 0);
     return true;
@@ -1907,7 +1977,22 @@ void Verifier::fetch_dma(void* ctx, const uint8_t* const* src, int n, size_t byt
     if (n <= 0) { raise_flag(v->h_flagB_, want); return; }
     v->copy_used_ = true;
     uint8_t* stage = (uint8_t*) v->sink_.staging;                  // this group's half in a split window
-    for (int i = 0; i < n; ++i) cudaMemcpyAsync(stage + (size_t) i * bytes, src[i], bytes, cudaMemcpyHostToDevice, v->copy_);
+    // STRATA_DMA_BATCH (midhatn's #807, F12): the group's independent uploads as one cudaMemcpyBatchAsync.  Mode 0 is
+    // the loop the engine always ran, errors unchecked (it never stops the engine).  A batch mode whose uploads
+    // cannot be submitted stops the engine: flag B must not release the consumers to expert weights that were never
+    // copied.
+    const int batch_mode = strata::core::dma_batch_mode();
+    if (batch_mode == 0) {
+        for (int i = 0; i < n; ++i) cudaMemcpyAsync(stage + (size_t) i * bytes, src[i], bytes, cudaMemcpyHostToDevice, v->copy_);
+    } else {
+        const auto copied = strata::core::copy_expert_blobs(stage, src, n, bytes, v->copy_, batch_mode);
+        if (copied != cudaSuccess) {
+            std::fprintf(stderr, "strata DMA: expert upload failed: %s\n", cudaGetErrorString(copied));
+            std::fflush(stderr);
+            v->release_gpu_waits(5000);
+            std::abort();
+        }
+    }
     FlagSet& fs = v->flag_sets_[v->cur_layer_ % (sizeof v->flag_sets_ / sizeof v->flag_sets_[0])];
     fs.flag = v->h_flagB_;
     fs.value = want;
@@ -1986,21 +2071,26 @@ bool Verifier::commit(int n_keep, std::string& err) {
     h_commit_[0] = n_keep;
     h_commit_[1] = n_keep - 1;
     for (int t = 0; t < max_t_; ++t) h_commit_[2 + t] = t < n_keep ? (int32_t) (last_pos0_ + t) : -1;
-    std::atomic_thread_fence(std::memory_order_seq_cst);
-    const cudaError_t le = cudaGraphLaunch(commit_exec_, cs_);
-    if (le != cudaSuccess) { err = std::string("verify: commit launch: ") + cudaGetErrorString(le); return false; }
-    // set_commit_async: no wait here - the next window runs on the same stream after it, and the drafter (its own
-    // stream) reads only this window's final rows and its own K/V. A layer split's stages each launch theirs on their
-    // own stream the same way (they used to wait one after the other: four launch + sync round trips a window). h_commit_ is next written after the next window's
-    // results are read, i.e. after this graph has run.  Everything else waits on commit_done_ (wait_commit).
-    if (!g_commit_async) {
-        const cudaError_t se = cudaStreamSynchronize(cs_);
-        if (se != cudaSuccess) { err = std::string("verify: commit: ") + cudaGetErrorString(se); return false; }
+    if (last_t_ == 1 && one_token_self_commit()) {
+        // a one-token window has advanced the state itself (record_window): no commit graph
     } else {
-        const cudaError_t re = cudaEventRecord(commit_done_, cs_);
-        if (re != cudaSuccess) { err = std::string("verify: commit event: ") + cudaGetErrorString(re); return false; }
-        (void) cudaStreamQuery(cs_);
-        commit_pending_ = true;
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        const cudaError_t le = cudaGraphLaunch(commit_exec_, cs_);
+        if (le != cudaSuccess) { err = std::string("verify: commit launch: ") + cudaGetErrorString(le); return false; }
+        // set_commit_async: no wait here - the next window runs on the same stream after it, and the drafter (its own
+        // stream) reads only this window's final rows and its own K/V. A layer split's stages each launch theirs on their
+        // own stream the same way (ac922, 9098768: they used to wait one after the other, four launch + sync round trips
+        // a window). h_commit_ is next written after the next window's results are read, i.e. after this graph has run.
+        // Everything else waits on commit_done_ (wait_commit).
+        if (!g_commit_async) {
+            const cudaError_t se = cudaStreamSynchronize(cs_);
+            if (se != cudaSuccess) { err = std::string("verify: commit: ") + cudaGetErrorString(se); return false; }
+        } else {
+            const cudaError_t re = cudaEventRecord(commit_done_, cs_);
+            if (re != cudaSuccess) { err = std::string("verify: commit event: ") + cudaGetErrorString(re); return false; }
+            (void) cudaStreamQuery(cs_);
+            commit_pending_ = true;
+        }
     }
     if (ple_stage())   // stages that share one session must advance it once
         for (int t = 0; t < n_keep; ++t) {

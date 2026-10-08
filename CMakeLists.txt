@@ -8,7 +8,7 @@
 # below refuses anything older: silently building for a pre-Ampere arch would produce a binary that runs
 # and is wrong about its own performance, which is the worst of both outcomes.
 cmake_minimum_required(VERSION 3.24)
-project(strata VERSION 0.1.39 LANGUAGES CXX)
+project(strata VERSION 0.1.40 LANGUAGES CXX)
 # EXPERIMENTAL: the Intel Arc engine, the SYCL port in sycl/ (PR #423; icpx + oneMKL, docs/INTEL_ARC.md). It is its
 # own project that takes the unported sources from src/; with this on, nothing below is configured.
 option(STRATA_ENABLE_SYCL "EXPERIMENTAL: build the Intel Arc (SYCL) engine from sycl/ - docs/INTEL_ARC.md" OFF)
@@ -718,6 +718,16 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # the prompt path's DeltaNet recurrence: gdn_rec_kh_kernel against gdn_rec_cols_pipe_kernel, bitwise (GPU,
   # synthetic, no model; --bench adds timings).  NVIDIA only: cp.async and the CUDA occupancy API (not on gfx906)
   if(STRATA_ENABLE_CUDA AND NOT STRATA_HIP_GFX906)
+    # Independent pinned expert uploads: byte parity and stream/event ordering.
+    add_executable(dma_batch_parity tests/core/dma_batch_parity.cu)
+    target_include_directories(dma_batch_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(dma_batch_parity PRIVATE ${_strata_gpu_runtime_target})
+    add_test(NAME dma_batch_parity COMMAND dma_batch_parity)
+    set_tests_properties(dma_batch_parity PROPERTIES TIMEOUT 120)
+    if(WIN32)
+      add_test(NAME dma_batch_registered_parity COMMAND dma_batch_parity --registered)
+      set_tests_properties(dma_batch_registered_parity PROPERTIES TIMEOUT 120)
+    endif()
     add_executable(gdn_rec_parity src/prefill/gdn_rec_parity.cu)
     target_link_libraries(gdn_rec_parity PRIVATE ${_strata_gpu_runtime_target})
     add_test(NAME gdn_rec_parity COMMAND gdn_rec_parity)
@@ -737,6 +747,13 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_include_directories(shared_expert_parity PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(shared_expert_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   add_test(NAME shared_expert_parity COMMAND shared_expert_parity --selftest)
+  # the split / batched verify-window kernels (from eddoursul's fork), bitwise vs the kernels they replace; CUDA only
+  if(STRATA_ENABLE_CUDA)
+    add_executable(verify_parity src/kernels/verify_parity.cpp)
+    target_include_directories(verify_parity PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(verify_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    add_test(NAME verify_parity COMMAND verify_parity --selftest)
+  endif()
 
   add_executable(fused_gr_bench src/kernels/fused_gr_bench.cpp)
   target_include_directories(fused_gr_bench PRIVATE ${_strata_gpu_include_directories})

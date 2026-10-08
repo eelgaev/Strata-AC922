@@ -4,6 +4,7 @@
 #include "strata/kernels/cpu/expert_layout.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <chrono>
 #include "strata/platform/cpu_relax.hpp"
@@ -30,7 +31,31 @@ constexpr uint64_t pack_head(uint32_t epoch, uint32_t n, uint32_t i) {
 }
 }  // namespace
 
+namespace {
+std::atomic<int> g_host_core{(int) HostCore::First};
+}  // namespace
+
+void set_host_core(HostCore where) { g_host_core.store((int) where); }
+HostCore host_core_setting() { return (HostCore) g_host_core.load(); }
+
+static CpuTopology detect_cpu_topology_impl(bool skip_first, PoolAffinity affinity);
+
 CpuTopology detect_cpu_topology(bool skip_first, PoolAffinity affinity) {
+    CpuTopology topo = detect_cpu_topology_impl(skip_first, affinity);
+    // --host-core last: the host takes the last core, the workers the others (the first included)
+    if (skip_first && host_core_setting() == HostCore::Last && !topo.is_hybrid && topo.host_core >= 0 &&
+        !topo.worker_cores.empty()) {
+        const int last = topo.worker_cores.back();
+        topo.worker_cores.pop_back();
+        topo.worker_cores.insert(topo.worker_cores.begin(), topo.host_core);
+        topo.host_core = last;
+    }
+    return topo;
+}
+
+int planned_host_core(PoolAffinity affinity) { return detect_cpu_topology(true, affinity).host_core; }
+
+static CpuTopology detect_cpu_topology_impl(bool skip_first, PoolAffinity affinity) {
     CpuTopology topo;
 #if defined(_WIN32)
     // Ask the OS rather than assuming a layout.  `hardware_concurrency()` returns LOGICAL processors, and on

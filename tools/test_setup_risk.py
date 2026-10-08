@@ -205,6 +205,13 @@ class BrokenEarlierConfig(unittest.TestCase):
 class LowRamGpus(unittest.TestCase):
     """S2/S3 (#364 #384): one GPU recommended in the low-RAM mode, all of them when asked for."""
 
+    def setUp(self):
+        # the behaviour before RESIDENT_SPLIT_ENGINE (an engine from before 0.1.40); the tests of the newer engine
+        # patch MIN_ENGINE themselves, and the default (MIN_ENGINE = 0.1.40) is covered by test_setup_golden
+        p = mock.patch.object(setup, "MIN_ENGINE", (0, 1, 39))
+        p.start()
+        self.addCleanup(p.stop)
+
     def test_explicit_gpus_are_kept_with_the_mapped_variant(self):
         for prof, model in (("32GB-2x24GB", "IQ3_XXS"), ("32GB-2x24GB", "Q2_0"), ("47GB-2x16GB", "IQ3_XXS")):
             with self.subTest(prof=prof, model=model):
@@ -284,6 +291,13 @@ class LowRamGpus(unittest.TestCase):
 
 class StartOnSeveralGpus(unittest.TestCase):
     """A resident low-RAM config started on several GPUs reads the experts through the file cache (#364 #384)."""
+
+    def setUp(self):
+        # the behaviour before RESIDENT_SPLIT_ENGINE (an engine from before 0.1.40); the tests of the newer engine
+        # patch MIN_ENGINE themselves, and the default (MIN_ENGINE = 0.1.40) is covered by test_setup_golden
+        p = mock.patch.object(setup, "MIN_ENGINE", (0, 1, 39))
+        p.start()
+        self.addCleanup(p.stop)
 
     def test_split_mmap(self):
         cfg = {"args": ["--pack", "p", "--resident-experts", "--kv", "int8"]}
