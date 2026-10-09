@@ -178,7 +178,9 @@ bool EpTwin::init(int prim_dev, int twin_dev, int64_t lb, int64_t le, int64_t n_
     cache_base_ = cache_base;
     {
         const OnDevice on(twin_dev);
-        if (!ok(cudaStreamCreateWithFlags(&ts_, cudaStreamNonBlocking), "stream", err) ||
+        int prio_lo = 0, prio_hi = 0;   // the highest priority: ahead of the partner fetch's blocks on this GPU
+        cudaDeviceGetStreamPriorityRange(&prio_lo, &prio_hi);
+        if (!ok(cudaStreamCreateWithPriority(&ts_, cudaStreamNonBlocking, prio_hi), "stream", err) ||
             !ok(cudaMalloc((void**) &slot_off_d_, slot_off.size() * 8), "alloc", err) ||
             !ok(cudaMemcpy(slot_off_d_, slot_off.data(), slot_off.size() * 8, cudaMemcpyHostToDevice), "slot offsets", err) ||
             !ok(cudaMalloc((void**) &res_d_, twin_res.size() * 4), "alloc", err) ||

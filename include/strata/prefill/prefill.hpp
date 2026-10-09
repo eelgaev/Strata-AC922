@@ -70,6 +70,11 @@ public:
               core::ExpertSource* src, const core::ExpertCache* cache, const int32_t* host_res, int64_t chunk,
               void* stream, std::string& err, void* borrow = nullptr, uint64_t borrow_bytes = 0);
 
+    /// --ep-twins (core/ep_twin.hpp): the experts of this stage marked kTwinHeld in `host_res` live in `twin_cache`
+    /// (the NVLink partner's cache, slot `twin_res[layer * n_expert + expert]`); the prompt path reads them there,
+    /// over NVLink, instead of streaming them.  Those slots are never in the partner's loan region.
+    void set_twin(const core::ExpertCache* twin_cache, const int32_t* twin_res);
+
     /// With borrowed buffers: lay them out again for chunks of `chunk` tokens (at most `init`'s) in `borrow` - a
     /// request lends only the slots its prompt needs.  The stream must be idle (between prompts).
     bool relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::string& err);

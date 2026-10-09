@@ -684,6 +684,18 @@ struct Prefill::Impl {
     core::ExpertSource* src = nullptr;
     const core::ExpertCache* cache = nullptr;
     const int32_t* host_res = nullptr;
+    const core::ExpertCache* twin_cache = nullptr;   ///< --ep-twins: the partner's cache (set_twin)
+    const int32_t* twin_res = nullptr;               ///< its slot of each kTwinHeld expert
+    /// the device address of (l, e) when no copy is needed: this stage's cache, or the partner's for a twin-held one
+    const uint8_t* res_ptr(int64_t l, int32_t e) const {
+        if (host_res == nullptr || cache == nullptr) return nullptr;
+        const size_t i = (size_t) l * (size_t) g->n_expert + (size_t) e;
+        const int32_t s = host_res[i];
+        if (s >= 0) return cache->device_slot(s);
+        if (s == core::kTwinHeld && twin_res != nullptr && twin_cache != nullptr && twin_res[i] >= 0)
+            return twin_cache->device_slot(twin_res[i]);
+        return nullptr;
+    }
     int64_t T = 0, T_max = 0;
     bool borrowed = false;
     cudaStream_t cs = nullptr, copy = nullptr;
@@ -1241,6 +1253,11 @@ bool Prefill::carve(size_t T, void* alloc) {
     take_stage(o, ss, s, m.stage, ok);
     m.T = (int64_t) T;
     return ok;
+}
+
+void Prefill::set_twin(const core::ExpertCache* twin_cache, const int32_t* twin_res) {
+    impl_->twin_cache = twin_cache;
+    impl_->twin_res = twin_res;
 }
 
 bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::string& err) {
@@ -2307,7 +2324,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 seq_start[(size_t) l] = seq.size();
                 if (ps_on) m.pp->pseq_start[(size_t) l] = m.pp->pseq.size();
                 for (int32_t e = 0; e < m.g->n_expert; ++e) {
-                    if (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;
+                    if (m.res_ptr(l, e) != nullptr) continue;   // resident here or on the twin (--ep-twins)
                     if (m.pp && m.pp->peer && m.pp->peer->has(l, e)) continue;   // multi-GPU: computed on (or read from) the peer
                     int job = -1;
                     const uint8_t* b = nullptr;
@@ -3056,7 +3073,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     b.blob[e - b.e0] = m.stage_dev[k % (size_t) m.ring];
                                     ++k;
                                 } else {                  // not streamed: resident (the walk streams all others)
-                                    b.blob[e - b.e0] = m.cache->device_slot(m.host_res[(size_t) l * m.g->n_expert + e]);
+                                    b.blob[e - b.e0] = m.res_ptr(l, e);
                                     // counted whether routed or not (the routing stays on the GPU): at a streamed
                                     // chunk's size (>= 1024 tokens x 10 of 512) nearly every expert is routed
                                     ++stats_.experts_resident;
@@ -3158,7 +3175,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             int64_t nstream = 0;
                             for (int32_t e = 0; e < m.g->n_expert; ++e) {
                                 const int32_t c = m.cnt[(size_t) e];
-                                if (c == 0 || (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0))
+                                if (c == 0 || m.res_ptr(l, e) != nullptr)
                                     continue;
                                 ++nstream;
                                 // a blob the CPU reads from RAM: page-locked, or any other that is not assembled into a
@@ -3200,7 +3217,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     rows_peer += c;
                                     continue;
                                 }
-                                if (c == 0 || (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) ||
+                                if (c == 0 || m.res_ptr(l, e) != nullptr ||
                                     !m.pp->peer || !m.pp->peer->has(l, e))
                                     continue;
                                 if (rows_peer + c > m.pp->cap_rows) { ++m.pp->over_cap; continue; }
@@ -3660,7 +3677,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             std::vector<Stager::Job> js;
                             for (size_t j = 0; j < order.size(); ++j) {
                                 const int32_t e = order[j];
-                                if (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;
+                                if (m.res_ptr(l, e) != nullptr) continue;
                                 if (m.src->pinned(l, e)) continue;
                                 job_of[j] = (int) js.size();
                                 if (m.src->transient(l, e)) {   // CS-T: copied by the source
@@ -3676,7 +3693,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         StagerDone stager_done{stream_all ? nullptr : m.stager.get()};
                         auto stage_one = [&](size_t j) -> bool {
                             const int32_t e = order[j];
-                            const bool resident = m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0;
+                            const bool resident = m.res_ptr(l, e) != nullptr;
                             if (resident) return true;
                             const int sl = stage_next;
                             stage_next = (stage_next + 1) % STAGE;
@@ -3835,7 +3852,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 const int32_t e = order[j];
                                 if (stage_of[j] < 0) {
                                     ++stats_.experts_resident;
-                                    if (!compute(j, m.cache->device_slot(m.host_res[(size_t) l * m.g->n_expert + e]), -1)) return false;
+                                    if (!compute(j, m.res_ptr(l, e), -1)) return false;
                                 } else {
                                     pt.mark(kPfWaitCopy, cs);
                                     cudaStreamWaitEvent(m.cs, m.copied[stage_of[j]], 0);
@@ -3874,8 +3891,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     consumed = ++k;
                                     if (!group_gather || gg_nslots == 0) give(consumed);   // its group was gathered
                                 } else {
-                                    const bool r0 = m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0;
-                                    const uint8_t* bp = r0 ? m.cache->device_slot(m.host_res[(size_t) l * m.g->n_expert + e])
+                                    const uint8_t* r0p = m.res_ptr(l, e);
+                                    const uint8_t* bp = r0p != nullptr ? r0p
                                                            : (m.pp && m.pp->peer ? m.pp->peer->slot_ptr(l, e) : nullptr);   // over the cap: P2P
                                     if (bp == nullptr) { err = "prefill: an expert is neither resident, streamed nor on the peer"; return false; }
                                     ++stats_.experts_resident;

@@ -2044,11 +2044,8 @@ int main(int argc, char** argv) {
         }
         o.adapt_every = 0;
         o.adapt_async = 0;
-        // the prompt path's loan borrows the tail of a stage's cache and refills only the stage's own layers: the
-        // partner's experts traded into that tail would come back as prompt buffers (M2: lend around them)
-        o.no_prefill_borrow = true;
         std::fprintf(stderr, "strata generate: STRATA_EP_TWINS=1: expert parallelism inside each NVLink pair (the adaptive tier "
-                             "and the prompt path's cache loan are off)\n");
+                             "is off)\n");
     }
     {   // --host-core / STRATA_HOST_CORE, before the pool and the session pin any thread
         std::string hc = o.host_core;
@@ -5014,11 +5011,26 @@ int main(int argc, char** argv) {
             uint64_t std_b = 0;
             int64_t best_n = -1;
             for (const auto& [sz, cnt] : sizes) if (cnt > best_n) { best_n = cnt; std_b = sz; }
+            // the prompt path's loan borrows the tail of each cache (its largest chunk's buffers, refilled after the
+            // prompt with the stage's own experts): nothing is traded there, so the loan never hands the partner's
+            // experts out and the partner's prompt path may read them over NVLink at any time
+            auto loan_floor = [&](int st) -> int64_t {
+                strata::core::ExpertCache& xc = cache_of(st);
+                const strata::core::SessionState& ses = st == 0 ? ss : stages[(size_t) st - 1]->ss;
+                if (o.no_prefill_borrow || o.prefill_chunk <= 0 || xc.slot_offsets() == nullptr) return xc.slots();
+                const uint64_t need = strata::prefill::Prefill::bytes_needed(g, ses, o.prefill_chunk);
+                int64_t k = 0;
+                while (k < xc.slots() && (uint64_t) (xc.bytes() - (int64_t) xc.slot_offsets()[xc.slots() - k]) < need) ++k;
+                return std::max<int64_t>(0, xc.slots() - k - 64);   // a margin for the ring's final size
+            };
             auto picks = [&](int st) {
                 std::vector<std::pair<int32_t, int32_t>> v;
                 int64_t rank = 0;
+                const int64_t floor_s = loan_floor(st);
                 for (const auto& pr : prof_of(st)) {
-                    if (lay.blob_bytes(pr.first) != std_b || cache_of(st).slot_of(pr.first, pr.second) < 0) continue;
+                    if (lay.blob_bytes(pr.first) != std_b || cache_of(st).slot_of(pr.first, pr.second) < 0 ||
+                        cache_of(st).slot_of(pr.first, pr.second) >= floor_s)
+                        continue;
                     if (rank++ % 2 == 1) v.push_back(pr);
                 }
                 return v;
@@ -7216,6 +7228,10 @@ int main(int argc, char** argv) {
                     return 1;
                 }
                 stage_ver(st).set_ep_twin(tw.get());
+                // its prompt path reads the twin-held experts from the partner over NVLink (opt-in: measured slower than
+                // streaming them from RAM, the kernels read remote memory directly; next: DMA them into the ring)
+                if (const char* v = std::getenv("STRATA_EP_PREFILL_PEER"); v != nullptr && std::atoi(v) != 0)
+                    (st == 0 ? sp : stages[(size_t) st - 1]->sp).set_twin(&cp, ep_res[(size_t) st].data());
                 std::fprintf(stderr, "strata serve: STRATA_EP_TWINS: stage %d (CUDA%d, layers %lld-%lld): its twin is CUDA%d\n",
                              st + 1, ep_dev[(size_t) st], (long long) lb, (long long) (le - 1), ep_dev[(size_t) p]);
                 ep_twin_objs.push_back(std::move(tw));

@@ -1189,7 +1189,9 @@ __global__ void __launch_bounds__(kResidentPlanMax) resident_plan_kernel(const i
         eid = ids[tid];
         s_ids[tid] = eid;
         slot = (eid >= 0 && eid < n_expert) ? res[eid] : -1;
-        if (slot < 0) atomicOr(&s_bad, 1);
+        // -2 (kTwinHeld, --ep-twins): the stage's NVLink partner computes it and its row is merged before the combine -
+        // not a reason to leave the group to the host plan; it gets no group and no row here
+        if (slot < 0 && slot != -2) atomicOr(&s_bad, 1);
     }
     __syncthreads();
     if (s_bad) {
@@ -1257,15 +1259,18 @@ __global__ void __launch_bounds__(kResidentPlanMax) resident_plan_kernel(const i
             if (w < fj_warp) fj_tot += s_wsum[w];
         }
         const int out_idx = (fj_tot >> 16) + rank_in_group;
-        dst[out_idx] = tid;
-        tok[out_idx] = tid / k;
+        if (slot >= 0) {   // a twin-held entry (--ep-twins) has no row here
+            dst[out_idx] = tid;
+            tok[out_idx] = tid / k;
+        }
     }
     if (tid == 0) {
-        const int groups = (s_wsum[0] + s_wsum[1] + s_wsum[2] + s_wsum[3]) & 0xffff;
-        start[groups] = n;
-        start2[0] = n;
+        const int sum = s_wsum[0] + s_wsum[1] + s_wsum[2] + s_wsum[3];
+        const int groups = sum & 0xffff, entries = sum >> 16;   // == n unless twin-held entries were skipped
+        start[groups] = entries;
+        start2[0] = entries;
         counts[0] = groups;
-        counts[1] = n;
+        counts[1] = entries;
         counts[2] = 0;
         if (skip != nullptr) {
             __threadfence();
