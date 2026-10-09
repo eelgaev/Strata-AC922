@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import glob
 import hashlib
 import json
 import math
@@ -191,6 +192,10 @@ LLAMA_CPP_ZIP = f"https://github.com/ggml-org/llama.cpp/archive/{LLAMA_CPP_COMMI
 # With the default, the release of this checkout's own version (PREBUILT_TAG_URL, CMakeLists.txt's version) is
 # tried first and the latest release is the fallback (#214): an older checkout keeps the engine it shipped with.
 PREBUILT_URL = "https://github.com/Niko1221/Strata/releases/latest/download/"
+# The repository the release assets and their SHA-256 come from; `engine_digest` reads the API here even
+# when --prebuilt points the download somewhere else, because the hash is only worth having if it comes
+# from somewhere the download does not.
+REPO = "Niko1221/Strata"
 PREBUILT_TAG_URL = "https://github.com/Niko1221/Strata/releases/download/v{version}/"
 PREBUILT_ASSET = "strata-windows-x64.zip" if WIN else "strata-linux-x64.zip"
 # the CUDA libraries the ready-made engine loads (the same CUDA 13.0 it is built with), from NVIDIA's pip packages
@@ -207,7 +212,7 @@ CUDA12_WHEELS = ["nvidia-cublas-cu12==12.9.1.4", "nvidia-cuda-runtime-cu12==12.9
 # toolkit the CUDA 12 zip is built with (cuBLAS 12.9.1.4, runtime 12.9.79).  Not tested on such an old driver here.
 CUDA12_MIN_DRIVER = 528 if WIN else 525
 ENGINE12_DIR = "engine-cuda12"
-MIN_ENGINE = (0, 1, 40)                # v0.1.40: --resident-experts on a layer split with the split+resident variant (#848), --kv k8v4 with KV streaming (#711); v0.1.39: the #577 file-tier regression fixed, the OpenAI Responses API (#451, Codex), a reply stuck on one token ended (#606), the head before the arena (#620), effort_position (#458), --vram-reserve hot resize opt-in (#533), PR batch; v0.1.38: prompts faster (one gather per expert group #372, the first chunk's PLE rows beside layer 0 #374, DeltaNet three heads per thread #413), --kv q4_0 prompts on tensor cores (#452), Q5_0 experts on the GPU (#473), IQ4_XS on AVX-2 (#415), unbuffered expert loading on Windows (#357 #362), --peer-device (#531), a 6 GB card starts (#496), PR batch; v0.1.37: a silent engine is restarted (#481), Windows AMD counts the desktop's VRAM (#380 #377 #497), a steadier PCIe probe (#485), fixes #496 #495 #498 #505 #493; v0.1.36: a cancelled prompt logged as read so far (#471), the draft-head hint (#474), UPDATE.bat (#475), --expert-profile-save (#477); v0.1.35: Windows AMD uses its bundled HIP runtime (#468 #461), the low-RAM resident mode on Windows 32 GB (#467), fixes #460 #459 #446 #447 #457 #448 #444; v0.1.34: AMD on Windows (a ready-made HIP engine), an MCP server for AI assistants (tools/strata_mcp.py), a shorter README; v0.1.33: a portable image encoder again (#411 #412), setup recommends instead of forcing (#406 #403 #364 #384), fixes #352 #365 #369 #371 #375 #393 #408 #414; v0.1.32: split prompts faster (#340), AMD router +12%, Unsloth Q4 in setup, faster Q4 prompts, #326/#327/#342/#344 fixes, PR batch; v0.1.31: Unsloth UD-Q4_K_XL (experimental), GGUF-in-place low-RAM mode, Windows GGUF load 2x, server race + tokenizer fixes, AMD intrinsics; v0.1.30: short prompts faster (streaming from 1024 tokens), resident low-RAM variant, multi-GPU session carve, RDNA4; v0.1.29: sampled answers faster (split top-k), #154 correctness fixes; v0.1.28: the expert cache reserves the draft head, a cancelled request no longer fails the next; v0.1.27: RTX 20 (sm_75) in the ready-made engine, the HIP build without CUDA headers; v0.1.26: the draft layer's prompt pass in batches; v0.1.25: faster prompts (grouping off the copy engine, fused hyper-connection kernels), AMD HIP backend, --kv k8v4; v0.1.24: long prompts faster (QSA select on tensor cores); v0.1.23: image requests honor sampling, 8 GB cards start, batched verify window; v0.1.22: faster prompts (tensor-core attention), multi-GPU across images/steering/KV streaming; v0.1.21: multi-GPU layer split (--gpus); v0.1.20: system-prompt checkpoint, PCIe probe, hit rate; v0.1.19: penalties
+MIN_ENGINE = (0, 1, 40, 3)             # versions compare all four numbers; v0.1.40.3: the #1357 MTP router guard, the #1376 Windows HIP cache floor, #461 runtime DLLs, Intel A750 first-request fix; v0.1.40.2: F4 verify windows, the Linux file tier (#1194), the stager wait (#1057), #1264/#1201/#1139 fixes, opt-in CPU share (#1282), Intel Arc; v0.1.40: --resident-experts on a layer split with the split+resident variant (#848), --kv k8v4 with KV streaming (#711); v0.1.39: the #577 file-tier regression fixed, the OpenAI Responses API (#451, Codex), a reply stuck on one token ended (#606), the head before the arena (#620), effort_position (#458), --vram-reserve hot resize opt-in (#533), PR batch; v0.1.38: prompts faster (one gather per expert group #372, the first chunk's PLE rows beside layer 0 #374, DeltaNet three heads per thread #413), --kv q4_0 prompts on tensor cores (#452), Q5_0 experts on the GPU (#473), IQ4_XS on AVX-2 (#415), unbuffered expert loading on Windows (#357 #362), --peer-device (#531), a 6 GB card starts (#496), PR batch; v0.1.37: a silent engine is restarted (#481), Windows AMD counts the desktop's VRAM (#380 #377 #497), a steadier PCIe probe (#485), fixes #496 #495 #498 #505 #493; v0.1.36: a cancelled prompt logged as read so far (#471), the draft-head hint (#474), UPDATE.bat (#475), --expert-profile-save (#477); v0.1.35: Windows AMD uses its bundled HIP runtime (#468 #461), the low-RAM resident mode on Windows 32 GB (#467), fixes #460 #459 #446 #447 #457 #448 #444; v0.1.34: AMD on Windows (a ready-made HIP engine), an MCP server for AI assistants (tools/strata_mcp.py), a shorter README; v0.1.33: a portable image encoder again (#411 #412), setup recommends instead of forcing (#406 #403 #364 #384), fixes #352 #365 #369 #371 #375 #393 #408 #414; v0.1.32: split prompts faster (#340), AMD router +12%, Unsloth Q4 in setup, faster Q4 prompts, #326/#327/#342/#344 fixes, PR batch; v0.1.31: Unsloth UD-Q4_K_XL (experimental), GGUF-in-place low-RAM mode, Windows GGUF load 2x, server race + tokenizer fixes, AMD intrinsics; v0.1.30: short prompts faster (streaming from 1024 tokens), resident low-RAM variant, multi-GPU session carve, RDNA4; v0.1.29: sampled answers faster (split top-k), #154 correctness fixes; v0.1.28: the expert cache reserves the draft head, a cancelled request no longer fails the next; v0.1.27: RTX 20 (sm_75) in the ready-made engine, the HIP build without CUDA headers; v0.1.26: the draft layer's prompt pass in batches; v0.1.25: faster prompts (grouping off the copy engine, fused hyper-connection kernels), AMD HIP backend, --kv k8v4; v0.1.24: long prompts faster (QSA select on tensor cores); v0.1.23: image requests honor sampling, 8 GB cards start, batched verify window; v0.1.22: faster prompts (tensor-core attention), multi-GPU across images/steering/KV streaming; v0.1.21: multi-GPU layer split (--gpus); v0.1.20: system-prompt checkpoint, PCIe probe, hit rate; v0.1.19: penalties
 # a CPU without the ready-made engine compiles it with its own CUDA toolkit: 12.x runs on 525+ (minor-version
 # compatibility), and ppc64le's last driver is 550 (CUDA 12.4)
 MIN_DRIVER_LOCAL = 525
@@ -1865,7 +1870,47 @@ STRIX_HALO_MIN_GB = 80         # UD-IQ4_XS keeps all of its experts in memory fr
 def strix_halo_recommends(gpu, ram) -> bool:
     """Is UD-IQ4_XS the recommended model here: a Strix Halo whose unified memory (the OS's RAM plus the BIOS carve-out)
     holds it - the model docs/STRIX_HALO.md measures.  A recommendation only: the menus still list every size."""
-    return bool(gpu.get("uma")) and ram + gpu.get("dedicated_gb", 0.0) >= STRIX_HALO_MIN_GB
+    return is_strix_halo(gpu) and bool(gpu.get("uma")) and ram + gpu.get("dedicated_gb", 0.0) >= STRIX_HALO_MIN_GB
+
+
+def amd_device_access_problem(dev="/dev", access=os.access, listing=glob.glob) -> str | None:
+    """Linux AMD: /dev/kfd and the render nodes must be readable and writable by this user (the render / video groups).
+    None when they are, else a sentence for the user.  A missing /dev/kfd is not this problem (no driver / no ROCm)."""
+    kfd = os.path.join(dev, "kfd")
+    if not os.path.exists(kfd):
+        return None
+    bad = [kfd] if not access(kfd, os.R_OK | os.W_OK) else []
+    bad += [n for n in sorted(listing(os.path.join(dev, "dri", "renderD*"))) if not access(n, os.R_OK | os.W_OK)]
+    if not bad:
+        return None
+    return (f"this user cannot open {', '.join(bad)}: ROCm will find no GPU and the engine will fail with 'no ROCm-capable "
+            "device' although nothing else holds the GPU. Add your user to the render and video groups: "
+            "sudo usermod -aG render,video $USER, then log out and in again")
+
+
+def gfx1103_notes(gpu, ram) -> list[str]:
+    """What setup tells the owner of a Radeon 780M / 760M / 740M (Phoenix / Hawk Point, gfx1103, unified memory): never
+    the Strix Halo text, which is about another chip (gfx1151).  Opt-in only (STRATA_EXPERIMENTAL_GFX1103=1)."""
+    notes = [f"  Radeon 780M / 760M class (gfx1103, Ryzen 7040 / 8040): the CPU and the GPU share one memory pool ({ram:.0f} GB "
+             f"seen by the OS + a {gpu.get('dedicated_gb', 0.0):.1f} GB BIOS carve-out), so the model's experts live in "
+             "that pool and the expert cache is sized from the memory the OS can give back."]
+    notes.append("  " + ("The engine is compiled here for gfx1103" if not WIN else "This GPU has no ready-made Windows engine")
+                 + " (experimental opt-in, STRATA_EXPERIMENTAL_GFX1103=1; measured on one machine, not validated on a real "
+                 "card): see docs/AMD_HIP.md. This is not a Strix Halo.")
+    if not WIN and gpu.get("shared_gb", 0) < 0.75 * ram - 1:
+        notes.append(f"!the GPU can reach {gpu.get('shared_gb', 0):.0f} GB of shared memory (the GTT pool; the kernel's "
+                     "default is about half of the RAM). The kernel option ttm.pages_limit raises it; setup changes no "
+                     "host setting - a bigger model needs the room, a smaller one runs as it is")
+    return notes
+
+
+def igpu_notes(gpu, ram) -> list[str]:
+    """The unified-memory notes for exactly this chip: Strix Halo (gfx1151) or the gfx1103 opt-in, nothing else."""
+    if is_strix_halo(gpu):
+        return strix_halo_notes(gpu, ram)
+    if gfx_arch_is(gpu.get("arch"), "gfx1103"):
+        return gfx1103_notes(gpu, ram)
+    return []
 
 
 def strix_halo_notes(gpu, ram) -> list[str]:
@@ -2219,21 +2264,40 @@ def hip_lib_dirs(eng: Path) -> list[Path]:
 HIP_RUNTIME_DLLS = ("amdhip64_*.dll", "amd_comgr*.dll")
 
 
+def hip_runtime_closure(d: Path) -> list[str]:
+    """The DLLs of `d` (the engine's rocm/bin) that amdhip64_7.dll and amd_comgr.dll need, the two included, read from
+    their PE import tables and followed recursively (tools/hip/dll_closure.py).  #461: amdhip64_7.dll imports
+    rocm_kpack.dll, which imports the MSVC runtime; with only the two DLLs beside strata.exe the full-path load fails
+    (error 126), Windows falls back to System32's copy of the runtime, and the first big prompt dies with
+    hipErrorInvalidDeviceFunction.  Falls back to the names above when the helper cannot be read."""
+    roots = sorted({p.name for pat in HIP_RUNTIME_DLLS for p in d.glob(pat)})
+    try:
+        sys.path.insert(0, str(ROOT / "tools" / "hip"))
+        from dll_closure import dll_closure
+        return dll_closure(d, roots)
+    except Exception:                                  # noqa: BLE001 - a missing helper must not stop setup
+        return roots
+    finally:
+        if str(ROOT / "tools" / "hip") in sys.path:
+            sys.path.remove(str(ROOT / "tools" / "hip"))
+
+
 def hip_runtime_beside_exe(eng: Path) -> None:
-    """Copy the bundled HIP runtime DLLs from rocm/bin next to the engine's exes when missing or different (a 0.1.34
-    install, whose zip had them in rocm/bin only, is fixed on its next start)."""
+    """Copy the bundled HIP runtime DLLs and everything they import from rocm/bin next to the engine's exes when
+    missing or different (a 0.1.34 install, whose zip had them in rocm/bin only, is fixed on its next start; a
+    0.1.40.2 install, which got only the two runtime DLLs, gets rocm_kpack.dll and the C++ runtime now, #461)."""
     for d in hip_lib_dirs(eng):
-        for pat in HIP_RUNTIME_DLLS:
-            for src in d.glob(pat):
-                dst = eng / src.name
-                try:
-                    if dst.exists() and dst.stat().st_size == src.stat().st_size and \
-                            dst.stat().st_mtime >= src.stat().st_mtime:
-                        continue
-                    shutil.copy2(src, dst)
-                except OSError as e:                   # e.g. the engine is running and holds the old copy
-                    warn(f"could not put {src.name} next to the AMD engine ({e}); if the engine stops on its first "
-                         "request, close Strata and run START-HERE.bat again")
+        for name in hip_runtime_closure(d):
+            src = d / name
+            dst = eng / src.name
+            try:
+                if dst.exists() and dst.stat().st_size == src.stat().st_size and \
+                        dst.stat().st_mtime >= src.stat().st_mtime:
+                    continue
+                shutil.copy2(src, dst)
+            except OSError as e:                   # e.g. the engine is running and holds the old copy
+                warn(f"could not put {src.name} next to the AMD engine ({e}); if the engine stops on its first "
+                     "request, close Strata and run START-HERE.bat again")
 
 
 def hip_match(card: dict, listed: list[dict], hip: list[dict]) -> dict | None:
@@ -2276,7 +2340,7 @@ def get_prebuilt_hip(url_base, gpu, updating=False) -> Path | None:
             meta = json.loads(info.read_text(encoding="utf-8"))
         except ValueError:
             meta = {}
-        ver = tuple(int(x) for x in str(meta.get("version", "0")).split(".")[:3] if x.isdigit())
+        ver = tuple(int(x) for x in str(meta.get("version", "0")).split(".")[:4] if x.isdigit())
         if meta.get("backend") == "hip" and meta.get("source") == "prebuilt" and ver >= WIN_HIP_MIN_ENGINE and \
                 gpu["arch"] in meta.get("archs", []) and not updating:
             ok("ready-made AMD engine already installed")
@@ -2301,6 +2365,11 @@ def get_prebuilt_hip(url_base, gpu, updating=False) -> Path | None:
             return None
     say("  Downloading the ready-made Strata engine for AMD GPUs (with the ROCm libraries it uses) ...")
     download(base + WIN_HIP_ASSET, z, "Strata AMD engine")
+    try:
+        verify_engine_archive(z, WIN_HIP_ASSET, base)
+    except UnverifiedEngine as e:
+        engine_refused(WIN_HIP_ASSET, e, updating)
+        return None
     tmp = eng / "_unpack"
     shutil.rmtree(tmp, ignore_errors=True)
     with zipfile.ZipFile(z) as f:
@@ -2309,7 +2378,7 @@ def get_prebuilt_hip(url_base, gpu, updating=False) -> Path | None:
         meta = json.loads((tmp / "BUILD.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         meta = {}
-    ver = tuple(int(x) for x in str(meta.get("version", "0")).split(".")[:3] if x.isdigit())
+    ver = tuple(int(x) for x in str(meta.get("version", "0")).split(".")[:4] if x.isdigit())
     why = None
     if meta.get("backend") != "hip" or not (tmp / EXE).exists():
         why = "it is not a HIP engine"
@@ -2532,6 +2601,165 @@ def driver_major(gpu):
         return 0
 
 
+class UnverifiedEngine(Exception):
+    """The engine archive could not be verified, with the reason.
+
+    Raised rather than `fail()`-ed on purpose.  The engine-UPDATE paths wrap their download in
+    `except Exception` and fall back to the engine already installed, so a refusal has to be an Exception:
+    `fail()` ends in `sys.exit(1)`, and SystemExit is a BaseException, so it flies past that guard and
+    kills the start instead.  Measured on this change before the fix - a wrong hash, a wrong size and a
+    missing digest each escaped get_prebuilt(updating=True) as SystemExit(1).
+    """
+
+
+def release_of(base: str) -> tuple[str, str | None] | None:
+    """("github", tag) for a GitHub release URL, or None when the URL is not one.
+
+    `base` is one of the bases from `prebuilt_bases`: a `releases/download/v0.1.40/` URL (which names its
+    tag), the `releases/latest/download/` URL, or something else entirely - a local folder, a plain mirror.
+    That last case matters: it has no published digest, so treating it as "latest" would check the file
+    against a release the user did not ask for, over the network, which is wrong twice over.
+
+    The repository comes out of the URL when it names one, so a fork's own releases are checked against
+    the fork rather than against Niko1221/Strata (which never has the fork's tags, so the check would
+    always fail).
+    """
+    m = re.search(r"https?://(?:www\.)?github\.com/([^/]+)/([^/]+)/releases/(?:download/v([^/]+)|latest)/",
+                  base)
+    if not m:
+        return None
+    return f"https://api.github.com/repos/{m.group(1)}/{m.group(2)}/releases", m.group(3)
+
+
+def is_local(base: str) -> bool:
+    """True for a path on this machine - `C:/mirror`, `/mnt/mirror`, `//share/engine`, `file://...`.
+
+    A local folder is the user's own file on their own disk, the same trust decision as `--gguf-dir`, and
+    there is no published digest for it to be checked against.  It is treated differently from a remote
+    mirror on purpose: nothing is between the file and setup, whereas a remote mirror has a network in the
+    middle and still no release to check it against.
+    """
+    b = base.strip()
+    if b.lower().startswith("file://"):
+        return True
+    return not re.match(r"^[a-z][a-z0-9+.\-]*://", b, re.I)
+
+
+def engine_digest(asset: str, base: str) -> tuple[int, str] | None:
+    """(size, "sha256:<hex>") for `asset` in the release `base` points at, or None if GitHub will not say.
+
+    The size and hash come from the releases API - a different origin from the download, which is the
+    whole point: a mirrored, substituted or TLS-intercepted download does not come with a matching digest,
+    while a compromised release does (see `verify_engine_archive` for what that leaves uncovered).
+
+    GitHub populates `digest` for every asset, including ones uploaded before the field existed
+    (measured on v0.1.34 through v0.1.40.1).  None means no answer - no network, a rate limit, or a
+    release that does not publish one - and the caller warns and installs anyway (never refuses).
+    """
+    where = release_of(base)
+    if where is None:                  # a local folder or a plain mirror: nothing published to check against
+        return None
+    releases, tag = where
+    url = f"{releases}/tags/v{tag}" if tag else f"{releases}/latest"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "strata-setup",
+                                                   "Accept": "application/vnd.github+json"})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            rel = json.loads(r.read().decode("utf-8"))
+    except Exception:
+        return None                     # offline, rate-limited, or the release is not there
+    for a in rel.get("assets") or []:
+        if a.get("name") == asset and a.get("digest") and str(a.get("digest")).startswith("sha256:"):
+            return int(a.get("size") or 0), str(a["digest"]).split(":", 1)[1]
+    return None
+
+
+def drop_download(z: Path) -> None:
+    """The archive and its finish mark. A refused engine is not left where a later run would reuse it."""
+    z.unlink(missing_ok=True)
+    z.with_name(z.name + ".done").unlink(missing_ok=True)
+
+
+def verify_engine_archive(z: Path, asset: str, base: str) -> None:
+    """The downloaded engine archive against the published size and SHA-256, before it is unpacked.
+
+    Without this, a ready-made engine is installed on nothing more than the byte count matching the
+    server's Content-Length - and a substituted file of the same length passes that.  It runs before the
+    archive is opened, so a wrong engine never reaches `_unpack`, let alone the engine directory.
+
+    Raises UnverifiedEngine on a refusal; the caller decides whether that stops setup (a first install,
+    with nothing to fall back to) or keeps the engine that is already there (an update).
+
+    Where the hash comes from, and where it cannot:
+
+    - a GitHub release URL: the tag is read out of the URL, so the exact release the bytes claim to come
+      from is the one checked rather than "latest" (setup tries the checkout's own release first, #214),
+      and the repository comes out of the URL too, so a fork's releases are checked against the fork;
+    - a local folder (`--prebuilt D:/mirror`): nothing published to check against.  This warns and goes
+      ahead - it is the user's own file, the same trust decision as `--gguf-dir`, and there is nothing an
+      API could say about it;
+    - any other remote mirror: nothing published to check against either, but a network is in the middle,
+      so it warns and installs anyway (no digest is never a reason to refuse).
+
+    What a digest from the API does NOT cover, stated plainly: it proves the bytes are the ones GitHub
+    published for that asset, so it catches a corrupted transfer, a mirror or proxy that substituted the
+    file, and a hostile network.  It does not make a malicious RELEASE safe - if whoever can publish a
+    release publishes a hostile engine, the digest matches it.  Only a hash pinned in this file closes
+    that, at the cost of a commit per release; a dict of tag -> sha next to `engine_digest` is where one
+    would go.
+
+    The size and the hashing below are spelled out rather than delegated to `verify_sha256`, for two
+    reasons, both measured here.  That function ends in `fail()`, and a refusal has to be an Exception so
+    the update paths can fall back.  And it keeps a `.done` mark so 111 GB of Unsloth shards is hashed
+    once; the engine archive is 190 MB, which hashes in 0.79 s at 242 MB/s on this machine, against 3.0 s
+    to download the same file.  A mark that saves 0.8 s is not worth a class of hole - anything that
+    changes the file after it was verified, at any length - so there is no mark here.
+    """
+    if os.environ.get("STRATA_SKIP_SHA256") == "1":
+        warn(f"STRATA_SKIP_SHA256=1: NOT checking {asset} against its SHA-256. If the file is corrupt or "
+             f"tampered with, it will be installed anyway. Unset it to get the check back.")
+        return
+    want = engine_digest(asset, base)          # one API call: this is a rate-limited API
+    if not want:
+        # no published digest (offline, rate limit, a mirror or folder): install anyway, never refuse
+        warn(f"could not get a SHA-256 for {asset} from GitHub (offline, rate limited, or not a release "
+             f"URL), so it was NOT verified. Installing it as it is.")
+        return
+    size, sha = want
+    have = z.stat().st_size if z.exists() else -1
+    if have != size:
+        drop_download(z)
+        raise UnverifiedEngine(f"{z.name} is {have:,} bytes, not the published {size:,}")
+    h = hashlib.sha256()
+    with open(z, "rb") as f:
+        while True:
+            b = f.read(16 << 20)
+            if not b:
+                break
+            h.update(b)
+    if h.hexdigest() != sha:
+        got = h.hexdigest()
+        drop_download(z)
+        raise UnverifiedEngine(f"{z.name} has the wrong SHA-256 ({got}, expected {sha})")
+
+
+def engine_refused(asset: str, e: Exception, updating: bool) -> None:
+    """Report a refusal and either stop setup or keep the engine that is installed.
+
+    A first install has nothing to fall back to, so it stops.  An update does: the engine already in
+    place is untouched by a refusal (nothing has been unpacked), it works, and stopping the model from
+    starting over a hash is worse than keeping what is there - which is the whole reason that call site
+    catches what the download can throw.
+    """
+    if not updating:
+        fail(f"the downloaded Strata engine does not match GitHub's checksum: {e}",
+             "the bad download has been deleted (corrupt or tampered), so the next run fetches the "
+             "published file again. Set STRATA_SKIP_SHA256=1 only if you insist on installing it anyway")
+        return
+    warn(f"keeping the engine that is installed: {e}")
+    say("       Nothing was replaced. The bad download was deleted; run setup again to fetch it afresh.")
+
+
 def prebuilt_bases(url_base) -> list[str]:
     """Where to look for the ready-made engine, in order (each ending in a slash).  The default: the release of this
     checkout's version first, then the latest (#214); an explicit --prebuilt / STRATA_PREBUILT_URL: only that."""
@@ -2614,7 +2842,7 @@ def get_prebuilt(url_base, gpu, vision, updating=False, toolkit=13) -> Path | No
     info = eng / "BUILD.json"
     if info.exists() and (eng / EXE).exists() and json.loads(info.read_text(encoding="utf-8")).get("backend") != "hip":
         meta = json.loads(info.read_text(encoding="utf-8"))
-        ver = tuple(int(x) for x in str(meta.get("version", "0")).split(".")[:3] if x.isdigit())
+        ver = tuple(int(x) for x in str(meta.get("version", "0")).split(".")[:4] if x.isdigit())
         if meta.get("source") == "local":              # compiled here: build_engine checks its source and cards
             return None
         have = [int(a) for a in meta.get("archs", [])]
@@ -2649,6 +2877,11 @@ def get_prebuilt(url_base, gpu, vision, updating=False, toolkit=13) -> Path | No
             return None
     say("  Downloading the ready-made Strata engine" + (" (CUDA 12, experimental)" if int(toolkit) == 12 else "") + " ...")
     download(base + asset, z, "Strata engine")
+    try:
+        verify_engine_archive(z, asset, base)
+    except UnverifiedEngine as e:
+        engine_refused(asset, e, updating)
+        return None
     tmp = eng / "_unpack"
     shutil.rmtree(tmp, ignore_errors=True)
     try:
@@ -2658,7 +2891,7 @@ def get_prebuilt(url_base, gpu, vision, updating=False, toolkit=13) -> Path | No
         drop_archive(z)                                # every later run fail on it instead of downloading it again
         raise
     meta = json.loads((tmp / "BUILD.json").read_text(encoding="utf-8"))
-    if tuple(int(x) for x in str(meta.get("version", "0")).split(".")[:3] if x.isdigit()) < MIN_ENGINE:
+    if tuple(int(x) for x in str(meta.get("version", "0")).split(".")[:4] if x.isdigit()) < MIN_ENGINE:
         need = ".".join(map(str, MIN_ENGINE))
         if updating:                                   # these files are newer than the published release (#58)
             warn(f"engine {need} is not published yet (the release may still be uploading): run this again "
@@ -2709,7 +2942,7 @@ def update_installed_engine(url_base, toolkit=None) -> None:
     meta_text = info.read_text(encoding="utf-8")
     meta = json.loads(meta_text)
     if meta.get("backend") == "hip" and WIN:           # AMD on Windows: the ready-made HIP engine, when older
-        ver = tuple(int(x) for x in str(meta.get("version", "0")).split(".")[:3] if x.isdigit())
+        ver = tuple(int(x) for x in str(meta.get("version", "0")).split(".")[:4] if x.isdigit())
         if meta.get("source") == "prebuilt" and ver < WIN_HIP_MIN_ENGINE:
             try:
                 g = next((x for x in amd_gpus() if amd_problem(x) is None), None)
@@ -2737,7 +2970,7 @@ def update_installed_engine(url_base, toolkit=None) -> None:
                 warn(f"could not compile the updated engine{'' if isinstance(e, SystemExit) else f' ({e})'}: "
                      "starting the installed one")
         return
-    ver = tuple(int(x) for x in str(meta.get("version", "0")).split(".")[:3] if x.isdigit())
+    ver = tuple(int(x) for x in str(meta.get("version", "0")).split(".")[:4] if x.isdigit())
     local = meta.get("source") == "local"
     vision = meta.get("vision") or "none"
     if local:                                          # compiled here: is it older than the source (a git pull)?
@@ -3657,11 +3890,11 @@ def engine_version(exe: Path) -> tuple:
     v = str(meta.get("version") or "")
     if not v:                                          # the version compiled into the binary: 0.1.13 and newer
         try:                                           # carry it, so a binary without it is older
-            m = re.search(rb"engine=(\d+\.\d+\.\d+)(?:\.\d+)?\n", Path(exe).read_bytes())
+            m = re.search(rb"engine=(\d+\.\d+\.\d+(?:\.\d+)?)\n", Path(exe).read_bytes())
             v = m.group(1).decode() if m else "0.1.12"
         except OSError:
             v = "0"
-    return tuple(int(x) for x in v.split(".")[:3] if x.isdigit())
+    return tuple(int(x) for x in v.split(".")[:4] if x.isdigit())
 
 
 def is_wsl() -> bool:
@@ -4344,8 +4577,8 @@ def sycl_setup(argv) -> int:
     Intel engine: it is compiled from source on the PC (docs/INTEL_ARC.md), then sycl/setup_intel.py runs this setup
     with the Intel steps swapped in. Nothing of the CUDA / HIP paths is used or changed."""
     say()
-    warn("Intel Arc (--backend sycl) is EXPERIMENTAL: a community port of the engine, not tested by the Strata "
-         "maintainers (no Intel card here). Expect rough edges; issues with your card and driver versions help.")
+    say("  Intel Arc (--backend sycl): supported since 0.1.40.2 on Linux, tested on an Arc Pro B70 (xe) and an Arc A750 "
+        "(i915); other Arc cards and driver versions are untested, and reports help (docs/INTEL.md).")
     if WIN:
         fail("the Intel Arc engine has no Windows setup yet (no ready-made Intel engine either)",
              "run it on Linux (Ubuntu 24.04 with Intel's GPU driver and oneAPI): docs/INTEL_ARC.md")
@@ -4598,6 +4831,10 @@ def main() -> int:
         for g in amd:
             say(f"    GPU {g['index']}: {g['name']}, {amd_mem_text(g)} - " + (amd_problem(g) or "can be used"))
         usable = [g for g in amd if amd_problem(g) is None]
+        if not WIN and (amd or amd_pci_devices()):     # a warning only: recommend, never force
+            acc = amd_device_access_problem()
+            if acc:
+                warn(acc)
         if not amd and not WIN:                        # the KFD topology is empty: name a Strix Halo the kernel sees
             for d in amd_pci_devices():
                 if d["pci_id"] in STRIX_HALO_PCI_IDS:
@@ -4631,9 +4868,12 @@ def main() -> int:
         if multi:
             ok("GPUs: " + " + ".join(gpu_name(x) for x in chosen) + " together (the model's layers are split across them)")
         ok(f"GPU: {gpu['name']}, {amd_mem_text(gpu) if gpu.get('uma') else format(gpu['vram_gb'], '.1f') + ' GB VRAM'}, "
-           f"{gpu['arch']} (AMD: docs/{'STRIX_HALO' if gpu.get('uma') else 'AMD_HIP'}.md)")
+           f"{gpu['arch']} (AMD: docs/{'STRIX_HALO' if is_strix_halo(gpu) else 'AMD_HIP'}.md)")
+        if WIN and str(gpu.get("arch") or "").startswith("gfx12"):   # only a pointer; no default changes
+            say("  If Windows resets the AMD driver (VIDEO_ENGINE_TIMEOUT_DETECTED, flicker, the engine dies mid-answer): "
+                "docs/TROUBLESHOOTING.md, \"Windows AMD: the driver resets\"")
         if gpu.get("uma"):
-            for line in strix_halo_notes(gpu, ram_gb()):
+            for line in igpu_notes(gpu, ram_gb()):
                 (warn if line.startswith("!") else say)(line.lstrip("!"))
     else:
         if not found:
@@ -5035,7 +5275,7 @@ def main() -> int:
         lib_dirs = [str(d) for d in hip_lib_dirs(eng)]
     else:
         lib_dirs = meta.get("lib_dirs") or meta.get("cuda_dirs") or cuda_lib_dirs(cuda_tk)
-    engine_ver = tuple(int(x) for x in str(meta.get("version", "0")).split(".")[:3] if x.isdigit())
+    engine_ver = tuple(int(x) for x in str(meta.get("version", "0")).split(".")[:4] if x.isdigit())
     need_engine = MODELS[model].get("engine", UNSLOTH_ENGINE)
     if budget is not None and engine_ver < need_engine:      # checked before the 94-111 GB download
         fail(f"{model} needs engine {'.'.join(map(str, need_engine))} or newer; this one is {meta.get('version')}",

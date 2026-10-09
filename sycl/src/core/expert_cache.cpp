@@ -638,8 +638,8 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
         base_ = r->base();
         vmm_ = std::move(r);
     } else if (DPCT_CHECK_ERROR(
-                   base_ = (uint8_t *)sycl::malloc_device(
-                       (size_t)want, dpct::get_in_order_queue())) != 0 ||
+                   base_ = (uint8_t *)strata::malloc_device_guarded(
+                       (size_t)want, dpct::get_in_order_queue(), "expert cache arena")) != 0 ||
                base_ == nullptr) {   // Level Zero answers a too-large allocation with null, not an exception
         // (an Arc A750 caps one allocation at 4 GiB unless UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS=1)
         base_ = nullptr;

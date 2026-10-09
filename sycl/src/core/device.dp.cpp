@@ -2,6 +2,7 @@
 #define DPCT_PROFILING_ENABLED
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
+#include "strata/sycl_queue.hpp"
 #include "strata/core/device.hpp"
 
 #include <cstdio>
@@ -411,7 +412,7 @@ DeviceArena::DeviceArena(uint64_t bytes, int ordinal, bool poison)
     check(DPCT_CHECK_ERROR(dpct::select_device(ordinal)), "cudaSetDevice");
     // One allocation for the whole region.  cudaMalloc of a large block is the thing that can fail late, so it
     // happens once, here, before anything depends on it.
-    check(DPCT_CHECK_ERROR(base_ = (void *)sycl::malloc_device(
+    check(DPCT_CHECK_ERROR(base_ = (void *)strata::malloc_device_guarded(
                                (size_t)bytes, dpct::get_in_order_queue())),
           "cudaMalloc");
     if (poison_) {

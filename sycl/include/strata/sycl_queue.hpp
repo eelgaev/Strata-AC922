@@ -115,3 +115,90 @@ inline const std::string& intel_gpu_driver() {
     return drv;
 }
 }  // namespace strata
+
+#include <cstdint>
+namespace strata {
+// Does every page of a big device allocation keep its own bytes?  On an Arc Pro B70 (xe) a 22 GiB expert-cache arena came
+// back with two of its 2 MiB pages mapped onto the same memory (a write to the page at +2 MiB showed up at +1022 MiB; the
+// cache slots there then held other experts' bytes and the prompt came out NaN).  The check writes a tag per 64 KiB of
+// the range, then reads them back in a second kernel: it returns the number of 64 KiB blocks that do not hold their own tag
+// (0 = clean) and the first such block's offset.  The range's contents are destroyed.
+inline uint64_t arena_alias_check(sycl::queue& q, void* base, size_t bytes, size_t* first_bad = nullptr) {
+    constexpr size_t kBlock = 64 << 10;
+    const size_t n = bytes / kBlock;
+    if (n == 0) return 0;
+    uint8_t* b = (uint8_t*) base;
+    uint64_t* res = sycl::malloc_device<uint64_t>(2, q);
+    uint64_t init[2] = {0, ~0ull};
+    q.memcpy(res, init, sizeof init).wait();
+    // chunked so that no single launch is huge (an xe job past a few seconds is timed out)
+    const size_t chunk = (size_t) 1 << 20;
+    for (size_t c0 = 0; c0 < n; c0 += chunk) {
+        const size_t cn = n - c0 < chunk ? n - c0 : chunk;
+        q.parallel_for(sycl::range<1>(cn), [=](sycl::id<1> i) {
+            const size_t blk = c0 + i[0];
+            *(volatile uint64_t*) (b + blk * kBlock) = (blk + 1) * 0x9E3779B97F4A7C15ull;
+        });
+        q.wait();
+    }
+    for (size_t c0 = 0; c0 < n; c0 += chunk) {
+        const size_t cn = n - c0 < chunk ? n - c0 : chunk;
+        q.parallel_for(sycl::range<1>(cn), [=](sycl::id<1> i) {
+            const size_t blk = c0 + i[0];
+            if (*(volatile uint64_t*) (b + blk * kBlock) != (blk + 1) * 0x9E3779B97F4A7C15ull) {
+                sycl::atomic_ref<uint64_t, sycl::memory_order::relaxed, sycl::memory_scope::device> bad(res[0]);
+                sycl::atomic_ref<uint64_t, sycl::memory_order::relaxed, sycl::memory_scope::device> lo(res[1]);
+                bad.fetch_add(1);
+                lo.fetch_min((uint64_t) blk * kBlock);
+            }
+        });
+        q.wait();
+    }
+    uint64_t out[2] = {0, 0};
+    q.memcpy(out, res, sizeof out).wait();
+    sycl::free(res, q);
+    if (first_bad) *first_bad = (size_t) out[1];
+    return out[0];
+}
+}  // namespace strata
+
+namespace strata {
+inline bool arena_alias_guard_enabled() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_ARENA_ALIAS_CHECK"); return v == nullptr || v[0] != '0'; }();
+    return on;
+}
+}  // namespace strata
+
+#include <vector>
+namespace strata {
+// sycl::malloc_device for a big allocation, checked for aliased pages (arena_alias_check) and, when it has some, allocated
+// again behind a growing spacer that moves it.  Small allocations and STRATA_ARENA_ALIAS_CHECK=0 go straight to
+// sycl::malloc_device.  The memory comes back uninitialised, as from sycl::malloc_device.
+inline void* malloc_device_guarded(size_t bytes, sycl::queue& q, const char* what = "device buffer") {
+    void* p = sycl::malloc_device(bytes, q);
+    if (p == nullptr || bytes < ((size_t) 32 << 20) || !arena_alias_guard_enabled()) return p;
+    std::vector<void*> spacers;
+    bool clean = false;
+    for (int attempt = 0; attempt < 8 && p != nullptr; ++attempt) {
+        size_t first = 0;
+        const uint64_t bad = arena_alias_check(q, p, bytes, &first);
+        if (bad == 0) {
+            clean = true;
+            if (attempt > 0)
+                std::fprintf(stderr, "strata: %s (%.2f GiB) is clean after %d move(s)\n", what, (double) bytes / 1073741824.0, attempt);
+            break;
+        }
+        std::fprintf(stderr,
+                     "strata: WARNING: %llu 64-KiB blocks of the %s (%.2f GiB) do not keep their own bytes (first at +%zu MiB): the GPU's "
+                     "page table maps them onto other pages; allocating it again behind a %d MiB spacer\n",
+                     (unsigned long long) bad, what, (double) bytes / 1073741824.0, first >> 20, 2 * (attempt + 1));
+        sycl::free(p, q);
+        spacers.push_back(sycl::malloc_device((size_t) (2 * (attempt + 1)) << 20, q));
+        p = sycl::malloc_device(bytes, q);
+    }
+    for (void* sp : spacers) if (sp != nullptr) sycl::free(sp, q);
+    if (p != nullptr && !clean)
+        std::fprintf(stderr, "strata: WARNING: the %s still has aliased pages after 8 tries (STRATA_ARENA_ALIAS_CHECK=0 skips the check)\n", what);
+    return p;
+}
+}  // namespace strata

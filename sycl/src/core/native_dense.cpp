@@ -1,6 +1,7 @@
 #define DPCT_PROFILING_ENABLED
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
+#include "strata/sycl_queue.hpp"
 #include "strata/core/native_dense.hpp"
 #include <cstdlib>
 #include "strata/core/weights.hpp"
@@ -245,7 +246,7 @@ bool NativeDense::load(const std::vector<std::string> &shards,
                     tensor.type, (int) ref.ne0, (int) ref.ne1);
                 void* allocation = nullptr;
                 auto status =
-                    DPCT_CHECK_ERROR(allocation = (void *)sycl::malloc_device(
+                    DPCT_CHECK_ERROR(allocation = (void *)strata::malloc_device_guarded(
                                          bytes, dpct::get_in_order_queue()));
                 DevicePtr data(allocation);
                 if (status == 0)
@@ -284,7 +285,7 @@ bool NativeDense::load(const std::vector<std::string> &shards,
                                                            (int) ref.ne1);
                     void* packed_allocation = nullptr;
                     auto packed_status = DPCT_CHECK_ERROR(
-                        packed_allocation = (void *)sycl::malloc_device(
+                        packed_allocation = (void *)strata::malloc_device_guarded(
                             bytes, dpct::get_in_order_queue()));
                     packed.reset(packed_allocation);
                     if (packed_status == 0)
@@ -332,7 +333,7 @@ bool NativeDense::load(const std::vector<std::string> &shards,
                     std::vector<uint8_t> q8;
                     if (f32_inject) q8 = q8_0_of((const float*) gguf.tensor_data(tensor), (uint64_t) ref.ne0 * (uint64_t) ref.ne1);
                     if (DPCT_CHECK_ERROR(
-                            p = (void *)sycl::malloc_device(
+                            p = (void *)strata::malloc_device_guarded(
                                 bytes, dpct::get_in_order_queue())) != 0 ||
                         /*
                         DPCT1114: cudaMemcpy is migrated to
@@ -356,7 +357,7 @@ bool NativeDense::load(const std::vector<std::string> &shards,
         if (pending.empty()) { err = "native dense: no supported GDN/QSA matrices in supplied shards"; return false; }
         void* allocation = nullptr;
         const auto status =
-            DPCT_CHECK_ERROR(allocation = (void *)sycl::malloc_device(
+            DPCT_CHECK_ERROR(allocation = (void *)strata::malloc_device_guarded(
                                  strata::kernels::native_q8_1_bytes(max_in),
                                  dpct::get_in_order_queue()));
         DevicePtr scratch(allocation);

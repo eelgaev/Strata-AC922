@@ -316,7 +316,7 @@ struct Alloc {
             return p;
         }
         void* p = nullptr;
-        if (DPCT_CHECK_ERROR(p = (void *)sycl::malloc_device(
+        if (DPCT_CHECK_ERROR(p = (void *)strata::malloc_device_guarded(
                                  bytes, dpct::get_in_order_queue())) != 0) {
             ok = false; failed_bytes = bytes; return nullptr;
         }
@@ -1706,7 +1706,7 @@ bool Prefill::set_peer(core::PeerExperts *peer, int64_t cap_rows,
         try {
     void *p = nullptr;
         if (!ok ||
-            DPCT_CHECK_ERROR(p = (void *)sycl::malloc_device(
+            DPCT_CHECK_ERROR(p = (void *)strata::malloc_device_guarded(
                                  bytes, dpct::get_in_order_queue())) != 0) {
             ok = false; return nullptr;
         }
@@ -2156,7 +2156,13 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
     // SYCL port: a short first chunk so the GPU starts while the rest of the prompt's PLE rows are still being read
     // (27k random 4 KB reads per 2k tokens, 330 ms at the drive's ~85k IOPS, otherwise all before the first kernel).
     // STRATA_PREFILL_FIRST=<tokens> (0: off), default 256 when the prompt is longer than twice that.
-    static const int64_t first_chunk = [] { const char* v = std::getenv("STRATA_PREFILL_FIRST"); return v ? std::atoll(v) : 256; }();
+    // Every chunk streams the experts the cache does not hold (a 4K prompt touches nearly all 512 per layer), over PCIe: with
+    // part of the model in the host mirror a short first chunk costs a whole extra pass of that stream (an Arc Pro B70 on
+    // IQ3_S: a 4,095-token prompt 784 -> 1,002 tok/s without it).  So the default is 256 only when the cache holds every
+    // expert; STRATA_PREFILL_FIRST=<tokens> decides explicitly.
+    const bool all_cached = m.cache != nullptr && m.g != nullptr && m.cache->slots() >= m.g->n_layers * m.g->n_expert;
+    static const char* const first_env = std::getenv("STRATA_PREFILL_FIRST");
+    const int64_t first_chunk = first_env ? std::atoll(first_env) : (all_cached ? 256 : 0);
     auto chunk_len = [&](int64_t c0) {
         if (c0 == 0 && first_chunk > 0 && first_chunk < m.T && n > 2 * first_chunk) return first_chunk;
         return std::min(m.T, n - c0);

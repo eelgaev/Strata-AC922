@@ -1,6 +1,7 @@
 #define DPCT_PROFILING_ENABLED
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
+#include "strata/sycl_queue.hpp"
 #include "strata/core/native_head.hpp"
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/kernels/iq_kernels.hpp"
@@ -50,11 +51,11 @@ bool NativeHead::load(const std::vector<std::string> &shards, int64_t n_in,
         void* weights = nullptr;
         void* scratch = nullptr;
         dpct::err0 status =
-            DPCT_CHECK_ERROR(weights = (void *)sycl::malloc_device(
+            DPCT_CHECK_ERROR(weights = (void *)strata::malloc_device_guarded(
                                  bytes, dpct::get_in_order_queue()));
         if (status == 0)
             status = DPCT_CHECK_ERROR(
-                scratch = (void *)sycl::malloc_device(
+                scratch = (void *)strata::malloc_device_guarded(
                     strata::kernels::native_q8_1_bytes((int)n_in, 1),
                     dpct::get_in_order_queue()));
         strata::platform::advise_willneed(gguf.tensor_data(*tensor), bytes);
@@ -212,7 +213,7 @@ bool NativeEmbed::load(const std::vector<std::string> &shards, int64_t n_embd,
             */
             host_ = nullptr;
             void* d = nullptr;
-            if (DPCT_CHECK_ERROR(d = (void *)sycl::malloc_device(
+            if (DPCT_CHECK_ERROR(d = (void *)strata::malloc_device_guarded(
                                      bytes_, dpct::get_in_order_queue())) !=
                     0 ||
                 /*
