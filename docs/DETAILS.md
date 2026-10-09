@@ -37,8 +37,13 @@ below are 0.1.26's.
 | **IQ3_XXS** | 482 | 1,007 | 1,745 | 1,609 | 1,602 | - |
 | **IQ3_S** | 427 | 913 | 1,624 | 1,640 | 1,443 | - |
 | **Coder** | 656 | 1,583 | 2,177 | 2,236 | 2,208 | 1,034** |
+| **IQ3_S** (AMD RX 7900 XTX, gfx1100) | 760 | 1,275 | 1,641 | 1,594 | 1,494 | - |
 
-Engine 0.1.26; `bench/results/2026-09-29-speed-0126`. At 32K-128K that is 8-28% faster than 0.1.22. † not measured
+Engine 0.1.26; `bench/results/2026-09-29-speed-0126`. The AMD RX 7900 XTX row: engine 0.1.38 on a ROCm
+10.2 nightly with a tuned gfx1100 hipBLASLt-100500 table (upstream as [#755](https://github.com/Niko1221/Strata/pull/755)),
+the median of 3 clean cells per tier
+(Ryzen 9 7900X, 96 GB; 1K-128K one-shot runs, 256 generated tokens,
+greedy). At 32K-128K that is 8-28% faster than 0.1.22. † not measured
 again: 0.1.22. \* measured with images on (the image encoder's VRAM reserve leaves fewer experts cached). \*\* not
 measured again: 0.1.14.
 
@@ -51,8 +56,12 @@ measured again: 0.1.14.
 | **IQ3_XXS** | 61.9 | 61.6 | 58.5 | 57.2 | 49.0 | - |
 | **IQ3_S** | 52.4 | 53.3 | 48.3 | 46.3 | 45.5 | - |
 | **Coder** | 58.9 | 55.1 | 54.9 | 53.2 | 43.0 | 42.8† |
+| **IQ3_S** (AMD RX 7900 XTX, gfx1100) | 65.1 | 60.4 | 64.4 | 61.8 | 59.2 | - |
 
-Engine 0.1.26, the same runs. † not measured again: 0.1.14.
+Engine 0.1.26, the same runs. The AMD RX 7900 XTX row: engine 0.1.38 on a ROCm 10.2 nightly (tuned
+gfx1100 hipBLASLt-100500 table, upstream as [#755](https://github.com/Niko1221/Strata/pull/755)), median of 3 clean cells per tier (same box; decode is flat in
+context - the GDN linear attention is O(1) per token; 1K/4K prefill ran slightly under the 0.1.31
+packaged-ROCm numbers, 32K-128K ahead). † not measured again: 0.1.14.
 
 Output speed depends on the text as well: speculative decoding runs faster when more of the drafted tokens are
 accepted, so a different answer to the same prompt moves it by several percent. Run back to back on the 4K prompt,
@@ -145,10 +154,13 @@ other ~18 GB), a 32 GB PC with a 12-16 GB GPU the Coder; IQ3_XXS on a 32 GB PC s
   RAM place of the one that replaces it, so the RAM copy keeps holding exactly what the GPU does not.
 - `--adapt-async 1` (opt-in, `--serve`): the swaps of a round advance between decode windows on a helper thread
   (copy back, copy in, move into RAM) instead of one window waiting for the whole round. Not with `--batch` or
-  `--peer-device` (the blocking tier runs there). It is not bit-exact from run to run: which window first computes a
-  swapped-in expert on the GPU (which rounds differently from the CPU) depends on when its copy lands.
-  It stays on the blocking tier (said in the log) when the exchange buffers are not page-locked, and with
-  `--pipeline-windows`; the stats line reports ms per round.
+  `--peer-device` (the blocking tier runs there). With `--pipeline-windows 2` (two windows in flight, see
+  [MULTI_GPU.md](MULTI_GPU.md)) the copies into the evicted slots and the moves into RAM also wait until the windows
+  that were in flight when they were decided have completed (`STRATA_PIPELINE_ADAPT_ASYNC=0`: the blocking tier
+  there). It is not bit-exact from run to run: which window first computes a swapped-in expert on the GPU (which
+  rounds differently from the CPU) depends on when its copy lands.
+  It stays on the blocking tier (said in the log) when the exchange buffers are not page-locked; the stats line
+  reports ms per round.
 - `STRATA_EXCHANGE_ROTATE=1` (opt-in): an adaptive swap hands buffer ownership over instead of copying the evicted
   blob into the RAM copy (equal-size blobs, fully page-locked copy). Same tokens, fewer host copies; it works with
   `--adapt-async 1` too. Details and the measurement: [EXCHANGE_ROTATION.md](EXCHANGE_ROTATION.md).
@@ -414,11 +426,15 @@ START-HERE.bat --calibrate                      tune the engine for this PC (abo
 
 With more than one model installed, it asks which one to start. `run-<model>.bat` starts a model directly.
 
-**Tuning for your PC (`--calibrate`, engine 0.1.19).** Three engine settings depend on the PC more than on the model:
+**Tuning for your PC (`--calibrate`, engine 0.1.19).** Four engine settings depend on the PC more than on the model:
 - the share of the experts missing from VRAM that are copied to the GPU instead of computed by the CPU
   (`--pcie-frac`: a fast PCIe link and a slower CPU want more, a laptop's narrower link less);
 - how sure the draft layer must be to add another guess to a check (`--spec-min-p`);
-- how many CPU threads compute experts (`--pool-workers`: on CPUs with efficiency cores, fewer can be faster).
+- how many CPU threads compute experts (`--pool-workers`: on CPUs with efficiency cores, fewer can be faster);
+- how busily the VRAM expert cache follows the conversation (`--adapt-every`, `--adapt-swaps`, `--adapt-decay`): a PC
+  whose CPU reads the missed experts slowly (DDR3 or DDR4 in few channels) gains from swapping more. On a Xeon
+  E5-2673 v3 with DDR3 and an RTX 4060 Ti on PCIe 3.0 x8, 160 swaps every window measured +7.9% over the default
+  (Q2_0, with the swaps taking effect a window later, #764); see #906.
 
 The defaults were measured on a Ryzen 5 7600 with an RTX 5070. Setup offers to measure them on your PC after an
 install; `START-HERE.bat --calibrate` (Linux: `./setup.sh --calibrate`) does it any time. It measures the output
@@ -520,6 +536,50 @@ before). A relative path is in the Strata folder; one file per model, and a prof
 (point the key at another file). The file is a fingerprint of what you used the model for: it stays on your PC.
 Without the key nothing is counted or written. Setup rewrites the config when run again: add the key again then.
 
+**The expert cache size is a budget, and on Windows an over-sized one pages instead of failing.** `--expert-cache N`
+(`"expert_cache": N`) is `N` times the largest expert blob, and the engine compares it only with the free VRAM it
+reads **before** the slots are written. `--expert-cache auto` (the default) sizes from that same figure but **checks
+again once the slots are actually written** and shrinks if they do not fit; that second check is auto-only (the loop
+breaks on `!auto_cache`). Under WDDM an allocation is not resident until it is touched, and the free figure read
+before it can be about a gigabyte too high, and the driver's default sysmem fallback puts an over-committed
+allocation in system memory instead of failing - so the start looks normal, the banner still reports the slot count,
+and only the speed collapses. The startup line is the tell: `... MiB of VRAM free with everything loaded`, and below
+about 256 MiB it adds `LOW: requests may stall; add --vram-reserve-mib N` with the value that would have left room.
+
+Measured on an RTX 4080 SUPER 32 GB, IQ3_S, engine 0.1.39, `--max-context 1048576` (yarn factor 4), fresh
+43,969 / 45,670 / 47,956-token prompts with 200 generated each, one engine start per row (the rest of the
+configuration is the one in `bench/results/2026-10-04-community-rtx-4080s-iq3s`):
+
+| expert cache | slots | VRAM free at start | decode tok/s |
+| --- | ---: | --- | --- |
+| `--expert-cache 8900` (11,631 slots, 22.07 GiB) | 11,631 | 0 MiB (`LOW`, suggests `--vram-reserve-mib 1212`) | 13.7 / 14.7 |
+| `auto` | 11,178 | 217 MiB (`LOW`) | 102.1 / 122.3 |
+| `auto` with `--vram-reserve-mib 1500` | 10,766 | 1,075 MiB | 88.9 / 96.5 / 101.4 |
+| `--expert-cache 7000` | 9,148 | 4,130 MiB | 94.1 / 97.3 |
+| the same 11,631-slot cache at `--max-context 524288` | 11,631 | 299 MiB | 113.2 / 107.9 |
+
+453 slots (0.86 GiB) separate 13.7 from 102 tok/s, and the slower run had the **higher** cache hit rate (91.4 / 94.7%
+against 90.4 / 93.9%), so this is not misses: being at 0 MiB free is what costs 7x. Two ways to stay out of it: leave
+the cache on `auto`, or keep an explicit size and raise `--vram-reserve-mib`, which the engine deducts **before** it
+sizes the cache (700 -> 1000 -> 1500 took the free figure from 217 to 575 to 1,075 MiB and cost about 400 slots).
+
+**Checking it on Windows.** `\GPU Process Memory(<pid>)\Shared Usage` and `Dedicated Usage` (Performance Monitor, or
+`Get-Counter`) look like the right instrument, but on this machine they did **not** separate a 13.7 tok/s run from a
+102 tok/s one: `Shared` read about 55.5 GB at 262/524K and 62.4 GB at 1M in every run, because it counts the
+deliberately pinned memory (the expert arena, 50.3 GB here, plus the pinned K/V, 6.19 -> 12.38 GiB at 1M). The free
+line in the log is the reliable tell, and on NVIDIA hardware `CUDA - Sysmem Fallback Policy` set to
+`Prefer No Sysmem Fallback` for the engine's executable is the other way to make an over-sized cache fail instead of
+paging (not measured here). Reported with the measurements in
+[issue #781](https://github.com/Niko1221/Strata/issues/781).
+
+The same shape appears on a second, smaller card. On a 16 GB RTX 5080 at 786,432, UD-IQ4_XS, INT8 KV, with
+`Prefer No Sysmem Fallback` set and an explicit `--expert-cache 4000`, taking `--vram-reserve-mib` down from 770 to 0
+grew the cache from 2,782 to 3,115 slots (768 MiB) while the card's used memory moved 129 MiB, the hit rate stayed
+flat (59.9% to 63.0%) and decode fell from 40.9 to 16.6 tok/s. Every step there reached READY with 0 MiB free, so
+with the fallback off it still starts and degrades instead of failing - the slack left for the rest of the card is
+worth more than the extra slots, which is the same ordering measured above (enkynakamura, #781; one 256-token sample
+per step, so the upper rows are noisy).
+
 ---
 
 ## Using it
@@ -580,6 +640,10 @@ print(r.choices[0].message.content)
   part of the thinking the client sees and counts as output tokens. `"reasoning_budget_tokens": N` in
   `strata-<model>.json` sets it for every request; a request's own value wins, and `0` means no budget. Off by default;
   Anthropic's `"thinking": {"budget_tokens": N}` still only chooses the level, as above.
+- **A reply that ends inside its thinking (#1053, opt-in).** Some turns write a sentence of reasoning and then the
+  end-of-turn token with no `</think>`: the content is empty and an agent stops. `"reasoning_close_retry": true` in
+  `strata-<model>.json` closes the thinking once (as the thinking budget does) and continues, once per request, only for
+  a reply that ended that way with no answer and no tool call. Off by default.
 - **A reply stuck on one token is ended (0.1.39, #606).** When a reply repeats the same token 256 times in a row, the
   server ends it there with `finish_reason` `"length"` and says so in its window: a model in a loop, or a broken
   state that answers one token forever (#606 saw 36,689 tokens of `!`). `"repeat_stop_tokens": N` in
@@ -933,6 +997,7 @@ are refused with an error that says so.
 | `reasoning.effort` | `none`/`minimal`, `low`, `medium`, `high`/`xhigh`; without it the model's default (high) |
 | `max_output_tokens` | The output cap (thinking included). Running out ends the response `incomplete` (`max_output_tokens`) |
 | `text.format` | `json_schema` and `json_object` use the [JSON response formats](#json-response-formats) (checked, not constrained) |
+| `thread_source` `thread_title` in `client_metadata["x-codex-turn-metadata"]` | Codex's thread-title request (opt-in: `"codex_thread_titles": true` in `strata-<model>.json`, off by default), sent beside each user turn from another session with `tools: []`: answered without the engine as `{"title": "<the user's line, cut to 36 characters>"}`, so the conversation keeps the prompt cache. The title is the user's line, not one the model wrote |
 | `temperature`, `top_p`, `reasoning_budget_tokens`, ... | As on the chat path |
 
 The model's thinking comes back as a `reasoning` output item with `reasoning_text` content (streamed as
@@ -972,6 +1037,21 @@ name; that is expected. Measured with Codex CLI 0.160.0 and Q2_0 on an RTX 5070:
 tool descriptions) was 9,443 tokens, read in 10 s; in a tool loop, each later turn reused about 96% of the prompt from
 the cache and read only the new part in 1-2 s. On Windows, Codex's sandbox rejected every shell command in that test
 until it was started with `-c 'windows.sandbox="unelevated"'` (a Codex setting, not Strata's).
+
+**Codex's compaction (opt-in: `"codex_compaction_cache": true` in `strata-<model>.json`).** When the context fills up (or
+on `/compact`), Codex sends the conversation once more with a request to summarize it, and with `tools: []`. The template
+writes the tools at the top of the prompt, so that prompt would share only its first few tokens with the conversation the
+engine holds and be read again from the start, at its longest. With the option on, Strata keeps which Codex conversation
+sent the last prompt other than a compaction (`session_id` and `thread_id` from `client_metadata["x-codex-turn-metadata"]`)
+and the tools that prompt was rendered with; a request Codex marks `"request_kind": "compaction"`, from that same
+conversation and without tools of its own, is rendered with them. Only the prompt: for the output parser and in the
+response the request's tools stay what Codex sent, none, so a tool call the model writes comes back as a plain function
+call without its namespace or custom-tool form. It is one entry, replaced by each such prompt; a compaction of another
+conversation, a request without that metadata (Codex before 0.140) or a restart renders the request as sent, and so does
+one that would not fit the context with the kept tools. Off by default: the prompt of a compaction differs from the
+one the client sent. The author measured, with Codex CLI 0.160.0 and an engine that only counts the shared prompt start,
+that a compaction after an 85,000-token conversation reused 84,895 of its 84,997 tokens and read 102; without it, 41 of
+80,683.
 
 ## Tools from MCP servers
 
@@ -1113,6 +1193,23 @@ a community Q8_0 file, at 300, 768 and 1,024 tokens), and 0.9988 and 0.9987 on t
 the command above (300 tokens; the worst single token 0.94-0.96). Encode time above 768 tokens is the same as BF16's
 within about 3%. Numbers on more pictures (charts, small text) are welcome in #625.
 
+**Flash attention on the CPU (#660):** ggml's fast CPU kernel for flash attention needs the encoder's head size (72)
+to be a multiple of the vector width: 8 floats with AVX2, which the release builds use, but 16 with AVX-512, which a
+build from source gets on a CPU that has it (Zen 4 and newer, some Intel). There ggml falls back to a kernel that is
+several times slower and accumulates in FP16, so `strata-vision` turns flash attention off on the CPU when its ggml has
+AVX-512 and leaves it at `auto` (on) otherwise; `--flash-attn on|off|auto` overrides that. A 1024x1024 picture
+(1,024 image tokens) on a Ryzen 7 7700X, 8 threads, an F16 mmproj, one encode per fresh process:
+
+| Build | Flash attention | Encode | Peak RSS | Output vs FP32 attention |
+| --- | --- | --- | --- | --- |
+| AVX2 (as released) | on (default) | 8.3 / 9.9 s | 1,152 MiB | 1.2% |
+| AVX2 | off | 15.2 / 14.0 s | 2,194 MiB | 1.1% |
+| AVX-512 (from source) | on | 43.5 s | 1,152 MiB | 26% |
+| AVX-512 (from source) | off (default) | 13.3 s | 2,195 MiB | - |
+
+The last column is the relative L2 distance of the embeddings from the AVX-512 run without flash attention; two builds
+differ by about 1% anyway.
+
 **A spare GPU for the encoder (0.1.33, #408):** with a card the engine doesn't use, add `"cuda_device": 2` (numbered
 like `nvidia-smi`) to the `"vision"` section of `strata-<model>.json`: the encoder then runs on that card alone. Lower
 `--vram-reserve-mib` in `"args"` to 700 as well, so the engine's cards keep that VRAM for the expert cache. The
@@ -1233,9 +1330,11 @@ the document, +0.4% on the chat. Details: `bench/results/2026-09-27-esp/`.
 | `the setup refuses --rope-scaling none for a past-trained context` | A context past the trained 262,144 needs the rotary angles rescaled (experimental rope scaling), and the setup will not configure one with the stock angles there. Let it pick (`START-HERE.bat --setup --context 393216` adds yarn and a covering factor), or pass `--rope-scaling linear` or `yarn` yourself. |
 | Slower than the tables | The monitor plugged into the GPU and other GPU programs take VRAM from the expert cache; RAM running below its rated speed (enable EXPO/XMP in the BIOS) slows the CPU half. |
 | `this server was started without the vision encoder` | The model was set up for text only: run setup again with `--vision gpu`. |
+| Setup puts the model on an old drive after you moved or reinstalled Strata (#1070) | Setup remembers the data folder you used last in its settings file (`%APPDATA%\Strata\settings.json` on Windows, `~/.config/strata/settings.json` on Linux; the `data_dir` entry) and uses it again. Choose another place with `--data-dir DIR` (model files, packs, MTP layer) or `--models-dir DIR` (the GGUF files only), or delete the `data_dir` line; `--gguf-dir DIR` uses GGUF files you already have without copying. To move a model, copy its folder and run setup with the new `--data-dir`. |
 | A picture is refused or `cannot read the image` | The file is not a picture Pillow can open (JPEG, PNG, WebP, GIF, BMP, TIFF, AVIF work). |
 | Pictures are slow (3-30 s) | The encoder runs on the CPU: run setup again with `--vision gpu` (needs ~1.4 GB of VRAM). |
 | A request never finishes: "reading the prompt", GPU "100%" at low power | The GPU ran out of VRAM (engines before 0.1.9 could end with ~30 MiB free at large contexts). Run `START-HERE.bat` once to get engine 0.1.9 or newer; the log then says `... MiB of VRAM free with everything loaded` (a few hundred) and names the `--vram-reserve-mib` to add if it is low. |
+| Output much slower than the tables above, only with a large `--context`, and the start says a small `... MiB of VRAM free with everything loaded` | The expert cache does not fit the card at that context. With `--expert-cache auto` the engine shrinks it to fit; with a fixed number it does not check again after the slots are written, and on Windows the extra is put in system memory instead of failing, so only the speed shows it. Use `auto`, a smaller number, or raise `--vram-reserve-mib` (it is deducted before the cache is sized). See "The expert cache size is a budget" under Sharing the GPU. |
 | Generation stops mid-answer, GPU "100%", one CPU core busy | Fixed in engine 0.1.12 (issue #29, a race in the CPU expert pool on big-VRAM cards). Since then a request that stops moving ends with an error instead of hanging (after 2 minutes; 1 minute from 0.1.13): the log says `no progress for ... s ... (issue #29)` with where it stopped, and the next request starts the engine again. If you see that line, please open an issue with it. Engine 0.1.13 adds a stall report under it (what every expert-pool thread and the GPU handshake were doing, memory and page faults) and, on Windows, a `strata-stall-<pid>.dmp` file with every thread's stack: attach both. (`STRATA_WATCHDOG_S` sets the time in seconds; 0 turns it off.) Engine 0.1.14 fixes the stall those reports found (issue #31: with the IQ packs the host could wait forever inside the NVIDIA driver while copying experts in a verify window; the experts are now copied by a GPU kernel, `--pcie-mode dma` restores the old way). |
 | `no progress for 60 s ... reading the prompt` on Linux, and the stall report says `threads waiting on the disk (state D): 16 ...` | The engine waits for the drive, not a deadlock: the n-gram table is read at random (`--ple-io direct`), which a rotational disk cannot keep up with (#605). The engine warns at start when the table is on one; `--ple-io ram` (Linux, needs RAM for the table) or the model on an SSD fixes it. Setup adds `--ple-io ram` itself on a rotational disk when the RAM holds the table (0.1.39). |
 | `the engine said nothing for ... s during the request` or `... did not finish the request after it was stopped (STOP)` | Issue #481: the engine and the server lost step (the engine waits for its next command, the server for the request's end; GPU at 0 %, nothing in the log). The server ends the engine after 300 s without a line from it during a request (while a prompt is read: each chunk may take three times the previous one's time, the first one up to its tokens at 50 tok/s more), the request ends with an error and the next request starts the engine again. `"engine_silence_s": 600` in `strata-<model>.json` sets the time (0 = wait forever, as before). If you see it, please add the end of the engine log to #481. |
@@ -1305,12 +1404,14 @@ Strata itself: [MIT](../LICENSE). The model files are not part of it; their lice
 - The experimental speed projection's vector (`data/experimental-speed-projection/`): Qwen Community License 1.0,
   made from the model's activations (see its README).
 
-### Start the text API without occupying the GPU
+### Start the API without loading the model
 
 `serve/server.py --engine strata --config strata-<model>.json --lazy` (or `"lazy_load": true` in that
-config) starts the lightweight HTTP API without spawning the native engine. The first generation request
-loads it through the existing reload path, including `before_load` and `min_free_vram_mib`. Eager startup
-remains the default. This option is text-only: a vision configuration with lazy startup is rejected explicitly.
+config) starts the lightweight HTTP API without starting the native engine or the vision encoder. The first
+generation request, or `POST /load`, starts the vision encoder first when configured, then loads the engine through
+the existing reload path, including `before_load` and `min_free_vram_mib`. This also works with image requests:
+the load finishes before Strata encodes the image. `POST /unload` stops both processes. Eager startup remains the
+default.
 
 `POST /v1/load` and `/v1/unload` are JSON control aliases for integrations, accepting `{}` or
 `{"model":"<configured model>"}` and returning model status. They require the configured API key,

@@ -8,6 +8,7 @@ import contextlib
 import io
 import json
 import os
+import shutil
 import socket
 import sys
 import tempfile
@@ -847,6 +848,53 @@ class StatusNeedsTheKey(unittest.TestCase):
             httpd.server_close()
 
 
+class _Reached(Exception):
+    """raised by the patched serve(): main() got past the API key checks."""
+
+
+class ConfigApiKey(unittest.TestCase):
+    """#569 (and #213): the key in the config, through main(): empty is a warning, a blank one is refused."""
+
+    def run_main(self, cfg):
+        """-> (return code, the API key the service got or None when main() stopped before serving, stderr)."""
+        import serve.server as S
+        seen = {}
+
+        def fake_serve(svc, host=None, port=None):
+            seen["key"] = svc.api_key
+            raise _Reached
+
+        err = io.StringIO()
+        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ), \
+                mock.patch.object(S, "serve", fake_serve), mock.patch.object(sys, "stderr", new=err):
+            os.environ.pop("STRATA_API_KEY", None)
+            p = Path(d) / "cfg.json"
+            p.write_text(json.dumps(cfg), encoding="utf-8")
+            with mock.patch.object(sys, "argv", ["server.py", "--engine", "mock", "--port", "0", "--config", str(p)]):
+                try:
+                    code = S.main()
+                except _Reached:
+                    code = 0
+        return code, seen.get("key"), err.getvalue()
+
+    def test_an_empty_key_is_a_warning(self):
+        code, key, err = self.run_main({"api_key": ""})
+        self.assertEqual((code, key), (0, ""))
+        self.assertIn("api_key in the config is empty", err)
+
+    def test_a_blank_key_is_refused(self):
+        for value in ("   ", "\r\n"):
+            self.assertEqual(self.run_main({"api_key": value})[:2], (2, None), repr(value))
+
+    def test_a_key_and_no_key(self):
+        code, key, err = self.run_main({"api_key": "cfg"})
+        self.assertEqual((code, key), (0, "cfg"))
+        self.assertNotIn("is empty", err)
+        code, key, err = self.run_main({})
+        self.assertEqual((code, key), (0, ""))
+        self.assertNotIn("is empty", err)
+
+
 class ApiKeyForms(unittest.TestCase):
     """#725: a key no client could send (spaces or a line end around it), and a key outside ASCII."""
 
@@ -1352,6 +1400,52 @@ class GpuChoice(unittest.TestCase):
         self.assertEqual(plain.get("HIP_VISIBLE_DEVICES"), os.environ.get("HIP_VISIBLE_DEVICES"))
 
 
+class HipEnvGuard(unittest.TestCase):
+    """#654: a HIP_PATH that points nowhere and an unwritable TEMP crash the AMD runtime; both are repaired, a healthy
+    environment is not touched."""
+
+    def test_stale_hip_path_dropped(self):
+        import tempfile
+        from serve.server import hip_env_guard
+        with tempfile.TemporaryDirectory() as d:
+            gone = os.path.join(d, "TheRock", "build")
+            env = {"HIP_PATH": gone, "HIP_DEVICE_LIB_PATH": gone, "LLVM_PATH": d}
+            said = hip_env_guard(env, {"log": os.path.join(d, "x.log")})
+            self.assertNotIn("HIP_PATH", env)
+            self.assertNotIn("HIP_DEVICE_LIB_PATH", env)
+            self.assertEqual(env["LLVM_PATH"], d)             # exists: left alone
+            self.assertEqual(len(said), 2)
+
+    def test_unwritable_temp_replaced(self):
+        import tempfile
+        from serve.server import hip_env_guard
+        with tempfile.TemporaryDirectory() as d:
+            nothing = os.path.join(d, "no", "such", "dir")
+            env = {"TEMP": nothing, "TMP": d}
+            hip_env_guard(env, {"log": os.path.join(d, "x.log")})
+            self.assertEqual(env["TMP"], d)                   # writable: untouched
+            self.assertTrue(os.path.samefile(env["TEMP"], os.path.join(d, "tmp")))
+            self.assertTrue(os.path.isdir(env["TEMP"]))
+
+    def test_healthy_untouched(self):
+        import tempfile
+        from serve.server import hip_env_guard
+        with tempfile.TemporaryDirectory() as d:
+            env = {"HIP_PATH": d, "TEMP": d}
+            before = dict(env)
+            self.assertEqual(hip_env_guard(env, {}), [])
+            self.assertEqual(env, before)
+
+    def test_only_for_hip(self):
+        from serve.server import child_env
+        os.environ["HIP_PATH"] = r"Z:\definitely\not\here"
+        try:
+            self.assertEqual(child_env({}).get("HIP_PATH"), os.environ["HIP_PATH"])
+            self.assertNotIn("HIP_PATH", child_env({"backend": "hip"}))
+        finally:
+            del os.environ["HIP_PATH"]
+
+
 class RecordingPrompt(MockEngine):
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
         self.last_ids = list(ids)
@@ -1559,6 +1653,25 @@ class PcieShare(unittest.TestCase):
         self.assertEqual([r["hit_rate"] for r in rows], [0.6, 0.6, 0.6])
         self.assertEqual([r["pcie_share"] for r in rows], [0.2, 0.0, None])
         self.assertIn("expert cache 60.0% hit (+20.0% of the routed experts over PCIe)", out.getvalue())
+
+
+class PeerDevice(unittest.TestCase):
+    """#665: several GPUs in the config are a layer split, but --peer-device uses the second card as an expert-cache
+    tier, and the engine refuses it beside --layer-split: the server must not add one then."""
+
+    def test_split_added_for_several_gpus(self):
+        self.assertEqual(engine_args({"args": ["--native", "x"], "gpu": [0, 1]}),
+                         ["--native", "x", "--layer-split", "auto"])
+
+    def test_no_split_with_a_peer(self):
+        args = ["--native", "x", "--peer-device", "1"]
+        self.assertEqual(engine_args({"args": list(args), "gpu": [0, 1]}), args)
+        self.assertEqual(engine_args({"args": list(args), "gpu": [0, 1], "split_skip_if_fits": True}), args)
+
+    def test_both_cards_visible(self):
+        from serve.server import child_env
+        env = child_env({"args": ["--peer-device", "1"], "gpu": [0, 1]})
+        self.assertEqual(env["CUDA_VISIBLE_DEVICES"], "0,1")
 
 
 class LearnedProfile(unittest.TestCase):
@@ -2373,6 +2486,19 @@ class WebApp(unittest.TestCase):
         self.assertEqual(slots, [{"id": 0, "n_ctx": CTX, "is_processing": True, "n_prompt_tokens": 500},
                                  {"id": 1, "n_ctx": CTX, "is_processing": False, "n_prompt_tokens": 77}])
 
+    def test_the_endpoints_keep_the_context_while_the_engine_restarts(self):
+        """#351: max_context is 0 until READY; the endpoints report the last known one."""
+        engine = self.svc.engine
+        had = engine.max_context
+        engine.max_context, engine.known_ctx = 0, CTX
+        try:
+            self.assertEqual(json.loads(self.get("/props")[2])["default_generation_settings"]["n_ctx"], CTX)
+            self.assertEqual(json.loads(self.get("/health")[2])["max_context"], CTX)
+            self.assertEqual(json.loads(self.get("/v1/status")[2])["cache_max_tokens"], CTX)
+        finally:
+            engine.max_context = had
+            del engine.known_ctx
+
     def test_props_total_slots_follows_the_batch_slots(self):
         # llama.cpp clients read total_slots as the number of requests the server runs at once
         engine, had = self.svc.engine, hasattr(self.svc.engine, "batch")
@@ -2763,6 +2889,64 @@ class ThinkingEngine(MockEngine):
             if cancel.is_set():
                 return
             yield t
+
+
+class EndsInsideThinkingEngine(ThinkingEngine):
+    """The #1053 reply: one sentence of reasoning, then the end-of-turn token, no </think>.  A prompt that ends the
+    thinking (the retry) gets the answer."""
+    THOUGHT = "Let me think: two plus two is four."
+
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        self.prompts.append(list(ids))
+        done = self.tok.decode(ids).endswith("</think>" + chr(10) + chr(10))
+        text = self.ANSWER if done else self.THOUGHT
+        for t in (self.tok.encode(text) + self.tok.encode("<|im_end|>", parse_special=True))[:max_new]:
+            if cancel.is_set():
+                return
+            yield t
+
+
+class ReasoningCloseRetry(unittest.TestCase):
+    """#1053 (opt-in): a reply that ends inside <think> with no answer is continued once with the thinking closed."""
+
+    def setUp(self):
+        self.tok = ByteTokenizer()
+        self.engine = EndsInsideThinkingEngine(self.tok)
+        self.svc = Service(self.engine, self.tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        self.httpd = serve(self.svc, port=0)
+        self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+    def chat(self):
+        body = {"model": "m", "messages": [{"role": "user", "content": "2+2?"}], "max_tokens": 300}
+        req = urllib.request.Request(self.base + "/v1/chat/completions", data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read().decode())["choices"][0]
+
+    def test_off_by_default_the_reply_stays_empty(self):
+        c = self.chat()
+        self.assertEqual(self.engine.prompts.__len__(), 1)
+        self.assertFalse(c["message"].get("content"))
+
+    def test_on_it_closes_the_thinking_once_and_answers(self):
+        self.svc.reasoning_close_retry = True
+        c = self.chat()
+        self.assertEqual(len(self.engine.prompts), 2)
+        self.assertTrue(self.tok.decode(self.engine.prompts[1]).endswith("</think>" + chr(10) + chr(10)))
+        self.assertEqual(c["message"]["content"], EndsInsideThinkingEngine.ANSWER)
+        self.assertIn("two plus two is four", c["message"]["reasoning_content"])
+        self.assertEqual(c["finish_reason"], "stop")
+
+    def test_a_reply_that_answered_is_not_touched(self):
+        self.svc.reasoning_close_retry = True
+        self.engine.THOUGHT = "ok</think>" + chr(10) + chr(10) + "Fine."
+        c = self.chat()
+        self.assertEqual(len(self.engine.prompts), 1)
+        self.assertEqual(c["message"]["content"], "Fine.")
 
 
 class ThinkingBudget(unittest.TestCase):
@@ -4104,6 +4288,102 @@ class VisionCacheEviction(unittest.TestCase):
                 v.encode(f"image {i}".encode())
             self.assertEqual(len(v.cache), 64)
             self.assertFalse(first.exists())
+
+
+class BudgetOverRam(unittest.TestCase):
+    """#1080: a RAM budget above what the PC has free is a warning at start, not silence and not a refusal."""
+
+    def run_with(self, budget, total, free):
+        import serve.server as S
+        vm = SimpleNamespace(total=total * 2**30, available=free * 2**30)
+        fake = SimpleNamespace(virtual_memory=lambda: vm)
+        with mock.patch.dict(sys.modules, {"psutil": fake}), contextlib.redirect_stdout(io.StringIO()):
+            return S.warn_budget_over_ram(["--native", "x", "--resident-budget-gib", str(budget)])
+
+    def test_over_free_ram_warns(self):
+        msg = self.run_with(55, 64, 30)
+        self.assertIn("55 GiB", msg)
+        self.assertIn("30 GiB free of 64", msg)
+
+    def test_over_total_less_headroom_warns(self):
+        self.assertIsNotNone(self.run_with(60, 64, 60))
+
+    def test_a_budget_that_fits_is_quiet(self):
+        self.assertIsNone(self.run_with(40, 64, 50))
+
+    def test_no_budget_argument_is_quiet(self):
+        import serve.server as S
+        self.assertIsNone(S.warn_budget_over_ram(["--native", "x"]))
+
+
+class LazyVision(unittest.TestCase):
+    """#673: with --lazy the image encoder is not started either; it starts with the model, and an encoder that fails
+    to start leaves nothing running."""
+
+    def make(self, ready=True):
+        import serve.server as server
+        started = []
+
+        class Proc:
+            def __init__(self):
+                self.stdin = io.StringIO()
+                self.stdout = io.StringIO("READY 1" + chr(10) if ready else "oops" + chr(10))
+                self.killed = False
+
+            def poll(self):
+                return None
+
+            def kill(self):
+                self.killed = True
+
+            def wait(self, timeout=None):
+                return 0
+
+        def popen(what, args, **kw):
+            p = Proc()
+            started.append(p)
+            return p
+
+        with mock.patch.object(server, "popen", popen), mock.patch.object(server, "contain"):
+            v = server.Vision({"exe": "strata-vision", "mmproj": "m.gguf", "model": "t.gguf"}, lazy=True)
+            self.addCleanup(lambda: shutil.rmtree(v.dir, ignore_errors=True))
+            return v, started, popen
+
+    def test_lazy_starts_nothing_and_alive_says_so(self):
+        v, started, _ = self.make()
+        self.assertEqual(started, [])
+        self.assertFalse(v.alive())
+
+    def test_restart_starts_it_and_close_ends_it(self):
+        import serve.server as server
+        v, started, popen = self.make()
+        with mock.patch.object(server, "popen", popen), mock.patch.object(server, "contain"):
+            v.restart()
+        self.assertTrue(v.alive())
+        self.assertEqual(len(started), 1)
+        v.close()
+        self.assertFalse(v.alive())
+
+    def test_a_failed_start_kills_the_process_and_raises(self):
+        import serve.server as server
+        v, started, _ = self.make(ready=False)
+
+        def popen(what, args, **kw):
+            class P:
+                stdin, stdout, killed = io.StringIO(), io.StringIO("oops" + chr(10)), False
+
+                def kill(self):
+                    P.killed = True
+
+                def wait(self, timeout=None):
+                    return 0
+            started.append(P)
+            return P()
+        with mock.patch.object(server, "popen", popen), mock.patch.object(server, "contain"):
+            with self.assertRaises(RuntimeError):
+                v.restart()
+        self.assertTrue(started[-1].killed)
+        self.assertFalse(v.alive())
 
 
 class VisionShutdown(unittest.TestCase):

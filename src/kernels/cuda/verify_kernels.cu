@@ -191,14 +191,22 @@ __global__ void __launch_bounds__(256) gdn_ab_multi_t_kernel(const float* __rest
 
 // State-only commit kernel: each head's 128 independent state columns are split across 4 blocks of 32 columns
 // (48 * 4 = 192 blocks of 128 threads across all SMs, vs 48 blocks of 512 threads), with no sq/o/norm/z/y work.
+// DBG (STRATA_DBG_GDN=1, #937): a window count the launch never allowed (n_keep is read from device memory; n_max is the
+// rows the window holds) is reported and the commit skipped, where the fault would be a memory-aperture violation
+template <bool DBG>
 __global__ void __launch_bounds__(32 * RG) gdn_step_commit_kernel(float* __restrict__ state,
                                                                   const float* __restrict__ hbuf, int C,
                                                                   const float* __restrict__ gate,
                                                                   const float* __restrict__ beta,
                                                                   int h_k, int h_v,
-                                                                  const int32_t* __restrict__ n_keep) {
+                                                                  const int32_t* __restrict__ n_keep, int n_max) {
     const int n = *n_keep;
     if (n <= 0) return;
+    if (DBG && n > n_max) {
+        if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0 && threadIdx.y == 0)
+            printf("strata DBG: gdn_step_commit: n_keep %d is past the window's %d rows: commit skipped (#937)\n", n, n_max);
+        return;
+    }
     __shared__ float sk[S];
     __shared__ float red[RG][32];
     const int head = blockIdx.x;
@@ -1115,8 +1123,11 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
         return !e || e[0] != '0';
     }();
     if (commit_split && n_keep != nullptr && t_out_begin >= n_tok) {
-        gdn_step_commit_kernel<<<dim3((unsigned) h_v, 4u), dim3(32, RG), 0, (cudaStream_t) stream>>>(
-            state, h, conv_channels, gate, beta, h_k, h_v, n_keep);
+        static const bool dbg = [] { const char* e = std::getenv("STRATA_DBG_GDN"); return e && e[0] == '1'; }();
+        if (dbg) gdn_step_commit_kernel<true><<<dim3((unsigned) h_v, 4u), dim3(32, RG), 0, (cudaStream_t) stream>>>(
+            state, h, conv_channels, gate, beta, h_k, h_v, n_keep, n_tok);
+        else gdn_step_commit_kernel<false><<<dim3((unsigned) h_v, 4u), dim3(32, RG), 0, (cudaStream_t) stream>>>(
+            state, h, conv_channels, gate, beta, h_k, h_v, n_keep, n_tok);
         check("gdn_step_commit");
         return;
     }

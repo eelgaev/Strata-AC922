@@ -77,6 +77,26 @@ The server leaves out finished assistant turns that have no text, so the next re
 **A Turing card (RTX 20) reads prompts above ~90K tokens differently (0.1.40, #743).**
 The prompt's top-k selection takes a wider kernel there, with the same ids. `STRATA_TOPK_STREAM=0` restores the old one.
 
+**Decode is several times slower with `--expert-cache N` than with `auto` (#781, #831).**
+An explicit N is a byte budget that is not checked against the free VRAM once the slots are written. On a card it
+fills (the log says `0 MiB of VRAM free with everything loaded - LOW`), Windows pages the GPU's memory and decode drops
+from 100 to 14 tok/s with only a few hundred slots too many. Use `--expert-cache auto`, or a smaller N.
+
+**A low-RAM PC (about 32 GB) stalls with `--resident-budget-gib N` (#649).**
+The budget is pinned (locked) in RAM, which leaves the OS and the CPU workers little room. `STRATA_RESIDENT_PIN=0` keeps
+it pageable; a smaller budget works too.
+
+**The Windows display driver resets, then the PC blue-screens (0x141, then 0x116 in `nvlddmkm`) during an answer (#961).**
+This is the NVIDIA driver, not Strata: the report shows the same wedge with other CUDA programs on that driver (610.88,
+RTX 4080 SUPER). Try another driver (a Studio one, or an older one) and a lower power limit; if it only happens with
+`--spec 4`, `--spec 0` avoids the verify window while you wait for a driver fix.
+
+**An RTX 50 card (a source build with CUDA 13.2) answers with nonsense, or reads prompts wrongly (#892, #968).**
+CUDA 13.2's compiler (nvcc 13.2.51) miscompiles some of the engine's kernels for sm_120: on our RTX 5070 the IQ2_S and IQ3_S
+products are wrong (relative error 0.5 to 1.0 in the tests) with 13.2 and right with 13.0. The ready-made engine is built
+with 13.0. If you compile it yourself, use CUDA 13.0 or 13.1 (it can sit next to 13.2: `STRATA_NVCC=<path to its nvcc>`);
+setup warns when it finds 13.2 for such a card, and takes an older 13.x when one is installed.
+
 **Pictures are refused, or slow.**
 "this server was started without the vision encoder": the model was set up for text only - run setup again with
 `--vision gpu` (or `--vision cpu`). Pictures that take several seconds (about 3 s at 300 image tokens on 8 cores, more with more tokens) are read by the encoder on the CPU; `--vision gpu`
@@ -91,6 +111,13 @@ lists every card it found and whether Strata can use it.
 **The engine stops at start with the card's name, its architecture and the build's list.**
 The engine was compiled for another card (for example after moving the Strata folder to another PC). Run
 `./setup.sh --setup --backend hip`: it compiles the engine for this card's architecture.
+
+**On Windows the engine exits with `0xC0000005` in `amdhip64_7.dll` before it prints anything (#654).**
+Two things in your environment can cause it, and the server now repairs both before it starts the engine (it says so in
+the log): `HIP_PATH`, `HIP_DEVICE_LIB_PATH` or `LLVM_PATH` naming a ROCm folder that no longer exists (a deleted build),
+and a `TEMP`/`TMP` folder the engine cannot create files in (AMD's runtime compiles its first kernels through temporary
+files). If you start `strata.exe` by hand, fix them yourself: `set HIP_PATH=`, and point `TEMP` and `TMP` at a normal
+folder such as `C:\Temp`.
 
 **Large pinned host allocations fail on ROCm although RAM is free.**
 See [AMD_HIP.md](AMD_HIP.md#model-and-serving-configuration): the mapped expert mode avoids the full pinned arena.
