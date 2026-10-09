@@ -836,7 +836,10 @@ print(r.choices[0].message.content)
 - **From the internet.** Put a tunnel in front of it, for example [cloudflared](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/do-more-with-tunnels/trycloudflare/):
   `cloudflared tunnel --url http://127.0.0.1:8080`. **Set a key first**, or anyone with the link can use your PC:
   add `"api_key": "some-long-secret"` to `strata-<model>.json` (or set the `STRATA_API_KEY` environment variable);
-  clients then send it as their API key. Streamed answers carry `X-Accel-Buffering: no`, so nginx-style proxies pass
+  clients then send it as their API key. Several keys (one per client, so one can be withdrawn alone): separate them
+  with commas, `--api-key key1,key2` or `"api_key": "key1,key2"` as llama.cpp does, or give a list,
+  `"api_key": ["key1", "key2"]` (the way to use a key that contains a comma); a request passes with any one of them.
+  Streamed answers carry `X-Accel-Buffering: no`, so nginx-style proxies pass
   each token on at once. The web app's settings and MCP tools only answer Strata's own page: when you open it through
   a proxy or tunnel whose address differs, add that address, e.g. `"trusted_origins": ["https://strata.example.com"]`.
   With the key set, any `Host` name reaches the server (see Host names below).
@@ -1417,6 +1420,37 @@ expert here: none was page-locked):
 A coding agent's recorded conversation on the two cards (a 100K-token start, then 8 turns of 1-5K tokens of code, 128
 tokens written a turn, the same tokens read by both): 137.4 s off, 130.6 s auto (reading 121.1 -> 114.3 s).
 
+## More opt-in switches measured for 0.1.41 (all off unless you set them)
+
+None of these changes the default answers; each was measured against the default with interleaved off/on pairs of whole
+engine runs (a fresh engine per side, warmed, 200-token greedy answers on three fixed prompts, medians; "pairs faster" counts
+the pairs in which the switched arm won). They are here so you can try them on your own card.
+
+- **`STRATA_GDN_CHUNKED=1`: the DeltaNet recurrence of the prompt in chunks of 32 tokens** (sergiywith, #1372; WY form, FP32,
+  other bits than the default: first-token KL against the default was 0.002-0.009 nats on average, the same top token in
+  every prompt tried). The kernel needs 128 SMs in one wave, so by itself it runs only on a card with 128 or more
+  (RTX 5090: 1.8x on the recurrence). On smaller cards `STRATA_GDN_CHUNKED=2` forces it for a measurement, and it is
+  slower there: 0.73x on an RTX 3060 (28 SMs) and 0.87x on an RTX 5070 (48 SMs) at 2K-32K tokens (`gdn_rec_parity --bench`),
+  and the prompt time did not improve: RTX 5070 2K 1.01x, 8K 1.00x of the default's time; RTX 3060 2K, 8K, 16K 1.01x, no pair faster.
+- **`STRATA_FS_SLOTS=N`: the Foresight swap space** (q8atnight, #1348): N VRAM slots per layer, refilled on a copy stream
+  with the experts that just missed and with the ones the next layer's router predicts (`STRATA_FS_AHEAD=0` for the
+  misses only), so that an expert the cache lacks can be computed on the GPU instead of by the CPU. The model's own router
+  decides everything; the slots only hold copies of the same bytes (`STRATA_FS_VERIFY=1` reads every landed slot back and
+  compares it: 0 bad in 2,300+ reads on an RTX 5070). The slots are taken from the VRAM the expert cache would have
+  (raise `--vram-reserve-mib` by about N x 80 MiB), and in every box measured the smaller cache cost more than the slots
+  returned: decode 4 slots, median tok/s B/A (pairs faster): RTX 3060 0.95 (0/6) with misses only, 0.91 (0/6) with the
+  look-ahead; Tesla P100 0.97 (2/6) and 1.00 (4/6); 16 slots on the P100 0.96 (0/6); RTX 5070 0.98 (1/6). The reporter
+  measured the same on 2x RTX 3090 (the misses per layer are below one there, so the CPU round trip stays). Left off.
+- **`STRATA_STAGE_PIN`: pinned stage buffers** (Zhong Uncle, #1237; **on by default** while the host has 3 GiB of RAM to
+  spare, `STRATA_STAGE_PIN=0` turns it off, `=1` pins without the RAM check). Where the experts are served from the GGUF in
+  place (`--mmap-experts`, or too little RAM for the arena) the buffers the cache fill copies from are page-locked, so the
+  copy no longer goes through the driver's bounce buffer (about 0.4-0.6 GiB of pinned RAM, one buffer falls back to
+  pageable when the driver refuses). Decode, median tok/s on, off, 6 pairs of whole runs: Tesla P100 with the RAM capped at
+  24 GB (cgroup) 13.9 -> 15.0 (+8%, 6/6 pairs faster); RTX 5070 `--mmap-experts` +1.2% (5/6); RTX 3060 `--mmap-experts`
+  -0.1% (5/6). Boxes that hold all experts in RAM never use the stage buffers.
+- **`STRATA_ADAPT_LAG=2`: the adaptive tier's copies are waited for one window later** (#764). Decode, 6 pairs: Tesla P100
+  (PCIe 3.0 x16) +3.5% (6/6 pairs faster), RTX 5070 +0.2% (4/6), RTX 3060 -1.3% (0/6), so it stays opt-in.
+
 ---
 
 ## Experimental speed projection (EXPERIMENTAL, off by default)
@@ -1483,6 +1517,7 @@ the document, +0.4% on the chat. Details: `bench/results/2026-09-27-esp/`.
 | Generation stops mid-answer, GPU "100%", one CPU core busy | Fixed in engine 0.1.12 (issue #29, a race in the CPU expert pool on big-VRAM cards). Since then a request that stops moving ends with an error instead of hanging (after 2 minutes; 1 minute from 0.1.13): the log says `no progress for ... s ... (issue #29)` with where it stopped, and the next request starts the engine again. If you see that line, please open an issue with it. Engine 0.1.13 adds a stall report under it (what every expert-pool thread and the GPU handshake were doing, memory and page faults) and, on Windows, a `strata-stall-<pid>.dmp` file with every thread's stack: attach both. (`STRATA_WATCHDOG_S` sets the time in seconds; 0 turns it off.) Engine 0.1.14 fixes the stall those reports found (issue #31: with the IQ packs the host could wait forever inside the NVIDIA driver while copying experts in a verify window; the experts are now copied by a GPU kernel, `--pcie-mode dma` restores the old way). |
 | `no progress for 60 s ... reading the prompt` on Linux, and the stall report says `threads waiting on the disk (state D): 16 ...` | The engine waits for the drive, not a deadlock: the n-gram table is read at random (`--ple-io direct`), which a rotational disk cannot keep up with (#605). The engine warns at start when the table is on one; `--ple-io ram` (Linux, needs RAM for the table) or the model on an SSD fixes it. Setup adds `--ple-io ram` itself on a rotational disk when the RAM holds the table (0.1.39). |
 | `the engine said nothing for ... s during the request` or `... did not finish the request after it was stopped (STOP)` | Issue #481: the engine and the server lost step (the engine waits for its next command, the server for the request's end; GPU at 0 %, nothing in the log). The server ends the engine after 300 s without a line from it during a request (while a prompt is read: each chunk may take three times the previous one's time, the first one up to its tokens at 50 tok/s more), the request ends with an error and the next request starts the engine again. `"engine_silence_s": 600` in `strata-<model>.json` sets the time (0 = wait forever, as before). If you see it, please add the end of the engine log to #481. |
+| `the engine said nothing for ... s and used no CPU or disk in that time (frozen ...)` | Issue #1317: a quicker version of the check above for an engine that is not slow but stopped (a deadlock inside a CUDA call, a driver stall): after 90 s without a line, if the engine process has also used no CPU time and moved no disk bytes in that time, the server ends it and the next request starts it again. An engine that is silent but still working is never ended by this check, the server prints one note (`... but is still working; it is not ended`) and leaves it to `engine_silence_s`. `STRATA_ENGINE_STALL_S=180` sets the time, `0` turns the check off (it needs `psutil`, which setup installs). |
 | `out of memory: cudaFuncSetAttribute` in the log (IQ3_XXS, long prompt) | Fixed in engine 0.1.15: CUDA loaded a kernel's code when it was first needed, and mid-prompt there was no VRAM left for it. Run `START-HERE.bat` (Windows) or `./setup.sh` (Linux) once to update. |
 | Anything else | The engine log is `strata-<model>.log` in this folder. |
 

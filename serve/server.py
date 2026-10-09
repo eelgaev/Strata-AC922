@@ -230,6 +230,22 @@ def _timeout_env(name: str, default: float) -> float | None:
     return None if v <= 0 else v
 
 
+# #1317 part 2: the quick watchdog for a FROZEN engine.  engine_silence_s (above) is generous on purpose: a slow PC reads a
+# prompt chunk for minutes without a line.  But an engine that prints nothing for ENGINE_STALL_S and also uses no CPU time and
+# moves no bytes of I/O in that time is not slow, it is idle or frozen (a deadlock in a CUDA call, a driver stall, a lost
+# step), and waiting longer cannot help: it is ended, and the next request starts it again.  An engine that is silent but
+# still working is never ended by this, only reported once (the recommendation: engine_silence_s, or this variable).
+# STRATA_ENGINE_STALL_S overrides it (0 = off).  Needs psutil (setup installs it); without it nothing is ended.
+ENGINE_STALL_S = _timeout_env("STRATA_ENGINE_STALL_S", 90.0)
+STALL_CPU_EPS_S = 0.5       # CPU seconds the engine may use in the whole stall window and still count as frozen
+STALL_IO_EPS_B = 1 << 20    # bytes read or written in that window
+
+
+def engine_frozen(base: tuple[float, int], now: tuple[float, int]) -> bool:
+    """#1317: True when two (cpu seconds, io bytes) samples of the engine show no work between them."""
+    return (now[0] - base[0]) <= STALL_CPU_EPS_S and (now[1] - base[1]) <= STALL_IO_EPS_B
+
+
 VISION_READY_S = _timeout_env("STRATA_VISION_READY_S", 300.0)
 VISION_ENCODE_S = _timeout_env("STRATA_VISION_ENCODE_S", 300.0)
 ENGINE_READY_S = _timeout_env("STRATA_ENGINE_READY_S", 900.0)
@@ -562,6 +578,7 @@ class StrataEngine:
     """
     silence_s = ENGINE_SILENCE_S         # #481: main() sets the config's engine_silence_s (survives restart())
     silent_note = None                   # #481: why the server ended a silent engine (death_note says it)
+    gpu_busy = None                      # #1317: () -> bool, "the GPU is working" (the telemetry's reading); a GPU at work is not frozen
     last_err = None                      # #997: an ERR that was its last stdout line (death_note says it)
     batch = 0                            # --batch: the engine's batch slots (0: one request at a time)
 
@@ -1459,6 +1476,8 @@ class StrataEngine:
         allow = silence + min(len(ids), PP_CHUNK_MAX) / PP_FLOOR_TOK_S if silence > 0 else 0.0
         heard, read_to = time.monotonic(), 0
         beat = heard
+        stall_s = ENGINE_STALL_S or 0.0
+        stall_state: dict = {}
         try:
             while True:
                 wait = 10.0
@@ -1473,6 +1492,12 @@ class StrataEngine:
                 except queue.Empty:
                     if cancel.is_set():
                         return
+                    if stall_s > 0:
+                        try:
+                            self._stall_check(heard, stall_state, stall_s)
+                        except EngineSilent:
+                            done = True                   # as above: nothing is listening
+                            raise
                     if allow > 0 and time.monotonic() - heard >= allow:
                         continue                          # enforce the expired deadline before another heartbeat
                     if time.monotonic() - beat >= 10.0:
@@ -1484,6 +1509,8 @@ class StrataEngine:
                     raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
                 heard = time.monotonic()                  # any line is output: T, PP, RESUME, INFO ...
                 beat = heard
+                if stall_state:
+                    stall_state.clear()
                 if line.startswith("T "):
                     allow = silence
                     if cancel.is_set():
@@ -1542,6 +1569,43 @@ class StrataEngine:
                         break
                     if not self.can_stop:
                         heard = time.monotonic()
+
+    def _activity(self) -> tuple[float, int] | None:
+        """#1317: (CPU seconds, I/O bytes) the engine process has used so far, or None when they cannot be read."""
+        try:
+            import psutil
+            pr = psutil.Process(self.proc.pid)
+            t = pr.cpu_times()
+            io = pr.io_counters()
+            return (t.user + t.system, io.read_bytes + io.write_bytes)
+        except Exception:  # noqa: BLE001 - psutil missing, the process gone, no permission: no reading
+            return None
+
+    def _stall_check(self, heard: float, state: dict, stall_s: float) -> None:
+        """#1317: called while the engine is silent.  Takes a baseline soon after the last line, and at stall_s of silence
+        compares: no CPU and no I/O in all that time -> the engine is ended (EngineSilent); work going on -> one warning."""
+        age = time.monotonic() - heard
+        if state.get("base") is None:
+            state["base"] = self._activity()
+            return
+        if age < state.get("next", stall_s) or state["base"] is None:
+            return
+        now = self._activity()
+        try:
+            gpu_working = bool(self.gpu_busy()) if self.gpu_busy is not None else False
+        except Exception:  # noqa: BLE001 - a telemetry hiccup must not decide anything
+            gpu_working = False
+        if now is not None and not gpu_working and engine_frozen(state["base"], now):
+            raise self._silent(f"the engine said nothing for {age:.0f} s and used no CPU or disk in that time (frozen; "
+                               "STRATA_ENGINE_STALL_S sets this, 0 = off)")
+        if now is not None:   # working: look again after another window from here, and say so once
+            state["base"], state["next"] = now, age + stall_s
+            if not state.get("warned"):
+                state["warned"] = True
+                print(f"[strata] the engine has said nothing for {age:.0f} s but is still working; it is not ended (the "
+                      "limit is engine_silence_s). If it is stuck, \"engine_silence_s\" can be set lower.", flush=True)
+        else:
+            state["next"] = float("inf")   # no reading (psutil missing): nothing to decide on
 
     def _silent(self, what: str) -> EngineSilent:
         """#481: end an engine that lost step with the server (its main thread waits for a command the server never
@@ -2060,6 +2124,18 @@ def engine_args(cfg: dict) -> list[str]:
     config: "auto" by default, or the first layer of each later GPU's share, e.g. "18" or "16,32"; see
     layer_split_value)."""
     args = list(cfg["args"])
+    # #1322: a config with a "vision" section but without --vision in its args (written by an older setup run, or edited by
+    # hand) advertised images and then refused every picture ("this engine was started without --vision").  The section
+    # says images are wanted: start the engine with them, and keep the encoder's VRAM free as setup does for a GPU encoder
+    # (only when the config has no reserve of its own).
+    if isinstance(cfg.get("vision"), dict) and "--vision" not in args:
+        args.append("--vision")
+        note = "added --vision"
+        if cfg["vision"].get("gpu") and "--vram-reserve-mib" not in args:
+            args += ["--vram-reserve-mib", "700"]
+            note += " and --vram-reserve-mib 700"
+        print(f'[strata] the config has a "vision" section but no --vision in its args: {note} (run setup again with '
+              "--vision to write them)", flush=True)
     if layer_split_of(cfg) and "--layer-split" not in args:
         args += ["--layer-split", layer_split_value(cfg)]
     # opt-in: an auto split runs on the first card alone when it holds every profiled expert and the KV
@@ -2863,6 +2939,10 @@ class Service:
                                        gpu_index=int(getattr(self, "gpu_index", 0) or 0),
                                        gpu_indices=getattr(self, "gpu_indices", None),
                                        amd=getattr(self, "backend", None) == "hip")
+            if getattr(self, "engine", None) is not None and hasattr(self.engine, "gpu_busy"):
+                # #1317: the quick frozen-engine check does not end an engine whose GPU is busy (a long prompt chunk on a
+                # slow card keeps the GPU at work while the host thread sleeps)
+                self.engine.gpu_busy = lambda: (self.telemetry.snapshot()["now"].get("gpu_util") or 0) >= 10
 
     def _tok_s(self):
         """tok/s over the last RATE_WINDOW_S seconds.  Returns 0.0 while nothing is generating.  With parallel requests:
@@ -5283,27 +5363,47 @@ def host_allowed(host, names, any_host=False) -> bool:
                            or _name_in(name, names))
 
 
-def api_key_of(value) -> str:
+def key_list(value) -> list[str]:
+    """#1344: the keys a server accepts.  --api-key / STRATA_API_KEY / "api_key" take llama.cpp's form, several keys
+    separated by commas ("k1,k2"; spaces around each are dropped), or a list in the config ("api_key": ["k1", "k2"],
+    the way to give a key that contains a comma).  A list is taken as it is."""
+    if value is None or value == "":
+        return []
+    if isinstance(value, (list, tuple)):
+        return [str(k) for k in value if str(k)]
+    return [k.strip() for k in str(value).split(",") if k.strip()]
+
+
+def api_key_of(value):
     """The key as a client can send it (#725).  An HTTP header loses the spaces and line ends around its value, so a
     key kept with them (a config file or an environment file with CRLF line ends, a quoted " key ") matched no
     request: every client got 401 with the right key.  A value that is only such characters raises ValueError, it
-    never means "no key" (#213)."""
+    never means "no key" (#213).  #1344: a config list of keys returns the list (each key stripped, none empty); a
+    string stays a string (its commas separate keys, see key_list)."""
+    if isinstance(value, (list, tuple)):
+        keys = [str(k).strip() for k in value]
+        if not keys or any(not k for k in keys):
+            raise ValueError("an API key was given but it is empty")
+        return keys
     key = "" if value is None else str(value)
-    if key and not key.strip():
+    if key and not key_list(key):
         raise ValueError("an API key was given but it is empty")
     return key.strip()
 
 
-def key_matches(given: str, key: str) -> bool:
+def key_matches(given: str, key) -> bool:
     """given: a header's value as http.server read it, each byte one character.  A key with characters outside ASCII
     arrives as UTF-8 from most clients and as Latin-1 from some; the right key passes in both forms (#725: the
-    bytes were re-encoded before, so a UTF-8 key never matched).  Constant-time (#213)."""
+    bytes were re-encoded before, so a UTF-8 key never matched).  Constant-time (#213).  #1344: `key` may name several
+    keys (see key_list); the given one must match any, and every key is compared whatever the outcome."""
     raw = given.encode("latin-1", "replace")
-    ok = hmac.compare_digest(raw, key.encode())
-    try:
-        ok |= hmac.compare_digest(raw, key.encode("latin-1"))
-    except UnicodeEncodeError:
-        pass
+    ok = False
+    for k in key_list(key):
+        ok |= hmac.compare_digest(raw, k.encode())
+        try:
+            ok |= hmac.compare_digest(raw, k.encode("latin-1"))
+        except UnicodeEncodeError:
+            pass
     return ok
 
 
@@ -5482,7 +5582,8 @@ def main() -> int:
                     help="clamp max_tokens to the remaining context instead of rejecting the request "
                          "(default: reject with 400, like llama.cpp; also \"fit_max_tokens\": true in the config)")
     ap.add_argument("--api-key", default=os.environ.get("STRATA_API_KEY", ""),
-                    help="require this key on /v1/* (Authorization: Bearer ... or x-api-key); also $STRATA_API_KEY")
+                    help="require this key on /v1/* (Authorization: Bearer ... or x-api-key); also $STRATA_API_KEY. "
+                         "Several keys: separate them with commas (key1,key2), as llama.cpp does")
     ap.add_argument("--mcp-config", help="a JSON file with MCP servers in Claude Desktop's format ({\"mcpServers\": "
                                          "{...}}); the web app's chat can use their tools (also \"mcp_servers\" in "
                                          "the config)")

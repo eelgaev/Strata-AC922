@@ -214,6 +214,7 @@ protected:
 /// next - takes each token's top `k` experts, drops the ones the GPU cache or the RAM copy holds, and asks the
 /// source to `warm` the rest, so their pages are on the way while layer l computes.  A prediction only warms pages:
 /// it never changes which experts are computed or how.
+struct ForesightSwap;
 class RouterLookahead {
 public:
     RouterLookahead() = default;
@@ -222,7 +223,11 @@ public:
     RouterLookahead& operator=(const RouterLookahead&) = delete;
     /// `routers[l]`: layer l's ffn_gate_inp as BF16 bits, n_expert rows of n_embd.
     bool start(std::vector<std::vector<uint16_t>> routers, int64_t n_embd, int64_t n_expert, int k, ExpertSource* src,
-               std::string& err);
+               std::string& err, bool allow_cold_source = false);
+    /// One prefetch design (#1348): the predicted experts that no cache holds also go to the Foresight swap space
+    /// (ForesightSwap::predict), which copies them to VRAM ahead of the layer.  nullptr detaches it (waits for a
+    /// prediction in progress), so the swap space can be destroyed first.
+    void set_foresight(ForesightSwap* fs);
     /// Layer `layer`'s MoE input for `n_tok` tokens (host floats): predict and warm layer + 1.  Never waits: a
     /// prediction still running for an earlier layer makes this one skip.
     void submit(int64_t layer, const float* x, int64_t n_tok, const int32_t* host_res);
@@ -247,6 +252,7 @@ private:
     bool quit_ = false, pending_ = false, busy_ = false;
     int64_t layer_ = -1, n_tok_ = 0;
     const int32_t* host_res_ = nullptr;
+    ForesightSwap* fs_ = nullptr;                   ///< (under mu_)
     std::vector<float> x_;
     std::atomic<int64_t> predicted_{0}, skipped_{0};
     std::atomic<uint64_t> busy_us_{0};
@@ -280,7 +286,10 @@ struct GpuPlanSink {
 };
 
 /// The adapter's own state.  One per session, reused every layer so the token path allocates nothing (P2.T10).
+struct ForesightSwap;
+
 struct ExpertDispatch {
+    ForesightSwap* fs = nullptr;   ///< Foresight swap space (STRATA_FS_SLOTS; null = off)
     strata::kernels::cpu::ExpertPool* pool = nullptr;
     ExpertSource* src = nullptr;
     RouterLookahead* lookahead = nullptr;   ///< CS-T: warms the next layer's predicted file-tier experts
@@ -711,8 +720,16 @@ private:
     // reused only once `kStageAge` layer changes have passed since its blob was last asked for, so a pointer holds
     // through the layer it was asked in and the next ones (the pool computes a layer's misses before the next).
     static constexpr uint64_t kStageAge = 3;
+    // A stage buffer feeds cudaMemcpyAsync (the cache fill), so it is cudaHostAlloc'd where the driver allows:
+    // a pageable source would be staged through the driver's bounce buffer - an extra copy at a fraction of
+    // the transfer rate, with the calling thread doing it.  `pinned` picks the free (defined in the .cpp: the
+    // header has no cuda_runtime.h).
+    struct StageBufFree {
+        bool pinned = false;
+        void operator()(uint8_t* p) const noexcept;
+    };
     std::mutex stage_mu_;
-    std::vector<std::unique_ptr<uint8_t[]>> stage_buf_;
+    std::vector<std::unique_ptr<uint8_t[], StageBufFree>> stage_buf_;
     std::vector<int64_t> stage_key_;
     std::vector<uint64_t> stage_epoch_, stage_used_;
     std::vector<char> stage_busy_;            ///< being filled (outside stage_mu_): never a victim
@@ -728,6 +745,7 @@ private:
     uint64_t epoch_ = 0;
     int64_t last_layer_ = -1;
     bool stage_grew_ = false;
+    bool stage_pin_said_ = false, stage_pin_failed_said_ = false;   ///< the one-time notes in claim_stage
     std::atomic<int64_t> ram_reads_{0};
     std::atomic<uint64_t> file_read_bytes_{0};
     // ---- the Linux I/O path (set_io_prefetch)

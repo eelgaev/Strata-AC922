@@ -25,6 +25,7 @@
 #include "strata/core/conversation_memory.hpp"
 #include "strata/core/coupled_draft.hpp"
 #include "strata/core/expert_source.hpp"
+#include "strata/core/foresight_swap.hpp"
 #include "strata/core/pinned.hpp"
 #include "strata/core/remote_experts.hpp"
 #include "strata/core/on_device.hpp"
@@ -1161,6 +1162,18 @@ void pl_diag_print(std::FILE* f) {
             if (d.v[st][par] != nullptr) d.v[st][par]->diag_pipelined(f, names[st][par]);
 }
 
+// #1341 #964: CUDA_LAUNCH_BLOCKING=1 in the environment.  A verify window's graph waits on the GPU for flags the host
+// raises once cudaGraphLaunch has returned, and a blocking launch returns only when the graph has finished, so the
+// first window never ends (the batched prompt path has no such wait and runs).  HIP's own switches are not checked.
+bool launch_blocking() {
+#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)
+    return false;
+#else
+    const char* v = std::getenv("CUDA_LAUNCH_BLOCKING");
+    return v != nullptr && std::atoi(v) != 0;
+#endif
+}
+
 void stall_report(std::FILE* f, uint64_t layers_during) {
     strata::core::Progress& p = strata::core::progress();
     std::fprintf(f, "strata serve: stall report (engine %s): stage \"%s\" for %lld s; %llu layers served since the "
@@ -1610,6 +1623,10 @@ int main(int argc, char** argv) {
         setenv("CUDA_MODULE_LOADING", "EAGER", 0);
 #endif
     }
+    if (launch_blocking())
+        std::fprintf(stderr, "warning: CUDA_LAUNCH_BLOCKING=1: the verify windows cannot run with blocking launches, so "
+                             "the first one after a prompt hangs until the watchdog ends the engine (#1341). Unset it; "
+                             "STRATA_PF_STEP_SYNC=1 narrows down a failing prompt step without it\n");
     // --gpu LIST pins the visible GPUs (nvidia-smi/PCI order) from the command line instead of the caller's
     // environment: CUDA_VISIBLE_DEVICES is read at the first CUDA call, so this has to happen here, before
     // anything else.  The value itself is consumed again by the option loop below.
@@ -5044,7 +5061,12 @@ int main(int argc, char** argv) {
     // input predicts its experts and their pages are warmed meanwhile.  It only warms pages; STRATA_LOOKAHEAD=0 is
     // the A/B arm, STRATA_LOOKAHEAD_K the experts per token (default 10).
     strata::core::RouterLookahead lookahead;
-    if (srcp == &src && src.warms() && [] { const char* v = std::getenv("STRATA_LOOKAHEAD"); return v == nullptr || std::atoi(v) != 0; }()) {
+    // #1348, one prefetch design: with the Foresight swap space on (STRATA_FS_SLOTS) the look-ahead also runs on the pinned-RAM
+    // tiers, where there are no pages to warm, and feeds its predictions to the swap space (STRATA_FS_AHEAD=0: not)
+    const bool fs_ahead = srcp != nullptr && [] { const char* v = std::getenv("STRATA_FS_SLOTS"); return v != nullptr && std::atoi(v) > 0; }() &&
+                          [] { const char* v = std::getenv("STRATA_FS_AHEAD"); return v == nullptr || std::atoi(v) != 0; }();
+    if (srcp != nullptr && ((srcp == &src && src.warms()) || fs_ahead) &&
+        [] { const char* v = std::getenv("STRATA_LOOKAHEAD"); return v == nullptr || std::atoi(v) != 0; }()) {
         std::vector<std::vector<uint16_t>> routers((size_t) g.n_layers);
         bool ok = true;
         for (int64_t l = 0; l < g.n_layers && ok; ++l) {
@@ -5056,13 +5078,14 @@ int main(int argc, char** argv) {
             ok = cudaMemcpy(routers[(size_t) l].data(), w->data, (size_t) w->bytes, cudaMemcpyDeviceToHost) == cudaSuccess;
         }
         const char* kv = std::getenv("STRATA_LOOKAHEAD_K");
-        if (ok && lookahead.start(std::move(routers), g.n_embd, g.n_expert, kv ? std::atoi(kv) : 10, &src, err)) {
+        if (ok && lookahead.start(std::move(routers), g.n_embd, g.n_expert, kv ? std::atoi(kv) : 10, srcp, err, fs_ahead)) {
             drive.d.lookahead = &lookahead;
             if (const char* dv = std::getenv("STRATA_IO_PREFETCH_DEPTH"); dv != nullptr && std::atoi(dv) > 0)
                 lookahead.set_depth(std::atoi(dv));
-            else if (src.io_prefetch())
+            else if (srcp == &src && src.io_prefetch())
                 lookahead.set_depth(2);
-            std::fprintf(stderr, "strata generate: routing-aware prefetch of the file tier on (the next layer's router)\n");
+            std::fprintf(stderr, "strata generate: routing-aware prefetch on (the next layer's router%s)\n",
+                         fs_ahead ? ", feeding the Foresight swap space" : ", file tier");
         } else {
             (void) cudaGetLastError();
             std::fprintf(stderr, "strata generate: routing-aware prefetch off (%s)\n",
@@ -7259,12 +7282,33 @@ int main(int argc, char** argv) {
                 const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib * 1024 * 1024;
                 const size_t retained = reuse.bytes() + stage_retained;
                 const size_t additional = estimate > retained ? estimate - retained : 0;
-                if (!strata::core::conversation_memory_admit(strata::core::conversation_available_memory(),
-                        additional, floor)) {
-                    std::fprintf(stderr, "strata serve: conversation cache: skip parking (physical RAM admission; need %zu MiB plus %lld MiB floor, or telemetry unavailable)\n",
-                                 additional >> 20, (long long) o.conversation_cache_min_free_mib);
+                // The physical-RAM gate: the incoming snapshot has to fit beside the floor.  make_room()
+                // above only balanced the cache's own budget, so a full cache leaves this one short even
+                // though every parked conversation could give its RAM back - and refusing here throws
+                // away the whole prompt read that produced this snapshot (measured: 270k tokens, 96 s).
+                // Evict the least recently active parked conversations until it fits, or until none are
+                // left.  Each ConversationBuffer is a list of 16 MiB segments, each segment its own
+                // allocation, so an evicted entry is back with the kernel before the next check reads
+                // /proc/meminfo; no waiting is needed.  slots() bounds the loop, and the two lines
+                // below say what it did either way.
+                size_t evicted = 0;
+                auto admit = [&] {
+                    return strata::core::conversation_memory_admit(
+                        strata::core::conversation_available_memory(), additional, floor);
+                };
+                while (!admit() && conversations.size() > 0 && evicted < conversations.slots() &&
+                       conversations.evict_oldest())
+                    ++evicted;
+                if (!admit()) {
+                    std::fprintf(stderr, "strata serve: conversation cache: skip parking (physical RAM admission; need %zu MiB plus %lld MiB floor; evicted %zu, %zu still parked, or telemetry unavailable)\n",
+                                 additional >> 20, (long long) o.conversation_cache_min_free_mib,
+                                 evicted, conversations.size());
                     return true;
                 }
+                if (evicted)
+                    std::fprintf(stderr, "strata serve: conversation cache: evicted %zu parked conversation%s to admit this snapshot (%zu MiB plus %lld MiB floor)\n",
+                                 evicted, evicted == 1 ? "" : "s", additional >> 20,
+                                 (long long) o.conversation_cache_min_free_mib);
                 strata::core::SavedConversation image;
                 size_t reused_bytes = 0;
                 if (!strata::core::conversation_snapshot_save(image, view, ss, g, draft0, err,
@@ -7473,6 +7517,24 @@ int main(int argc, char** argv) {
             }
         }
         drive.d.plan = ver.plan_sink();
+        // Foresight swap space (STRATA_FS_SLOTS; unset = null and nothing changes)
+        std::unique_ptr<strata::core::ForesightSwap> fs_swap;
+        {
+            int main_dev = 0;
+            cudaGetDevice(&main_dev);
+            std::vector<int> devs{main_dev};
+            for (auto& st : stages) devs.push_back(st->dev);
+            std::vector<int> card((size_t) g.n_layers, 0);
+            for (int64_t l = 0; l < g.n_layers; ++l) card[(size_t) l] = multi_gpu ? stage_of(l) : 0;
+            fs_swap.reset(strata::core::foresight_swap_from_env(g.n_layers, g.n_expert, card, devs));
+            drive.d.fs = fs_swap.get();
+            if (fs_swap && drive.d.lookahead != nullptr) lookahead.set_foresight(fs_swap.get());
+        }
+        // the look-ahead thread must not touch the swap space once it is gone (declared after it: destroyed first)
+        struct FsDetach {
+            strata::core::RouterLookahead* la;
+            ~FsDetach() { la->set_foresight(nullptr); }
+        } fs_detach{&lookahead};
         drive.d.pcie_num = std::max(0, std::min(256, (int) (o.pcie_frac * 256.0 + 0.5)));
         const bool all_experts_resident = !host_res.empty() &&
             std::all_of(host_res.begin(), host_res.end(), [](int32_t r) { return r >= 0; });
@@ -8184,8 +8246,10 @@ int main(int argc, char** argv) {
                         // a blocking step's explicit allowance (session files): still within it, not yet stuck
                         if (strata::core::progress_now_ms() < p.allow_until_ms.load()) continue;
                         std::fprintf(stderr, "strata serve: no progress for %d s during a request (%s) - stopping "
-                                             "the engine so the server starts it again (issue #29)\n",
-                                     limit, stage_text().c_str());
+                                             "the engine so the server starts it again (issue #29)%s\n",
+                                     limit, stage_text().c_str(),
+                                     launch_blocking() ? "; CUDA_LAUNCH_BLOCKING=1 is set, and no verify window can "
+                                                         "finish with it (#1341)" : "");
                         stall_report(stderr, p.ticks.load() - ticks_at);
                         strata::core::release_gpu_waits(stderr);   // #267: no spin kernel outlives the process
                         std::fflush(stderr);
@@ -10549,6 +10613,7 @@ int main(int argc, char** argv) {
                     draft_offered += A.T - 1;
                     draft_accepted += a;
                     ++rounds;
+                    if (drive.d.fs) drive.d.fs->completed.fetch_add(1, std::memory_order_release);
                     ++dec_windows;
                     dec_T += A.T;
                     bool eos = false;
@@ -10805,6 +10870,7 @@ int main(int argc, char** argv) {
                 }
                 std::fflush(stdout);
                 ++rounds;
+                if (drive.d.fs) drive.d.fs->completed.fetch_add(1, std::memory_order_release);
                 const Clock::time_point tw2 = Clock::now();
                 // coupled drafts with penalties: the next window's row-0 history (`consumed` holds this window's
                 // commit, outv[a] is its row 0) - the drafts extend it on the device as the verify rows will
@@ -10863,6 +10929,7 @@ int main(int argc, char** argv) {
                     else std::fprintf(stderr, "strata decode GPU stages, stage %d (ms/window):%s\n", st, pr.c_str());
                 }
             }
+            if (drive.d.fs) std::fprintf(stderr, "strata serve: %s\n", drive.d.fs->report().c_str());
             if (!cancelled) {
                 // a prompt stopped halfway leaves the session somewhere between two chunks: nothing to continue from
                 // (the checkpoints taken while reading it are still good)

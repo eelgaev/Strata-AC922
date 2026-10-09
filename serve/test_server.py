@@ -922,6 +922,25 @@ class ApiKeyForms(unittest.TestCase):
         self.assertTrue(key_matches(as_read("ключ", "utf-8"), "ключ"))
         self.assertFalse(key_matches(as_read("ключ", "utf-8"), "ключx"))
 
+    def test_several_keys_1344(self):
+        # llama.cpp's form: "k1,k2" is two keys, not one key with a comma; a config list is taken as it is
+        self.assertEqual(api_key_of("sk-aaa,sk-bbb"), "sk-aaa,sk-bbb")
+        self.assertEqual(api_key_of(["sk-aaa", " sk-bbb "]), ["sk-aaa", "sk-bbb"])
+        self.assertEqual(api_key_of(["a,b"]), ["a,b"])                # a key with a comma: as a list
+        for bad in (",", " , ", [], [""], ["a", " "]):
+            with self.assertRaises(ValueError):
+                api_key_of(bad)
+        two = "sk-aaa,sk-bbb"
+        self.assertTrue(key_matches("sk-aaa", two))
+        self.assertTrue(key_matches("sk-bbb", two))
+        self.assertTrue(key_matches("sk-bbb", "sk-aaa, sk-bbb"))
+        self.assertFalse(key_matches(two, two))                       # the joined text is no key
+        self.assertFalse(key_matches("sk-ccc", two))
+        self.assertFalse(key_matches("", two))
+        self.assertTrue(key_matches("a,b", ["a,b", "c"]))
+        self.assertFalse(key_matches("a", ["a,b", "c"]))
+        self.assertTrue(key_matches("single", "single"))
+
     def test_a_utf8_key_over_http(self):
         tok = ByteTokenizer()
         svc = Service(MockEngine(tok, "ok", max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
@@ -1912,6 +1931,18 @@ class PcieShare(unittest.TestCase):
 class PeerDevice(unittest.TestCase):
     """#665: several GPUs in the config are a layer split, but --peer-device uses the second card as an expert-cache
     tier, and the engine refuses it beside --layer-split: the server must not add one then."""
+
+    def test_a_vision_section_starts_the_engine_with_images_1322(self):
+        args = ["--native", "x"]
+        got = engine_args({"args": list(args), "vision": {"exe": "v", "gpu": True}})
+        self.assertEqual(got, args + ["--vision", "--vram-reserve-mib", "700"])
+        got = engine_args({"args": list(args), "vision": {"exe": "v", "gpu": False}})
+        self.assertEqual(got, args + ["--vision"])
+        mine = args + ["--vram-reserve-mib", "1500"]
+        self.assertEqual(engine_args({"args": list(mine), "vision": {"gpu": True}}), mine + ["--vision"])
+        done = args + ["--vision", "--vram-reserve-mib", "700"]                  # setup wrote it: unchanged
+        self.assertEqual(engine_args({"args": list(done), "vision": {"gpu": True}}), done)
+        self.assertEqual(engine_args({"args": list(args)}), args)                # no section: no images
 
     def test_split_added_for_several_gpus(self):
         self.assertEqual(engine_args({"args": ["--native", "x"], "gpu": [0, 1]}),
@@ -3946,6 +3977,60 @@ class SilentEngine(unittest.TestCase):
         self.assertIn("STOP", engine.proc.stdin.getvalue())
         engine.proc.kill.assert_called_once()
         self.assertFalse(engine.alive())
+
+    def test_frozen_engine_is_ended_by_the_stall_watchdog(self):
+        # #1317 part 2: silent AND no CPU / disk work for the stall window -> ended, long before engine_silence_s
+        from serve import server
+        from serve.server import EngineSilent
+        engine = self.bare(300.0)
+        engine.lines.put("T 5")
+        engine._activity = lambda: (12.0, 4096)                  # the same reading every time: no work
+        with mock.patch.object(server, "ENGINE_STALL_S", 1.0):
+            gen = engine.generate([1], 10, {}, threading.Event())
+            self.assertEqual(next(gen), 5)
+            t0 = time.monotonic()
+            with self.assertRaises(EngineSilent) as cm:
+                next(gen)
+        self.assertLess(time.monotonic() - t0, 10)
+        self.assertIn("frozen", str(cm.exception))
+        engine.proc.kill.assert_called_once()
+
+    def test_a_working_silent_engine_is_not_ended_by_the_stall_watchdog(self):
+        from serve import server
+        engine = self.bare(300.0)
+        ticks = iter(range(10 ** 6))
+        engine._activity = lambda: (float(next(ticks)), 0)       # CPU time advances: it is working
+        self.later(engine, 3.0, "T 7", "DONE 1 1 1 1 length")
+        with mock.patch.object(server, "ENGINE_STALL_S", 1.0):
+            self.assertEqual(list(engine.generate([1], 10, {}, threading.Event())), [7])
+        engine.proc.kill.assert_not_called()
+
+    def test_a_busy_gpu_is_not_a_frozen_engine(self):
+        # #1317: no CPU and no disk, but the GPU is at work (a long prompt chunk on a slow card): not ended
+        from serve import server
+        engine = self.bare(300.0)
+        engine._activity = lambda: (12.0, 4096)
+        engine.gpu_busy = lambda: True
+        self.later(engine, 2.5, "T 7", "DONE 1 1 1 1 length")
+        with mock.patch.object(server, "ENGINE_STALL_S", 1.0):
+            self.assertEqual(list(engine.generate([1], 10, {}, threading.Event())), [7])
+        engine.proc.kill.assert_not_called()
+
+    def test_no_reading_means_no_kill_and_zero_is_off(self):
+        from serve import server
+        for stall, act in ((1.0, lambda: None), (0, lambda: (1.0, 1))):
+            engine = self.bare(300.0)
+            engine._activity = act
+            self.later(engine, 2.5, "T 7", "DONE 1 1 1 1 length")
+            with mock.patch.object(server, "ENGINE_STALL_S", stall):
+                self.assertEqual(list(engine.generate([1], 10, {}, threading.Event())), [7])
+            engine.proc.kill.assert_not_called()
+
+    def test_engine_frozen_samples(self):
+        from serve.server import engine_frozen
+        self.assertTrue(engine_frozen((10.0, 100), (10.2, 100)))
+        self.assertFalse(engine_frozen((10.0, 100), (13.0, 100)))
+        self.assertFalse(engine_frozen((10.0, 100), (10.0, 100 + (8 << 20))))
 
     def test_zero_waits_as_before(self):
         engine = self.bare(0)
