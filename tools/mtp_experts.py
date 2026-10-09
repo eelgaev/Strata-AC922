@@ -1,10 +1,12 @@
-# mtp_experts.py GGUF OUT: an Unsloth MTP head's 512 routed experts in the engine's native blob layout
+# mtp_experts.py GGUF OUT [TENSORS]: an Unsloth MTP head's 512 routed experts in the engine's native blob layout
 # (per expert: gate rows, up rows, down rows - native_expert_layout), behind a 16-byte header
-# "SMTPEXP1" int32 gate/up ggml type, int32 down type; then checks a few experts against Strata's BF16 source tensors.
+# "SMTPEXP1" int32 gate/up ggml type, int32 down type.  TENSORS (optional): the directory of Strata's BF16 MTP tensors
+# (mtp/tensors in the model's data directory); a few experts are checked against them.
 import sys, struct, pathlib, numpy as np
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))   # tools/: gguf_reader.py
 from gguf_reader import GGUFFile
 src, out = sys.argv[1], sys.argv[2]
+tensors = sys.argv[3] if len(sys.argv) > 3 else None
 H, FF, NE = 2560, 640, 512
 g = GGUFFile(pathlib.Path(src)); mm = np.memmap(src, dtype=np.uint8, mode="r")
 T = {t.name: t for t in g.tensors}
@@ -37,7 +39,8 @@ def deq(t, raw, n):
         y[:, 64 * k:64 * k + 32] = (d * s1)[:, None] * (q & 0xF) - (dm * m1)[:, None]
         y[:, 64 * k + 32:64 * k + 64] = (d * s2)[:, None] * (q >> 4) - (dm * m2)[:, None]
     return y.reshape(-1)[:n]
-S = "/mnt/ubuntu/models/Strata-data/mtp/tensors/mtp.layers.0.mlp.experts."
+if tensors is None: sys.exit(0)
+S = str(pathlib.Path(tensors) / "mtp.layers.0.mlp.experts.")
 gu_bf = np.memmap(S + "gate_up_proj.bin", dtype=np.uint16, mode="r").reshape(NE, 2 * FF, H)
 dn_bf = np.memmap(S + "down_proj.bin", dtype=np.uint16, mode="r").reshape(NE, H, FF)
 def bf(a): return (a.astype(np.uint32) << 16).view(np.float32)
