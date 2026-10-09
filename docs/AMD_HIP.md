@@ -136,7 +136,7 @@ cmake --build build-hip --target strata -j2
 
 `CMAKE_HIP_ARCHITECTURES` is `gfx1100`, `gfx1101`, `gfx1200`, `gfx1201`, or a list such as `"gfx1100;gfx1201"`
 (one binary for both). gfx1102 (the same wave32, 64 KiB LDS and dot4 instruction) builds with a warning: it passed
-ctest (#192) but no model run has been reported; so does gfx1030 (RDNA2: the older `v_dot4_i32_i8`, a community run in #311). At startup the engine and `strata-device` compare each GPU they use
+ctest (#192), and one RX 7600 XT (16 GB, i7-13700K, 64 GB) ran Swift IQ3_XXS over 146 requests up to 51K context at about 43 tok/s decode (28-50) and 250-300 tok/s prompt (#942); setup accepts it (unvalidated, #938); so does gfx1030 (RDNA2: the older `v_dot4_i32_i8`, a community run in #311). At startup the engine and `strata-device` compare each GPU they use
 (`gcnArchName` up to the `:` feature suffix) with the architectures the binary was compiled for, and require
 wave32. A binary carried to another card stops with the card's name, its architecture and the build's list,
 instead of failing later with "invalid device function".
@@ -207,6 +207,32 @@ prompt read 436 -> 757 tok/s (greedy text diverges from the default after a few 
 rounding). `STRATA_HIP_ADAPT_KERNEL_COPY=1` (#884) copies the adaptive tier's swaps with a kernel instead of the SDMA
 engine, a workaround for the gfx1030 hang seen with the MMQ prompt path and adaptive swaps (untested on the reporter's
 machine). Windows HIP: the doorbell kernels fence their store (#697), and the shared-expert fork is off on HIP (#816).
+
+## Linux: verify timeouts while the kernel reclaims host memory (experimental workarounds)
+
+A `verify: timed out at layer N` or "no progress for 60 s" message does not by itself mean a kernel or handshake bug. Two
+community reports found the same mechanism: the GPU's queues are suspended while the kernel reclaims host pages the GPU
+has pinned through a KFD userptr, and a restore that keeps returning `-EAGAIN` leaves them suspended for tens of seconds.
+Each report is one machine, one workaround, and the cause is not confirmed on either; neither is a default or a general
+speed claim, and neither is known to matter on Windows or on other ROCm versions.
+
+- **Paged host allocations (#750, two Radeon AI PRO R9700, ROCm 7.2):** tracing correlated a timeout with about 31 s of
+  USERPTR queue suspension on both cards. ROCr uses USERPTR for paged host allocations unless `HSA_USERPTR_FOR_PAGED_MEM=0`.
+  With it in the server JSON `env`, five paired runs gave the same outputs and the same median (7 requests: 16.65 s against
+  16.63 s), without the 29.8 s and 42.2 s outliers; solo requests were a little slower (3.55 s to 3.69 s).
+- **`--mmap-experts` (#920, RX 6800 gfx1030, ROCm 7.2.4, 31 GiB RAM, IQ3_XXS):** every run stalled until
+  `GPU_PINNED_MIN_XFER_SIZE=1048576` was in the `env`, and none has since. HIP pins the pageable source pages of large
+  copies, here the mapped expert file. (The engine already sets this variable for `STRATA_ARENA_MMAP=1`.)
+
+```json
+"env": { "GPU_PINNED_MIN_XFER_SIZE": "1048576" }
+```
+
+Change one setting at a time with the rest of the configuration the same, restart the engine so the runtime reads it, and
+remove it to go back to the default. Check free RAM and the driver's GTT limit before large-context tests. If the engine
+runs in a systemd unit, limit it with `MemoryMax`, never `MemoryHigh`: `MemoryHigh` counts the page cache that
+`--mmap-experts` reads from, and a 16K prompt stalled in `pread` for 8 minutes under it. In a report, give the runtime and
+kernel versions, whether reclaim coincides with KFD queue eviction, and paired timings.
 
 ## RDNA4 (gfx1201)
 
@@ -369,7 +395,10 @@ run it; the report below is from a community machine: an RX 6900 XT 16 GB (gfx10
   (`ple_parity` needs a Q2_0 PLE file that is not on that machine, `expert_multi_test` refuses the CPU without AVX-512,
   `platform_memory_test` cannot `mlock` at the shell's default `ulimit -l`).
 - **gfx1031** (RX 6700 XT, #524): setup knows it (the `gfx103X-all` wheels, unvalidated); its reporter runs it daily
-  on one card.
+  on one card. More reports: an RX 6700 XT 12 GB run as gfx1030 on ROCm 7.2.4 (#1027: IQ2_XS, decode 30-32 tok/s, prompt about 300 tok/s, 6 of 6
+  needles), and an RX 6800M 12 GB on Windows with a self-built engine (#915, #1078: Q2_0, decode 9-27 tok/s, prompt 50-114 tok/s; the
+  experts stream from disk with 31 GB of RAM). The ready-made Windows zip has no gfx1031 code unless it is built with it: `STRATA_HIP_ARCHS=gfx1031`
+  in `tools\hip\build_windows.bat` (the default list has it from 0.1.40.2 on).
 - **Not validated:** gfx1032 (the same `dp4a` path, no hardware report), setup's own build path and the
   `gfx103X-all` wheels on gfx1030, images, answer-quality benchmarks. RDNA1 (gfx1012, RX 5500 XT) builds by hand:
   [OLDER_GPUS.md](OLDER_GPUS.md#amd-building-gfx906-and-gfx1012).

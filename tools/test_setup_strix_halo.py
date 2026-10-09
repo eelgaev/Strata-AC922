@@ -247,7 +247,7 @@ class OtherChips(LinuxBase):
             self.assertFalse(setup.is_strix_halo(g), arch)
             self.assertAlmostEqual(g["vram_gb"], vram)                                # a card's VRAM is not changed
             self.assertEqual(setup.low_ram_vram(g), vram)
-            self.assertEqual(setup.amd_problem(g) is None, arch != "gfx1102", arch)
+            self.assertIsNone(setup.amd_problem(g), arch)
 
 
 class DualGpu(LinuxBase):

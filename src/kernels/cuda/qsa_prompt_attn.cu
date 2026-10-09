@@ -924,8 +924,9 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_v70_kernel(const float* _
         }
         __syncthreads();
         // scores: warp w = dim group w (64 dims), QP q = cells 8q..8q+7. The hi and lo halves of q accumulate in
-        // their own m8n8k4 chains (tg, tgl), added in FP32 at the end: in one chain, Volta's truncating accumulation
-        // dropped most of the lo half (error vs FP64 5.1e-6 -> 2.3e-6, as the FP32 per-query kernel; the same for p.v)
+        // separate m8n8k4 chains (tg, tgl), added in FP32 at the end: Volta's tensor cores truncate as they
+        // accumulate, and in one chain behind the hi products most of the lo half was lost (error vs FP64 at 32K
+        // 5.1e-6 -> 2.3e-6, the FP32 kernel's level). The same for p.v below.
         {
             float tg[2][8], tgl[2][8];
 #pragma unroll
@@ -1008,9 +1009,8 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_v70_kernel(const float* _
 #pragma unroll
             for (int o = 16; o > 0; o >>= 1) vmax = fmaxf(vmax, __shfl_xor_sync(0xffffffffu, vmax, o));
             const float vup = vmax > 0.0f ? 16384.0f / vmax : 0.0f, vdown = vmax * (1.0f / 16384.0f);
-            float tmp[2][2][8];
+            float tmp[2][2][8], tmpl[2][2][8];   // the hi and lo halves of p in separate chains (see the scores)
 #pragma unroll
-            float tmpl[2][2][8];
             for (int rb = 0; rb < 2; ++rb)
 #pragma unroll
                 for (int nt = 0; nt < 2; ++nt)

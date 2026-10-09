@@ -22,7 +22,8 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate, literal_tags, mark_think_literals, unmark_think_literals  # noqa: E402
 from serve.server import (CTX_SLACK, ByteTokenizer, EngineDied, GpuBusy, MockEngine, PP_DONE_TAIL, Service,  # noqa: E402
-                          StrataEngine, engine_args, layer_split_value, prompt_progress, prompt_tokens_seen,
+                          StrataEngine, api_key_of, engine_args, key_matches, layer_split_value, prompt_progress,
+                          prompt_tokens_seen,
                           request_timings, serve, start_failure_hint)
 from types import SimpleNamespace  # noqa: E402
 
@@ -841,6 +842,53 @@ class StatusNeedsTheKey(unittest.TestCase):
             with urllib.request.urlopen(req, timeout=10) as r:
                 self.assertEqual(r.status, 200)
                 self.assertNotIn("tail", json.loads(r.read()))
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+
+class ApiKeyForms(unittest.TestCase):
+    """#725: a key no client could send (spaces or a line end around it), and a key outside ASCII."""
+
+    def test_the_key_loses_what_a_header_cannot_carry(self):
+        self.assertEqual(api_key_of(" s3cret "), "s3cret")
+        self.assertEqual(api_key_of("s3cret\r\n"), "s3cret")
+        self.assertEqual(api_key_of("two words"), "two words")
+        self.assertEqual(api_key_of(12345), "12345")              # a number in the config file
+        self.assertEqual(api_key_of(""), "")
+        self.assertEqual(api_key_of(None), "")
+
+    def test_a_blank_key_is_an_error_not_no_key(self):
+        for blank in (" ", "\r\n", "\t "):
+            with self.assertRaises(ValueError):
+                api_key_of(blank)
+
+    def test_a_key_outside_ascii_matches_as_utf8_and_as_latin1(self):
+        def as_read(key, enc):                                    # what http.server hands the handler
+            return key.encode(enc).decode("latin-1")
+        self.assertTrue(key_matches("s3cret", "s3cret"))
+        self.assertFalse(key_matches("s3cret ", "s3cret"))
+        self.assertFalse(key_matches("", "s3cret"))
+        self.assertTrue(key_matches(as_read("clé", "utf-8"), "clé"))
+        self.assertTrue(key_matches(as_read("clé", "latin-1"), "clé"))
+        self.assertTrue(key_matches(as_read("ключ", "utf-8"), "ключ"))
+        self.assertFalse(key_matches(as_read("ключ", "utf-8"), "ключx"))
+
+    def test_a_utf8_key_over_http(self):
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "ok", max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        svc.api_key = "ключ"
+        httpd = serve(svc, port=0)
+        base = f"http://127.0.0.1:{httpd.server_address[1]}/status"
+        try:
+            sent = ("Bearer " + svc.api_key).encode().decode("latin-1")   # UTF-8 bytes, as curl and the web app send
+            with urllib.request.urlopen(urllib.request.Request(base, headers={"Authorization": sent}), timeout=10) as r:
+                self.assertEqual(r.status, 200)
+            with self.assertRaises(urllib.error.HTTPError) as e:
+                urllib.request.urlopen(urllib.request.Request(base, headers={"Authorization": "Bearer ???"}),
+                                       timeout=10)
+            self.assertEqual(e.exception.code, 401)
+            e.exception.close()
         finally:
             httpd.shutdown()
             httpd.server_close()
@@ -2077,6 +2125,17 @@ class SharedSettings(unittest.TestCase):
         self.chat()
         self.assertNotIn("temperature", self.engine.last_sampling)
 
+    def test_a_body_without_the_defaults_wrapper_is_rejected(self):
+        """A body with no "defaults" key is a mistake, not the documented "clear them" ({"defaults": null})."""
+        self.req("/settings", {"defaults": {"temperature": 0.3}})
+        code, b = self.req("/settings", {"temperature": 0.9})        # a client that forgot the wrapper
+        self.assertEqual(code, 400, b)
+        self.assertIn("defaults", b["error"]["message"])
+        self.assertTrue(self.svc.shared)                             # kept: the settings are still there
+        self.assertTrue(os.path.exists(self.svc.shared_path))        # and so is the file
+        self.chat()
+        self.assertEqual(self.engine.last_sampling["temperature"], 0.3)
+
     def test_only_strata_s_own_page_may_set_them(self):
         code, _ = self.req("/settings", None, {"Content-Type": "text/plain"}, raw=b'{"defaults": {"temperature": 1}}')
         self.assertEqual(code, 415)
@@ -2121,6 +2180,20 @@ class SharedSettings(unittest.TestCase):
             self.assertEqual(code, 403)
         finally:
             self.svc.trusted_origins = []
+
+
+class TemplateCaps(unittest.TestCase):
+    def test_probe_errors_are_logged_and_swallowed(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "chat_template.jinja"
+            path.write_text("{{ missing_global() }}", encoding="utf-8")
+            with self.assertLogs("serve.frontend", level="DEBUG") as logs:
+                caps = ChatTemplate(path).caps
+            self.assertFalse(any(caps.values()))
+            self.assertTrue(any("missing_global" in line for line in logs.output))
+            with mock.patch.object(ChatTemplate, "render", side_effect=RuntimeError("render bug")):
+                caps = ChatTemplate(path).caps       # any error of a probe is a feature that is off, not a crash
+            self.assertFalse(any(caps.values()))
 
 
 class WebApp(unittest.TestCase):
@@ -2204,6 +2277,9 @@ class WebApp(unittest.TestCase):
                 self.assertEqual(props["default_generation_settings"]["params"],
                                  {"temperature": 0.7, "repeat_penalty": 1.1, "n_predict": 4096})
                 self.assertEqual(props["chat_template"], (ROOT / "serve/chat_template.jinja").read_text(encoding="utf-8"))
+                for key in ("supports_tools", "supports_tool_calls", "supports_system_role",
+                            "supports_parallel_tool_calls", "supports_preserve_reasoning"):
+                    self.assertIs(props["chat_template_caps"][key], True)
                 self.assertEqual(props["modalities"]["vision"], vision is not None)
                 self.assertEqual(props["total_slots"], 1)
                 self.assertFalse(props["models_autoload"])
@@ -2213,6 +2289,103 @@ class WebApp(unittest.TestCase):
             self.assertEqual(self.get("/props?model=not-loaded&autoload=true")[0], 404)
         finally:
             svc.engine.max_context, svc.vision, svc.sampling_defaults, svc.shared = previous
+
+    def test_props_caps_follow_the_active_template(self):
+        source = self.svc.template.source
+        cases = [("{# tools tool_calls reasoning_content <tool_call> <function= #}{{ messages[-1].content }}",
+                  {"supports_tools": False, "supports_tool_calls": False, "supports_system_role": False,
+                   "supports_parallel_tool_calls": False, "supports_preserve_reasoning": False}),
+                 ("{% set preserve_thinking = false %}" + source, {"supports_preserve_reasoning": False}),
+                 ("{% for m in messages %}{% if m.tool_calls and m.tool_calls|length > 1 %}"
+                  "{{ raise_exception('Only one tool call is supported.') }}{% endif %}{% endfor %}" + source,
+                  {"supports_tool_calls": True, "supports_parallel_tool_calls": False}),
+                 ("{% if tools or messages[0].role == 'system' %}{{ raise_exception('Unsupported.') }}{% endif %}"
+                  "{{ messages[-1].content }}",
+                  {"supports_tools": False, "supports_tool_calls": False, "supports_system_role": False,
+                   "supports_parallel_tool_calls": False, "supports_preserve_reasoning": False}),
+                 ("{% for m in messages %}{{ m.content }}{% if m.tool_calls %}"
+                  "<tool_call>{{ m.tool_calls|tojson }}</tool_call>{% endif %}{% endfor %}",
+                  {"supports_tools": False, "supports_tool_calls": False, "supports_system_role": True,
+                   "supports_parallel_tool_calls": False, "supports_preserve_reasoning": False}),
+                 ("{% for m in messages %}{% if m.tool_calls %}{% for c in m.tool_calls %}"
+                  "{% set fn = c.function if c.function is defined else c %}"
+                  "{% if not tools or fn.name not in tools|map(attribute='name')|list %}"
+                  "{{ raise_exception('Tool calls require matching tool definitions.') }}"
+                  "{% endif %}{% endfor %}{% endif %}{% endfor %}" + source,
+                  {"supports_tools": True, "supports_tool_calls": True, "supports_parallel_tool_calls": True})]
+        original = self.svc.template
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                path = Path(d) / "chat_template.jinja"
+                for text, expected in cases:
+                    with self.subTest(expected=expected):
+                        path.write_text(text, encoding="utf-8")
+                        self.svc.template = ChatTemplate(path)
+                        code, _, body = self.get("/props")
+                        self.assertEqual(code, 200)
+                        props = json.loads(body)
+                        self.assertEqual(props["chat_template"], text)
+                        for key, value in expected.items():
+                            self.assertIs(props["chat_template_caps"][key], value)
+        finally:
+            self.svc.template = original
+
+    def test_props_caps_are_ready_for_concurrent_requests(self):
+        from concurrent.futures import ThreadPoolExecutor
+
+        original = self.svc.template
+        try:
+            self.svc.template = ChatTemplate(ROOT / "serve/chat_template.jinja")
+            with mock.patch.object(self.svc.template, "render", side_effect=AssertionError("render during request")):
+                with ThreadPoolExecutor(max_workers=4) as pool:
+                    results = list(pool.map(lambda _: self.get("/props"), range(4)))
+            for code, _, body in results:
+                self.assertEqual(code, 200)
+                caps = json.loads(body)["chat_template_caps"]
+                for key in ("supports_tools", "supports_tool_calls", "supports_system_role",
+                            "supports_parallel_tool_calls", "supports_preserve_reasoning"):
+                    self.assertIs(caps[key], True)
+        finally:
+            self.svc.template = original
+
+    def test_slot_reports_the_context_in_use(self):
+        """/slots in llama.cpp's names: a front-end's context meter divides n_prompt_tokens by n_ctx, so a server
+        that leaves the key out shows 0 % no matter how full the context is."""
+        with self.svc.status_lock:
+            self.svc.status["prompt_tokens"] = 1234
+        try:
+            slot = json.loads(self.get("/slots")[2])[0]
+            self.assertEqual((slot["n_ctx"], slot["n_prompt_tokens"]), (CTX, 1234))
+        finally:
+            with self.svc.status_lock:
+                self.svc.status.pop("prompt_tokens", None)
+        self.assertEqual(json.loads(self.get("/slots")[2])[0]["n_prompt_tokens"], 0)
+
+    def test_slots_lists_every_batch_slot(self):
+        engine = self.svc.engine
+        engine.batch, engine.max_context = 2, CTX
+        engine.slots_view = lambda: [{"slot": 0, "state": "decoding", "prompt_tokens": 500},
+                                     {"slot": 1, "state": "idle", "held_tokens": 77}]
+        try:
+            slots = json.loads(self.get("/slots")[2])
+        finally:
+            del engine.batch, engine.slots_view
+        self.assertEqual(slots, [{"id": 0, "n_ctx": CTX, "is_processing": True, "n_prompt_tokens": 500},
+                                 {"id": 1, "n_ctx": CTX, "is_processing": False, "n_prompt_tokens": 77}])
+
+    def test_props_total_slots_follows_the_batch_slots(self):
+        # llama.cpp clients read total_slots as the number of requests the server runs at once
+        engine, had = self.svc.engine, hasattr(self.svc.engine, "batch")
+        previous = getattr(engine, "batch", None)
+        try:
+            for batch, slots in ((0, 1), (3, 3)):
+                engine.batch = batch
+                self.assertEqual(json.loads(self.get("/props")[2])["total_slots"], slots)
+        finally:
+            if had:
+                engine.batch = previous
+            else:
+                del engine.batch
 
     def test_discovery_needs_the_api_key(self):
         self.svc.api_key = "secret"
@@ -2236,7 +2409,8 @@ class WebApp(unittest.TestCase):
                     self.svc.status["busy"] = busy
                 code, _, body = self.get("/slots")
                 self.assertEqual(code, 200)
-                self.assertEqual(json.loads(body), [{"id": 0, "n_ctx": CTX, "is_processing": busy}])
+                self.assertEqual(json.loads(body), [{"id": 0, "n_ctx": CTX, "is_processing": busy,
+                                                     "n_prompt_tokens": 0}])
         finally:
             with self.svc.status_lock:
                 self.svc.status["busy"] = False
@@ -2676,6 +2850,23 @@ class ThinkingBudget(unittest.TestCase):
         code, b = self.openai(reasoning_budget_tokens=0)
         self.assertEqual(b["choices"][0]["message"]["reasoning_content"], ThinkingEngine.THOUGHT)
         self.assertEqual(len(self.engine.prompts), 3)
+
+    def test_a_shared_budget_reaches_a_request_that_sets_none(self):
+        """The Chat settings shared with other apps may carry a thinking budget too, like max_tokens and the effort."""
+        self.svc.set_shared({"reasoning_budget_tokens": 20})
+        code, b = self.openai()                                    # a client that asks for no budget of its own
+        self.assertEqual(code, 200, b)
+        self.assertEqual(len(self.engine.prompts), 2)
+        self.assertTrue(b["choices"][0]["message"]["reasoning_content"].startswith(ThinkingEngine.THOUGHT[:20] + "\n"))
+        code, b = self.openai(reasoning_budget_tokens=0)           # its own 0 still turns it off
+        self.assertEqual(b["choices"][0]["message"]["reasoning_content"], ThinkingEngine.THOUGHT)
+        self.assertEqual(len(self.engine.prompts), 3)
+
+    def test_a_shared_budget_must_be_a_whole_number_of_tokens(self):
+        for bad in (-1, 1.5, "20"):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                self.svc.set_shared({"reasoning_budget_tokens": bad})
+        self.assertEqual(self.svc.set_shared({"reasoning_budget_tokens": 0}), {"reasoning_budget_tokens": 0})
 
     def test_without_thinking_there_is_nothing_to_limit(self):
         self.engine.THOUGHT = ""
@@ -3862,6 +4053,57 @@ class VisionArgs(unittest.TestCase):
         self.assertNotIn("--min-tokens", base)
         self.assertEqual(self.args_for({"max_tokens": 1024, "min_tokens": 768})[-4:],
                          ["--max-tokens", "1024", "--min-tokens", "768"])
+
+
+class VisionCacheEviction(unittest.TestCase):
+    """#1072: the cache of encoded images keeps 64; a request's own images are never evicted for a later one."""
+
+    def make(self, d):
+        import serve.server as server
+        v = server.Vision.__new__(server.Vision)
+        v.dir, v.cache, v.lock = d, {}, threading.Lock()
+        v.load = lambda src: src
+
+        class Pipe:
+            def __init__(self):
+                self.last = ""
+
+            def write(self, text):
+                self.last = text
+
+            def flush(self):
+                (d / self.last.split()[2]).write_bytes(b"x")
+
+            def readline(self):
+                return "OK 3" + chr(10)
+
+        pipe = Pipe()
+        v.proc = SimpleNamespace(stdin=pipe, stdout=pipe)
+        v.normalize = staticmethod(lambda data: data)
+        return v
+
+    def test_one_request_with_more_than_64_images_keeps_all_its_files(self):
+        with tempfile.TemporaryDirectory() as t:
+            d = Path(t)
+            v = self.make(d)
+            done = v.encode_all([f"image {i}".encode() for i in range(70)])
+            self.assertEqual(len(done), 70)
+            self.assertTrue(all(p.exists() for p, _ in done))
+            # the next request's image shrinks the cache back to 64, oldest first
+            p, _ = v.encode(b"another one")
+            self.assertEqual(len(v.cache), 64)
+            self.assertTrue(p.exists())
+            self.assertEqual(len(list(d.glob("*.sve"))), 64)
+
+    def test_plain_encode_still_evicts_the_oldest(self):
+        with tempfile.TemporaryDirectory() as t:
+            d = Path(t)
+            v = self.make(d)
+            first, _ = v.encode(b"first")
+            for i in range(64):
+                v.encode(f"image {i}".encode())
+            self.assertEqual(len(v.cache), 64)
+            self.assertFalse(first.exists())
 
 
 class VisionShutdown(unittest.TestCase):

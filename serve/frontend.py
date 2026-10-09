@@ -16,6 +16,7 @@ and the formats change often; the engine boundary is token ids in, text deltas o
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import uuid
@@ -24,6 +25,8 @@ from pathlib import Path
 
 import jinja2
 from jinja2.sandbox import ImmutableSandboxedEnvironment
+
+LOGGER = logging.getLogger(__name__)
 
 
 # ------------------------------------------------------------------------------------------------ template
@@ -47,6 +50,7 @@ class ChatTemplate:
         env.globals["raise_exception"] = raise_exception
         self.source = Path(path).read_text(encoding="utf-8")
         self.template = env.from_string(self.source)
+        self.caps = self._detect_caps()
 
     def render(self, messages: list[dict], tools: list[dict] | None = None, add_generation_prompt: bool = True,
                **kwargs) -> str:
@@ -58,6 +62,53 @@ class ChatTemplate:
                                                       and not _has_image(m.get("content")) and not m.get("tool_calls"))]
         return self.template.render(messages=messages, tools=tools, add_generation_prompt=add_generation_prompt,
                                     **kwargs)
+
+    def _detect_caps(self) -> dict[str, bool]:
+        """llama.cpp's capability names, checked at load time against this template and Strata's tool-call format.
+        These are rendering hints, not a guarantee that the model will follow a request."""
+        def render(messages, tools=None):
+            try:
+                return self.render(messages, tools=tools)
+            except Exception as exc:                # noqa: BLE001 - a hint only: never stop the server for a probe
+                # A template may reject a role or feature (a custom one may fail in any way): the feature is off,
+                # discovery still answers for the others, and the start-up goes on.
+                LOGGER.debug("chat template capability probe failed: %s", exc, exc_info=True)
+                return ""
+
+        user = {"role": "user", "content": "strata_caps_user"}
+        tools = [{"name": f"strata_caps_call_{i}", "description": "strata_caps_description",
+                  "parameters": {"type": "object", "properties": {"arg": {"type": "string"}}}}
+                 for i in range(2)]
+        tool_prompt = render([user], tools)
+
+        def calls_supported(count):
+            calls = [{"name": f"strata_caps_call_{i}", "arguments": {"arg": f"strata_caps_arg_{i}"}}
+                     for i in range(count)]
+            messages = [user, {"role": "assistant", "content": "",
+                               "tool_calls": [{"function": call} for call in calls]}]
+            replies = [f"strata_caps_result_{i}" for i in range(count)]
+            messages += [{"role": "tool", "content": reply} for reply in replies] + [user]
+            prompt = render(messages, tools)
+            # Instructions include example XML and literal tag names, which are not model output. Parse only
+            # complete calls to our probe functions, using the same body parser as OutputParser.
+            bodies = re.findall(r"<tool_call>\s*(<function=strata_caps_call_\d+>.*?</function>)\s*</tool_call>",
+                                prompt, re.S)
+            try:
+                parsed = [parse_tool_call(body) for body in bodies]
+            except ValueError:
+                return False
+            return [{"name": call.name, "arguments": call.arguments} for call in parsed] == calls \
+                and all(reply in prompt for reply in replies)
+
+        history = [user, {"role": "assistant", "content": "strata_caps_answer",
+                          "reasoning_content": "strata_caps_reasoning"}, user]
+        return {"supports_tools": all(s in tool_prompt for s in
+                                      ("strata_caps_call_0", "strata_caps_description", "<tool_call>", "<function=")),
+                "supports_tool_calls": calls_supported(1),
+                "supports_system_role": "strata_caps_system" in render(
+                    [{"role": "system", "content": "strata_caps_system"}, user]),
+                "supports_parallel_tool_calls": calls_supported(2),
+                "supports_preserve_reasoning": "strata_caps_reasoning" in render(history)}
 
 
 # ------------------------------------------------------------------------------------------------ requests

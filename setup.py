@@ -1566,16 +1566,22 @@ def cuda_lib_dirs(toolkit=13):
 # No images yet.
 ROCM_INDEXES = {"gfx1100": "https://rocm.nightlies.amd.com/v2/gfx110X-dgpu/",   # TheRock's wheels per GPU family
                 "gfx1101": "https://rocm.nightlies.amd.com/v2/gfx110X-dgpu/",
+                "gfx1102": "https://rocm.nightlies.amd.com/v2/gfx110X-dgpu/",
                 "gfx1200": "https://rocm.nightlies.amd.com/v2/gfx120X-all/",
                 "gfx1201": "https://rocm.nightlies.amd.com/v2/gfx120X-all/",
                 "gfx1030": "https://rocm.nightlies.amd.com/v2/gfx103X-all/",
                 "gfx1031": "https://rocm.nightlies.amd.com/v2/gfx103X-all/",
-                "gfx1151": "https://rocm.nightlies.amd.com/v2/gfx1151/"}       # Strix Halo (docs/STRIX_HALO.md)
+                "gfx1151": "https://rocm.nightlies.amd.com/v2/gfx1151/",       # Strix Halo (docs/STRIX_HALO.md)
+                "gfx1103": "https://rocm.nightlies.amd.com/v2/gfx110X-all/"}   # Radeon 780M: only with STRATA_EXPERIMENTAL_GFX1103=1
 ROCM_VERSION = os.environ.get("STRATA_ROCM_VERSION", "7.10.0a20251120")   # what Strata's HIP build was tested with
 ROCM_SYSTEM_MIN = (7, 0)       # an older system ROCm is passed over for the wheels (gfx1201 needs ROCm 6.4 or newer)
-AMD_ARCHS = ("gfx1100", "gfx1101", "gfx1200", "gfx1201", "gfx1030", "gfx1031", "gfx1151")
+# STRATA_EXPERIMENTAL_GFX1103=1 (opt-in, unsupported): the Radeon 780M / 760M / 740M iGPU (Ryzen 7040 / 8040, gfx1103) is taken
+# as a unified-memory AMD card like Strix Halo, with the portable kernels (no WMMA) (measured on one machine: Ryzen 7 255).  Unset: unchanged.
+GFX1103_OPT_IN = os.environ.get("STRATA_EXPERIMENTAL_GFX1103") == "1"
+AMD_ARCHS = ("gfx1100", "gfx1101", "gfx1102", "gfx1200", "gfx1201", "gfx1030", "gfx1031", "gfx1151") + (("gfx1103",) if GFX1103_OPT_IN else ())
 AMD_NAMES = {"gfx1100": "AMD Radeon RX 7900 series (gfx1100)",   # when sysfs has no product name
              "gfx1101": "AMD Radeon RX 7800 XT / 7700 XT (gfx1101)",
+             "gfx1102": "AMD Radeon RX 7600 / 7600 XT (gfx1102)",
              "gfx1200": "AMD Radeon RX 9060 series (gfx1200)",
              "gfx1201": "AMD Radeon RX 9070 series / AI PRO R9700 (gfx1201)",
              "gfx1030": "AMD Radeon RX 6800 / 6900 series (gfx1030)",
@@ -1587,7 +1593,7 @@ AMD_NAMES = {"gfx1100": "AMD Radeon RX 7900 series (gfx1100)",   # when sysfs ha
              "gfx1103": "AMD Radeon 780M / 760M / 740M (Ryzen 7040 / 8040, Phoenix / Hawk Point, gfx1103)"}
 AMD_CARDS = ("the RX 7900 XT / XTX (gfx1100), RX 7800 XT / 7700 XT (gfx1101), RX 9060 XT (gfx1200) and "
              "RX 9070 / 9070 XT / Radeon AI PRO R9700 (gfx1201), and the RX 6800 / 6900 series (gfx1030) and RX 6700 XT "
-             "(gfx1031, #524), both unvalidated, and the Ryzen AI Max \"Strix Halo\" APU (Radeon 8060S / 8050S / 8040S, "
+             "(gfx1031, #524), and the RX 7600 / 7600 XT (gfx1102, one run reported, #942), all unvalidated, and the Ryzen AI Max \"Strix Halo\" APU (Radeon 8060S / 8050S / 8040S, "
              "gfx1151: experimental, docs/STRIX_HALO.md)")
 
 
@@ -1629,7 +1635,7 @@ def amd_apply_uma(g: dict, gtt_gb: float = 0.0, ram: float | None = None) -> dic
     the model's experts live in, so it is not extra room beside the RAM.  g gets: uma, dedicated_gb (the carve-out: the
     only part that adds to the RAM, which the low-RAM mode counts) and vram_gb = the memory the GPU can use in all
     (the carve-out plus the shared pool less what the OS keeps), which sizes the context and the parallel slots."""
-    if g.get("uma") or not is_strix_halo(g):
+    if g.get("uma") or not (is_strix_halo(g) or (GFX1103_OPT_IN and gfx_arch_is(g.get("arch"), "gfx1103"))):
         return g
     ram = ram_gb() if ram is None else ram
     carve = max(0.0, float(g.get("vram_gb") or 0.0))
@@ -2683,7 +2689,7 @@ def cmake_build(src, bdir, target, defs, vcvars, bat_name):
             run(build)
 
 
-ENGINE_SOURCES = ("CMakeLists.txt", "src", "include", "third_party/ggml")
+ENGINE_SOURCES = ("CMakeLists.txt", "cmake", "src", "include", "third_party/ggml")
 VISION_SOURCES = ("tools/vision",)
 
 
@@ -3197,7 +3203,7 @@ def write_config(path: Path, cfg: dict):
 # "sampling" or "mcp_servers" block, "allowed_hosts", "cors_origins", "open_browser" - and is kept when setup runs again
 SETUP_KEYS = frozenset({"exe", "args", "cwd", "tokenizer", "model_name", "log", "lib_dirs", "port", "backend", "env",
                         "gpu", "gpus_asked", "layer_split", "host", "api_key", "draft_vocab", "vision"})
-SETUP_ENV = frozenset({"STRATA_HIPBLASLT_TUNING", "STRATA_RESIDENT_PIN"})   # the "env" entries setup writes
+SETUP_ENV = frozenset({"STRATA_HIPBLASLT_TUNING", "STRATA_RESIDENT_PIN", "STRATA_NO_ARENA_THP"})   # the "env" entries setup writes
 SETUP_VISION = frozenset({"exe", "mmproj", "model", "gpu", "max_tokens", "threads"})
 
 
@@ -4980,6 +4986,9 @@ def main() -> int:
         table = hipblaslt_table(gpu["arch"], lib_dirs, meta.get("hipblaslt_version"))
         if table:
             cfg["env"] = {"STRATA_HIPBLASLT_TUNING": str(table)}
+        if GFX1103_OPT_IN and gfx_arch_is(gpu["arch"], "gfx1103") and not WIN:
+            # the 780M's KFD queues are evicted (a GPU reset) while transparent huge pages move the pinned expert arena
+            cfg.setdefault("env", {})["STRATA_NO_ARENA_THP"] = "1"
         if resident:   # ROCm: large page-locked host allocations can fail or be slow for the CPU; keep the copy pageable
             cfg.setdefault("env", {})["STRATA_RESIDENT_PIN"] = "0"
     if gpu["count"] > 1 or a.gpu is not None:

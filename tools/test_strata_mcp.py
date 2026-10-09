@@ -18,6 +18,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
@@ -303,6 +304,20 @@ class Validation(FakeRoot):
         self.assertRejected("strata_install", {"family": "unsloth", "model": "UD-Q4_K_XL", "vision": "yes"},
                             "images are not available")
         self.assertRejected("strata_install", {"vision": "yes\nrm"}, "control characters")
+
+    def test_amd_vision_follows_setups_rules(self):
+        """#990: --vision cpu is allowed with the AMD backend on Linux (setup.hip_vision); a GPU encoder is not."""
+        with mock.patch.object(M, "WIN", False):
+            self.assertRejected("strata_install", {"backend": "hip", "vision": "yes"}, "no GPU image encoder")
+            self.assertRejected("strata_install", {"backend": "hip", "vision": "gpu"}, "vision=cpu")
+            res, err = self.call("strata_install", {"backend": "hip", "vision": "cpu"})
+            self.assertFalse(err, res)
+            self.assertEqual(res["plan"]["images"], "cpu")
+            self.assertIn("--vision cpu", res["plan"]["setup_command"])
+            res, err = self.call("strata_install", {"backend": "hip", "vision": "no"})
+            self.assertFalse(err, res)
+        with mock.patch.object(M, "WIN", True):
+            self.assertRejected("strata_install", {"backend": "hip", "vision": "cpu"}, "Linux")
 
     def test_data_dir_paths(self):
         self.assertRejected("strata_install", {"data_dir": "models"}, "absolute")

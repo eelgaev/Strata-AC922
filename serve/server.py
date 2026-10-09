@@ -668,6 +668,7 @@ class StrataEngine:
             self.ctl_epoch = 0                          # how often the control lines were taken
             self.ctl = threading.Lock()                 # one admission or solo request on the control lines at a time
         self.gen = self.__dict__.get("gen", 0) + 1      # which engine process this is (a request notes its own)
+        self._ctl_erred = False                         # #1059: the control lines ended on an ERR
         self._yielded = None                            # (slot, tokens read): the last request on them gave way
         self.wlock = threading.Lock()                   # stdin writes from several request threads
         self.pump = threading.Thread(target=self._pump, daemon=True)
@@ -947,6 +948,7 @@ class StrataEngine:
                 if len(f) >= 3 and f[1].lstrip("-").isdigit() and f[2].isdigit():
                     self._yielded = (int(f[1]), int(f[2]))
             elif line.startswith("ERR"):
+                self._ctl_erred = True                   # #1059: the engine refused it and is idle: no DONE follows
                 raise ValueError(line[4:].strip())
             if line.startswith("DONE") and self._ctl_mode == "solo":
                 self._ctl_result = ("done", None)
@@ -1087,6 +1089,7 @@ class StrataEngine:
         out: list[int] = []
         pending: list[int] = []
         prompt, left = list(ids), int(max_new)
+        reused0 = None      # the first read's reused tokens: a continued leg's count includes this request's own output
         ok = yield from self._take_control(cancel, len(prompt))
         if not ok:
             return
@@ -1110,6 +1113,7 @@ class StrataEngine:
                     self._send(f"{head} {','.join(str(int(t)) for t in prompt)}")
                     phase = "solo"
                     self._ctl_mode, self._ctl_result, self._yielded = "solo", None, None
+                    self._ctl_erred = False
                     def others():
                         with self.slot_cv:
                             return self.waiting > 0
@@ -1145,6 +1149,8 @@ class StrataEngine:
                         left = int(max_new) - len(out)
                         if cancel.is_set() or left <= 0 or finish in ("stop", "length") or (out and out[-1] in EOS_IDS):
                             return
+                        if reused0 is None:
+                            reused0 = (self.last or {}).get("reused")
                         prompt = list(ids) + out            # promoted: it continues in a batch slot from here
                 while True:
                     if slot is None:
@@ -1181,6 +1187,7 @@ class StrataEngine:
                     self.slot_held[slot] = []               # the admission overwrites what the slot held
                     phase = "admit"
                     self._ctl_mode, self._ctl_result, self._yielded = "batch", None, None
+                    self._ctl_erred = False
                     asked = False
                     for x in self._control(cancel, pending.append):
                         while pending:
@@ -1253,6 +1260,8 @@ class StrataEngine:
                                 self.slot_busy[slot] = False
                                 self.slot_cv.notify_all()
                             slot, gen0 = None, None
+                            if reused0 is None:
+                                reused0 = (self.last or {}).get("reused")
                             prompt, left = list(ids) + out, int(max_new) - len(out)
                             solo_again += 1
                             btrace("back to the solo path")
@@ -1264,6 +1273,8 @@ class StrataEngine:
             try:
                 if phase in ("solo", "admit") and (self.gen != born or not self.alive()):
                     phase = "none"                      # #1012: its engine is gone: nothing to stop or drain
+                if phase in ("solo", "admit") and self._ctl_erred:
+                    phase = "none"                      # #1059: it ended on the engine's ERR: no DONE to wait 300 s for
                 if phase == "solo":
                     self._send("STOP")
                     self._drain_control("DONE", born=born)
@@ -1273,6 +1284,8 @@ class StrataEngine:
                         phase = "slot"
             except EngineDied:
                 pass
+            if reused0 is not None and isinstance(self.last, dict):
+                self.last = {**self.last, "reused": reused0}
             if holding:
                 self.ctl.release()
             if reserved is not None:
@@ -1729,12 +1742,23 @@ class Vision:
         im.save(out, format="PNG")
         return out.getvalue()
 
-    def encode(self, source: str | bytes) -> tuple[Path, int]:
-        """-> (embeddings file, number of image tokens).  `source`: what load() reads, or the image's bytes."""
+    def encode_all(self, sources: list) -> list[tuple[Path, int]]:
+        """encode() for every image of one request: the files of this request's earlier images are never evicted to
+        make room for a later one (#1072: with more than 64 unique images the first was deleted before the request
+        had read it)."""
+        out: list[tuple[Path, int]] = []
+        for src in sources:
+            out.append(self.encode(src, keep=[p for p, _ in out]))
+        return out
+
+    def encode(self, source: str | bytes, keep=()) -> tuple[Path, int]:
+        """-> (embeddings file, number of image tokens).  `source`: what load() reads, or the image's bytes.
+        `keep`: files the caller still needs (never evicted by this call)."""
         data = self.normalize(source if isinstance(source, bytes) else self.load(source))
         key = hashlib.sha256(data).hexdigest()[:32]
         with self.lock:
             if key in self.cache:
+                self.cache[key] = self.cache.pop(key)                  # most recently used last
                 return self.cache[key]
             img, out = self.dir / f"{key}.img", self.dir / f"{key}.sve"
             img.write_bytes(data)
@@ -1748,9 +1772,12 @@ class Vision:
                 raise ValueError("the image could not be read: " + (line[4:] if line.startswith("ERR") else
                                                                      "the vision encoder stopped"))
             self.cache[key] = (out, int(line.split()[1]))
-            if len(self.cache) > 64:                                   # oldest first
-                old = next(iter(self.cache))
-                self.cache.pop(old)[0].unlink(missing_ok=True)
+            held = {str(p) for p in keep} | {str(out)}
+            for old in list(self.cache):                               # oldest first, but never one still in use
+                if len(self.cache) <= 64:
+                    break
+                if str(self.cache[old][0]) not in held:
+                    self.cache.pop(old)[0].unlink(missing_ok=True)
             return self.cache[key]
 
     def close(self):
@@ -2759,7 +2786,8 @@ class Service:
             # "reading the prompt" with CPU and GPU busy, for good (reproduced).  So encoding takes its turn in the
             # same FIFO as the requests.
             with self.fifo:
-                encoded = [self.vision.encode(src) for src in images]
+                encoded = (self.vision.encode_all(images) if hasattr(self.vision, "encode_all")
+                           else [self.vision.encode(src) for src in images])
             # one <|image_pad|> per image -> one per image token.  Only the markers the template writes for an image
             # (right after <|vision_start|>) are images: the same text inside a message (an agent reading these docs,
             # #150) is kept as plain text, or it took an image's place and the counts no longer matched.
@@ -2857,11 +2885,12 @@ class Service:
     def run(self, ids, thinking, tools, max_new, sampling, cancel, force=None) -> Iterator[tuple[str, object]]:
         """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..}).
         `force` (forced_call): the opening of the call the reply must make - see prepare()."""
-        budget = self.reasoning_budget(sampling) if thinking else None   # #123: opt-in, off by default
         defaults = {**self.sampling_defaults, **self.shared}   # the config's, then the Chat settings shared with apps
         if defaults:                   # the request's own fields win (explicit 0 stays greedy)
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
             sampling = {**defaults, **req_values}
+        # #123: read after the merge, so a budget shared through POST /settings is seen like the other keys
+        budget = self.reasoning_budget(sampling) if thinking else None
         parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True)
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         run_tok, run_len, repeated = None, 0, False     # #606: the current run of one repeated token
@@ -3535,8 +3564,10 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
                 "tool_use" if used_tool and streamed <= finished and x["finish"] == "stop" else \
                 {"stop": "end_turn", "length": "max_tokens", "cancel": "end_turn"}[x["finish"]]
             # the final counts, Anthropic's way: input_tokens leaves out what the conversation cache already held,
-            # which is cache_read_input_tokens (message_start could only say the whole prompt)
-            reused = min(x.get("reused") or 0, len(ids))
+            # which is cache_read_input_tokens (message_start could only say the whole prompt).  At least the last
+            # prompt token is always read, and Claude Code takes an input_tokens of 0 as "not given" and keeps
+            # message_start's whole prompt beside cache_read_input_tokens: the prompt counted twice (#1013)
+            reused = max(0, min(x.get("reused") or 0, len(ids) - 1))
             yield "message_delta", {"type": "message_delta", "delta": {"stop_reason": stop,
                                                                        "stop_sequence": x.get("stop_sequence")},
                                     "usage": {"input_tokens": len(ids) - reused, "cache_read_input_tokens": reused,
@@ -3577,6 +3608,17 @@ def anthropic_collect(events) -> dict:
 
 
 # ------------------------------------------------------------------------------------------------ HTTP
+CHUNKED_BODY_MAX = 256 << 20                # #893: the most a Transfer-Encoding: chunked body may hold (read into memory)
+
+
+class BadBody(Exception):
+    """A request body that cannot be read (a malformed or oversized chunked body): the status and the sentence."""
+
+    def __init__(self, status: int, message: str):
+        super().__init__(message)
+        self.status = status
+
+
 def make_handler(svc: Service):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.0"                       # SSE ends by closing the connection
@@ -3593,8 +3635,56 @@ def make_handler(svc: Service):
             super().handle_one_request()
             self._drain_body()
 
+        def _chunked(self) -> bool:
+            """#893: a body sent as Transfer-Encoding: chunked (a relay or proxy that does not buffer it).  By RFC 9112
+            it wins over a Content-Length."""
+            te = self.headers.get("Transfer-Encoding", "") or ""
+            return te.split(",")[-1].strip().lower() == "chunked"
+
+        def _read_chunked(self, limit: int, keep: bool = True, deadline: float | None = None) -> bytes:
+            """Decode a chunked body: at most `limit` bytes (BadBody 413 beyond it - the size is checked before a chunk
+            is read, so a huge announced chunk is never allocated), BadBody 400 for a malformed one.  keep=False reads
+            and drops it (the drain); `deadline` (monotonic) ends the read early."""
+            parts, total = [], 0
+            while True:
+                if deadline is not None:
+                    wait = deadline - time.monotonic()
+                    if wait <= 0:
+                        return b"".join(parts)
+                    self.connection.settimeout(wait)
+                line = self.rfile.readline(1025)
+                if not line.endswith(b"\n"):
+                    raise BadBody(400, "malformed chunked request body")
+                try:
+                    size = int(line.split(b";", 1)[0].strip(), 16)
+                except ValueError:
+                    raise BadBody(400, "malformed chunk size in the request body") from None
+                if size < 0:
+                    raise BadBody(400, "malformed chunk size in the request body")
+                if size == 0:
+                    for _ in range(64):                       # the trailers, up to the blank line
+                        if self.rfile.readline(8193).strip() == b"":
+                            break
+                    return b"".join(parts)
+                total += size
+                if total > limit:
+                    self.close_connection = True
+                    raise BadBody(413, f"the request body is larger than {limit >> 20} MiB")
+                left = size
+                while left > 0:
+                    piece = self.rfile.read(min(left, 1 << 20))
+                    if not piece:
+                        raise BadBody(400, "the chunked request body ended early")
+                    left -= len(piece)
+                    if keep:
+                        parts.append(piece)
+                if self.rfile.read(2) != b"\r\n":
+                    raise BadBody(400, "malformed chunked request body")
+
         def _body(self) -> bytes:
             self.body_read = True
+            if self._chunked():
+                return self._read_chunked(CHUNKED_BODY_MAX)
             return self.rfile.read(int(self.headers.get("Content-Length", 0)))
 
         def _drain_body(self):
@@ -3606,6 +3696,12 @@ def make_handler(svc: Service):
             megabytes, at any speed the client has, still gets its answer."""
             headers = getattr(self, "headers", None)
             if self.body_read or headers is None:
+                return
+            if self._chunked():
+                try:
+                    self._read_chunked(CHUNKED_BODY_MAX, keep=False, deadline=time.monotonic() + self.DRAIN_SECONDS)
+                except (BadBody, OSError):
+                    self.close_connection = True
                 return
             try:
                 left = int(headers.get("Content-Length", 0))
@@ -3753,7 +3849,7 @@ def make_handler(svc: Service):
                 return True
             auth = self.headers.get("Authorization", "")
             given = auth[7:].strip() if auth.lower().startswith("bearer ") else self.headers.get("x-api-key", "")
-            if hmac.compare_digest(given.encode(), svc.api_key.encode()):   # #213: constant-time
+            if key_matches(given, svc.api_key):
                 return True
             self._json(401, {"error": {"type": "authentication_error", "message": "missing or wrong API key"}})
             return False
@@ -3867,8 +3963,20 @@ def make_handler(svc: Service):
                     loaded = not hasattr(svc.engine, "alive") or svc.engine.alive()
                     with svc.status_lock:
                         busy = bool(svc.status.get("busy"))
-                    slot = {"id": 0, "n_ctx": svc.engine.max_context, "is_processing": busy}
-                    self._json(200, [slot] if loaded else [])
+                        # llama.cpp's name for what the slot's context holds: the running request's prompt size,
+                        # kept after it ends (the conversation cache carries it on).  A front-end's context meter
+                        # divides it by n_ctx; without the key it reads 0 % against Strata forever (#562).
+                        in_use = int(svc.status.get("prompt_tokens") or 0)
+                    if getattr(svc.engine, "batch", 0) and hasattr(svc.engine, "slots_view"):
+                        # --batch: one entry per slot (the same view /metrics has), not one for the whole engine
+                        n_ctx = svc.engine.max_context
+                        slots = [{"id": s["slot"], "n_ctx": n_ctx, "is_processing": s["state"] != "idle",
+                                  "n_prompt_tokens": int(s.get("prompt_tokens") or s.get("held_tokens") or 0)}
+                                 for s in svc.engine.slots_view()]
+                    else:
+                        slots = [{"id": 0, "n_ctx": svc.engine.max_context, "is_processing": busy,
+                                  "n_prompt_tokens": in_use}]
+                    self._json(200, slots if loaded else [])
             elif path == "/v1/status":
                 if self._authorized():
                     self._json(200, svc.v1_status())
@@ -3876,6 +3984,12 @@ def make_handler(svc: Service):
                 self._json(404, {"error": {"message": "not found"}})
 
         def do_POST(self):
+            try:
+                self._post()
+            except BadBody as e:                              # #893: a malformed or oversized chunked body
+                self._json(e.status, {"error": {"type": "invalid_request_error", "message": str(e)}})
+
+        def _post(self):
             if not self._authorized():
                 return
             path = self.path.split("?")[0].rstrip("/")   # issue #55: Claude Code posts /v1/messages?beta=true
@@ -4022,7 +4136,9 @@ def make_handler(svc: Service):
                                "presence_penalty", "frequency_penalty", "penalty_last_n")}
             params["n_predict"] = svc.shared.get("max_tokens", -1)
             props = {"default_generation_settings": {"n_ctx": svc.engine.max_context, "params": params},
-                     "total_slots": 1, "model_alias": svc.model, "chat_template": svc.template.source,
+                     "total_slots": max(1, int(getattr(svc.engine, "batch", 0) or 0)),   # #1004: the batch slots
+                     "model_alias": svc.model, "chat_template": svc.template.source,
+                     "chat_template_caps": svc.template.caps,
                      "modalities": {"vision": svc.vision is not None}, "models_autoload": hasattr(svc.engine, "restart"),
                      "is_sleeping": not svc.loaded()}
             if getattr(svc.engine, "model_path", None):
@@ -4034,6 +4150,18 @@ def make_handler(svc: Service):
 
         def _control_body(self) -> bool:
             """Consume the unused control body before replying/closing (Windows otherwise sends a TCP reset)."""
+            if self._chunked():
+                self.body_read = True
+                try:
+                    self.connection.settimeout(2.0)
+                    self._read_chunked(65536, keep=False)
+                except BadBody as e:
+                    self._json(e.status, {"error": {"message": f"control request: {e}"}})
+                    return False
+                except OSError:
+                    self._json(400, {"error": {"message": "incomplete control request body"}})
+                    return False
+                return True
             try:
                 length = int(self.headers.get("Content-Length", "0"))
             except ValueError:
@@ -4132,7 +4260,12 @@ def make_handler(svc: Service):
                 return
             try:
                 req = json.loads(body or b"{}")
-                shared = svc.set_shared(req.get("defaults") if isinstance(req, dict) else None)
+                if not isinstance(req, dict) or "defaults" not in req:
+                    self._json(400, {"error": {"type": "invalid_request_error",
+                                              "message": 'the body must be {"defaults": {...}} to set them, '
+                                                         'or {"defaults": null} to clear them'}})
+                    return
+                shared = svc.set_shared(req["defaults"])
             except ValueError as e:
                 self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
                 return
@@ -4598,6 +4731,30 @@ def host_allowed(host, names, any_host=False) -> bool:
                            or _name_in(name, names))
 
 
+def api_key_of(value) -> str:
+    """The key as a client can send it (#725).  An HTTP header loses the spaces and line ends around its value, so a
+    key kept with them (a config file or an environment file with CRLF line ends, a quoted " key ") matched no
+    request: every client got 401 with the right key.  A value that is only such characters raises ValueError, it
+    never means "no key" (#213)."""
+    key = "" if value is None else str(value)
+    if key and not key.strip():
+        raise ValueError("an API key was given but it is empty")
+    return key.strip()
+
+
+def key_matches(given: str, key: str) -> bool:
+    """given: a header's value as http.server read it, each byte one character.  A key with characters outside ASCII
+    arrives as UTF-8 from most clients and as Latin-1 from some; the right key passes in both forms (#725: the
+    bytes were re-encoded before, so a UTF-8 key never matched).  Constant-time (#213)."""
+    raw = given.encode("latin-1", "replace")
+    ok = hmac.compare_digest(raw, key.encode())
+    try:
+        ok |= hmac.compare_digest(raw, key.encode("latin-1"))
+    except UnicodeEncodeError:
+        pass
+    return ok
+
+
 def origin_allowed(origin: str, host, names, origins=()) -> bool:
     """A browser page's Origin that may use the model without an API key: this server's own page (the Origin is the
     request's own Host), a page on one of the names this server answers to (any port), or an origin the config lists
@@ -4648,7 +4805,8 @@ def origins_of(value, key: str, wildcard: bool) -> list[str]:
     return out
 
 
-SHARED_KEYS = ("reasoning_effort", "temperature", "top_p", "top_k", "seed", "max_tokens", "experimental_speed_projection")
+SHARED_KEYS = ("reasoning_effort", "reasoning_budget_tokens", "temperature", "top_p", "top_k", "seed", "max_tokens",
+               "experimental_speed_projection")
 
 
 def clean_shared_defaults(d) -> dict:
@@ -4678,6 +4836,10 @@ def clean_shared_defaults(d) -> dict:
         elif key in ("seed", "max_tokens"):
             if not number or value != int(value) or value <= 0:
                 raise ValueError(f"{key}: a positive integer")
+            value = int(value)
+        elif key == "reasoning_budget_tokens":                 # #123: 0 means no budget, so 0 is allowed here
+            if not number or value != int(value) or value < 0:
+                raise ValueError("reasoning_budget_tokens: a whole number of tokens (0: no budget)")
             value = int(value)
         elif key == "experimental_speed_projection":
             if not isinstance(value, bool):
@@ -4881,7 +5043,11 @@ def main() -> int:
         print("[strata] an API key was given but it is empty: set a key, or leave --api-key / STRATA_API_KEY out",
               file=sys.stderr)
         return 2
-    svc.api_key = a.api_key or cfg.get("api_key", "")
+    try:
+        svc.api_key = api_key_of(a.api_key or cfg.get("api_key", ""))
+    except ValueError as e:
+        print(f'[strata] {e}: set a key, or leave --api-key / STRATA_API_KEY / "api_key" out', file=sys.stderr)
+        return 2
     svc.cors_origins = origins_of(cfg.get("cors_origins"), "cors_origins", wildcard=True)
     svc.trusted_origins = origins_of(cfg.get("trusted_origins"), "trusted_origins", wildcard=False)
     try:

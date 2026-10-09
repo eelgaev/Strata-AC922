@@ -4040,6 +4040,26 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: expert cache auto: %.2f GiB free, %d MiB reserved (+%lld MiB for the "
                              "draft head) -> %d slots\n",
                      (double) free_b / 1073741824.0, o.vram_reserve_mib, (long long) (mtp_bind >> 20), o.expert_cache);
+#if defined(STRATA_USE_HIP) && !defined(_WIN32)
+        // An APU's "VRAM" is system RAM: the device-free figure above counts the whole GPU-addressable pool and does not
+        // subtract ordinary CPU allocations (the host expert arena), so a cache sized from it alone can ask the OOM killer
+        // for nearly all RAM (PR #895). A warning, not a cap: the cache stays as asked, and --expert-cache N chooses.
+        {
+            cudaDeviceProp apu_prop{};
+            int apu_dev = 0;
+            strata::core::detail::HostMemory hm{};
+            if (cudaGetDevice(&apu_dev) == cudaSuccess && cudaGetDeviceProperties(&apu_prop, apu_dev) == cudaSuccess &&
+                apu_prop.integrated && strata::core::detail::host_available_memory(hm)) {
+                const int64_t host_headroom = 4ll << 30;   // the OS and request-time CPU work
+                const int64_t cache_b = (int64_t) o.expert_cache * blob;
+                if (cache_b > (int64_t) hm.available - host_headroom)
+                    std::fprintf(stderr, "strata generate: WARNING: this GPU shares system RAM, and the cache above (%.2f GiB) is "
+                                         "more than the host memory available now (%.2f GiB) less 4 GiB for the OS: the system may "
+                                         "run out of memory; --expert-cache N sets the cache by hand\n",
+                                 (double) cache_b / 1073741824.0, (double) hm.available / 1073741824.0);
+            }
+        }
+#endif
         // #496: the verify window cannot start without a cache (#174), and a cache too small to lend the prompt path
         // a 256-token chunk's buffers (plus the 128 slots a loan leaves; one slot without --prefill) makes it
         // allocate its own on top - more than the reserve.  When the default reserve leaves less than that (a 6 GB

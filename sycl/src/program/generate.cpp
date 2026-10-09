@@ -3829,10 +3829,12 @@ int main(int argc, char **argv) try {
         }
         unmirrored_misses = (int64_t) miss.size() - (int64_t) (gguf_src.mirrored_bytes() ? std::count_if(miss.begin(), miss.end(),
             [&](const std::pair<int64_t, int64_t>& pr) { return gguf_src.pinned(pr.first, pr.second); }) : 0);
-        if (unmirrored_misses > 0 && std::getenv("STRATA_VERIFY_NO_HOST") != nullptr)
-            std::fprintf(stderr, "strata generate: WARNING: %lld experts are neither in VRAM nor mirrored; with STRATA_VERIFY_NO_HOST "
-                                 "the device plan cannot run them and their layers' windows fall back slowly - raise "
+        if (unmirrored_misses > 0 && std::getenv("STRATA_VERIFY_NO_HOST") != nullptr) {
+            std::fprintf(stderr, "strata generate: REFUSED: %lld experts are neither in VRAM nor mirrored; with STRATA_VERIFY_NO_HOST "
+                                 "the device plan cannot run them and generation would lack a safe host fallback - raise "
                                  "STRATA_MIRROR_MIB or the free RAM, or lower --max-context\n", (long long) unmirrored_misses);
+            return 2;
+        }
     }
 
     for (auto& stp : stages) {
@@ -7361,7 +7363,15 @@ int main(int argc, char **argv) try {
         save_profile("exit");   // #477: QUIT, or the server closed stdin
         // SYCL port: the requests are done and their output written; leave without unwinding the GPU objects (the OS
         // reclaims them). Their destructors ran against a runtime already shutting down and aborted (exit 139).
-        try { dpct::get_current_device().queues_wait_and_throw(); } catch (...) {}
+        try {
+            dpct::get_current_device().queues_wait_and_throw();
+            // Release the direct-access USM host mirror before process teardown.
+            gguf_src.close();
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "strata shutdown: mirror release failed: %s\n", e.what());
+            std::fflush(stderr);
+            std::_Exit(1);
+        }
         std::fflush(stdout);
         std::fflush(stderr);
         std::_Exit(0);

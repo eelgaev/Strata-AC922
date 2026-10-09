@@ -82,7 +82,9 @@ __dpct_inline__ void route(const float *__restrict__ logits,
     float values[NE / 32];
 #pragma unroll
     for (int i = 0; i < NE / 32; ++i) values[i] = logits[lane + i * 32];
-    item_ct1.barrier(sycl::access::fence_space::local_space);
+    // Only subgroup row zero reaches this point (the other rows returned above): a work-group barrier here is
+    // divergent and hangs on Alchemist (A770); the subgroup barrier is the one the surviving row can meet.
+    sycl::group_barrier(item_ct1.get_sub_group());
     float maximum = -INFINITY;
 #pragma unroll
     for (int i = 0; i < NE / 32; ++i) maximum = sycl::max(maximum, values[i]);
