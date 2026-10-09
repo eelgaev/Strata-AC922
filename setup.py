@@ -1569,23 +1569,156 @@ ROCM_INDEXES = {"gfx1100": "https://rocm.nightlies.amd.com/v2/gfx110X-dgpu/",   
                 "gfx1200": "https://rocm.nightlies.amd.com/v2/gfx120X-all/",
                 "gfx1201": "https://rocm.nightlies.amd.com/v2/gfx120X-all/",
                 "gfx1030": "https://rocm.nightlies.amd.com/v2/gfx103X-all/",
-                "gfx1031": "https://rocm.nightlies.amd.com/v2/gfx103X-all/"}
+                "gfx1031": "https://rocm.nightlies.amd.com/v2/gfx103X-all/",
+                "gfx1151": "https://rocm.nightlies.amd.com/v2/gfx1151/"}       # Strix Halo (docs/STRIX_HALO.md)
 ROCM_VERSION = os.environ.get("STRATA_ROCM_VERSION", "7.10.0a20251120")   # what Strata's HIP build was tested with
 ROCM_SYSTEM_MIN = (7, 0)       # an older system ROCm is passed over for the wheels (gfx1201 needs ROCm 6.4 or newer)
-AMD_ARCHS = ("gfx1100", "gfx1101", "gfx1200", "gfx1201", "gfx1030", "gfx1031")
+AMD_ARCHS = ("gfx1100", "gfx1101", "gfx1200", "gfx1201", "gfx1030", "gfx1031", "gfx1151")
 AMD_NAMES = {"gfx1100": "AMD Radeon RX 7900 series (gfx1100)",   # when sysfs has no product name
              "gfx1101": "AMD Radeon RX 7800 XT / 7700 XT (gfx1101)",
              "gfx1200": "AMD Radeon RX 9060 series (gfx1200)",
              "gfx1201": "AMD Radeon RX 9070 series / AI PRO R9700 (gfx1201)",
              "gfx1030": "AMD Radeon RX 6800 / 6900 series (gfx1030)",
-             "gfx1031": "AMD Radeon RX 6700 XT series (gfx1031)"}
+             "gfx1031": "AMD Radeon RX 6700 XT series (gfx1031)",
+             "gfx1151": "AMD Radeon 8060S / 8050S / 8040S (Ryzen AI Max, Strix Halo, gfx1151)",
+             # integrated Radeons of other Ryzen families: named so they are not taken for Strix Halo (not supported)
+             "gfx1150": "AMD Radeon 890M / 880M (Ryzen AI 300, Strix Point, gfx1150)",
+             "gfx1152": "AMD Radeon 860M / 840M (Ryzen AI 300, Krackan Point, gfx1152)",
+             "gfx1103": "AMD Radeon 780M / 760M / 740M (Ryzen 7040 / 8040, Phoenix / Hawk Point, gfx1103)"}
 AMD_CARDS = ("the RX 7900 XT / XTX (gfx1100), RX 7800 XT / 7700 XT (gfx1101), RX 9060 XT (gfx1200) and "
              "RX 9070 / 9070 XT / Radeon AI PRO R9700 (gfx1201), and the RX 6800 / 6900 series (gfx1030) and RX 6700 XT "
-             "(gfx1031, #524), both unvalidated")
+             "(gfx1031, #524), both unvalidated, and the Ryzen AI Max \"Strix Halo\" APU (Radeon 8060S / 8050S / 8040S, "
+             "gfx1151: experimental, docs/STRIX_HALO.md)")
 
 
 def rocm_index(arch):
     return os.environ.get("STRATA_ROCM_INDEX") or ROCM_INDEXES[arch]
+
+
+# Strix Halo (Ryzen AI Max 380 / 385 / 390 / 395 + PRO: Radeon 8040S / 8050S / 8060S, RDNA 3.5, gfx1151) and the other
+# integrated Radeons it must never be taken for.  pci.ids lists ONE device id for the whole Strix Halo family
+# ("1586  Strix Halo [Radeon Graphics / Radeon 8050S Graphics / Radeon 8060S Graphics]"; the 8040S shares it: the
+# three differ by their CU count, 40 / 32 / 16, not by id).  Aurora's real answers (tools/test_setup_strix_halo.py):
+# KFD gfx_target_version 110501, vendor_id 4098, device_id 5510 (0x1586), simd_count 80.
+STRIX_HALO_ARCH = "gfx1151"
+STRIX_HALO_PCI_IDS = frozenset({0x1586})
+AMD_IGPU_PCI = {0x1586: "gfx1151",                                    # Strix Halo
+                0x150E: "gfx1150",                                    # Strix Point: Radeon 880M / 890M
+                0x1114: "gfx1152", 0x1902: "gfx1152",                 # Krackan Point (Krackan2): Radeon 840M / 860M
+                0x15BF: "gfx1103", 0x15C8: "gfx1103", 0x164F: "gfx1103",   # Phoenix: Radeon 740M / 760M / 780M
+                0x1900: "gfx1103", 0x1901: "gfx1103"}                 # Hawk Point
+STRIX_HALO_BY_SIMDS = {80: "8060S", 64: "8050S", 32: "8040S"}   # KFD simd_count (2 per CU): 40 / 32 / 16 CUs
+UMA_OS_LEFT_GB = 6             # the share of the unified memory kept for the OS: what the engine's device_free_bytes() leaves
+
+
+def gfx_arch_is(arch, name) -> bool:
+    """include/strata/kernels/gfx_arch.hpp's gfx_arch_is: `arch` (gcnArchName, "gfx1151" or "gfx1151:sramecc-:xnack-")
+    is exactly `name`, never a prefix: gfx1150 and gfx1152 are not gfx1151 (and gfx1151 is not gfx115)."""
+    arch = str(arch or "")
+    return arch == name or arch.startswith(name + ":")
+
+
+def is_strix_halo(g) -> bool:
+    return isinstance(g, dict) and gfx_arch_is(g.get("arch"), STRIX_HALO_ARCH)
+
+
+def amd_apply_uma(g: dict, gtt_gb: float = 0.0, ram: float | None = None) -> dict:
+    """Strix Halo is an APU with unified memory.  Its "dedicated VRAM" is a BIOS carve-out (512 MB to 96 GB; 2 GB on the
+    maintainers' box) and the GPU also reaches shared system memory (Linux: the GTT pool, `mem_info_gtt_total`, half the
+    RAM unless the kernel was told otherwise; Windows: "shared GPU memory", half the RAM).  The shared part IS the RAM
+    the model's experts live in, so it is not extra room beside the RAM.  g gets: uma, dedicated_gb (the carve-out: the
+    only part that adds to the RAM, which the low-RAM mode counts) and vram_gb = the memory the GPU can use in all
+    (the carve-out plus the shared pool less what the OS keeps), which sizes the context and the parallel slots."""
+    if g.get("uma") or not is_strix_halo(g):
+        return g
+    ram = ram_gb() if ram is None else ram
+    carve = max(0.0, float(g.get("vram_gb") or 0.0))
+    shared = gtt_gb if gtt_gb > 0 else ram / 2
+    shared = max(0.0, min(shared, ram - UMA_OS_LEFT_GB))
+    g.update({"uma": True, "dedicated_gb": carve, "shared_gb": shared, "vram_gb": carve + shared})
+    return g
+
+
+def low_ram_vram(g) -> float:
+    """The GPU memory the low-RAM mode may count as room beside the RAM: a discrete card's VRAM; an APU's BIOS
+    carve-out only (its shared memory is the RAM itself)."""
+    return g.get("dedicated_gb", 0.0) if g.get("uma") else g["vram_gb"]
+
+
+def amd_mem_text(g) -> str:
+    """How setup says a card's memory: "24 GB VRAM", or for an APU its unified memory."""
+    if g.get("uma"):
+        return (f"unified memory: {g['dedicated_gb']:.1f} GB BIOS carve-out + {g['shared_gb']:.0f} GB shared with the "
+                f"RAM, {g['vram_gb']:.0f} GB usable by the GPU")
+    return f"{g['vram_gb']:.0f} GB VRAM"
+
+
+STRIX_HALO_FAMILY, STRIX_HALO_MODEL = "unsloth", "UD-IQ4_XS"    # the model docs/STRIX_HALO.md measures
+STRIX_HALO_MIN_GB = 80         # UD-IQ4_XS keeps all of its experts in memory from ~80 GB (its menu line says so)
+
+
+def strix_halo_recommends(gpu, ram) -> bool:
+    """Is UD-IQ4_XS the recommended model here: a Strix Halo whose unified memory (the OS's RAM plus the BIOS carve-out)
+    holds it - the model docs/STRIX_HALO.md measures.  A recommendation only: the menus still list every size."""
+    return bool(gpu.get("uma")) and ram + gpu.get("dedicated_gb", 0.0) >= STRIX_HALO_MIN_GB
+
+
+def strix_halo_notes(gpu, ram) -> list[str]:
+    """What setup tells a Strix Halo owner (a leading "!" = a warning): the unified memory, the build, the guide, and the
+    memory settings that give the GPU room.  Nothing is changed or refused: recommend, never force."""
+    notes = [f"  Strix Halo (gfx1151, Ryzen AI Max): the CPU and the GPU share one memory pool ({ram:.0f} GB seen by the "
+             f"OS + a {gpu.get('dedicated_gb', 0.0):.1f} GB BIOS carve-out), so the model's experts live in that pool "
+             "and the expert cache is sized from the memory the OS can give back, not from the carve-out."]
+    notes.append("  " + ("The engine is compiled here for gfx1151" if not WIN else "Windows uses the ready-made AMD engine, "
+                                                                                     "which must be built for gfx1151")
+                 + " (experimental, measured on one machine): see docs/STRIX_HALO.md.")
+    if not WIN and gpu.get("shared_gb", 0) < 0.75 * ram - 1:
+        notes.append(f"!the GPU can reach {gpu.get('shared_gb', 0):.0f} GB of shared memory (the GTT pool; the kernel's "
+                     f"default is about half of the RAM). docs/STRIX_HALO.md boots with ttm.pages_limit and "
+                     "ttm.page_pool_size to give it most of the RAM; setup changes no host setting - a bigger model "
+                     "needs the room, a smaller one runs as it is")
+    if gpu.get("dedicated_gb", 0.0) > 16:
+        notes.append(f"!the BIOS carve-out is {gpu['dedicated_gb']:.0f} GB: that memory is taken from the OS, while the GPU "
+                     "reaches the shared memory anyway. A small carve-out (the BIOS's default or 512 MB - 2 GB) leaves "
+                     "the RAM to the model")
+    if strix_halo_recommends(gpu, ram):
+        notes.append(f"  Recommended model: {STRIX_HALO_MODEL} (the one docs/STRIX_HALO.md measures); the menus list the "
+                     "others.")
+    return notes
+
+
+def amd_rank(g):
+    """The order setup picks a card in, best first: a discrete card before an APU (its own GDDR is faster than the
+    shared LPDDR5X), then the most memory.  A Strix Halo beside a Radeon RX / PRO card is therefore left to --gpu N."""
+    return (bool(g.get("uma")), -round(g["vram_gb"]), g["index"])
+
+
+def amd_pci_devices(sysfs="/sys") -> list[dict]:
+    """The AMD (vendor 0x1002) display devices the kernel lists in /sys/class/drm/card*/device, as [{"pci_id",
+    "vram_gb", "gtt_gb", "arch"}] with the arch AMD_IGPU_PCI knows ("" when it does not).  The KFD topology answers the
+    same without ROCm; this one only names a card the topology does not list (a kernel without /dev/kfd)."""
+    found = []
+    base = Path(sysfs) / "class/drm"
+    if not base.is_dir():
+        return found
+    for card in sorted(base.glob("card[0-9]*")):
+        if not card.name[4:].isdigit():
+            continue
+        try:
+            dev = card / "device"
+            if int((dev / "vendor").read_text().strip(), 16) != 0x1002:
+                continue
+            did = int((dev / "device").read_text().strip(), 16)
+        except (OSError, ValueError):
+            continue
+        row = {"pci_id": did, "arch": AMD_IGPU_PCI.get(did, ""), "vram_gb": 0.0, "gtt_gb": 0.0}
+        for key, f in (("vram_gb", "mem_info_vram_total"), ("gtt_gb", "mem_info_gtt_total")):
+            try:
+                row[key] = int((dev / f).read_text()) / 2 ** 30
+            except (OSError, ValueError):
+                pass
+        found.append(row)
+    return found
 
 
 def amd_gpus(sysfs="/sys"):
@@ -1621,14 +1754,26 @@ def amd_gpus(sysfs="/sys"):
             name = f"AMD Radeon ({arch})"
         if name == f"AMD Radeon ({arch})" and arch in AMD_NAMES:
             name = AMD_NAMES[arch]
-        found.append({"index": len(found), "name": name, "vram_gb": vram, "arch": arch, "driver": "amdgpu",
-                      "vendor": "amd"})
+            if gfx_arch_is(arch, STRIX_HALO_ARCH) and int(props.get("simd_count") or 0) in STRIX_HALO_BY_SIMDS:
+                name = (f"AMD Radeon {STRIX_HALO_BY_SIMDS[int(props['simd_count'])]} "
+                        "(Ryzen AI Max, Strix Halo, gfx1151)")   # the CU count tells the 8060S / 8050S / 8040S apart
+        try:
+            gtt = int((dev / "mem_info_gtt_total").read_text()) / 2 ** 30
+        except (OSError, ValueError):
+            gtt = 0.0
+        g = {"index": len(found), "name": name, "vram_gb": vram, "arch": arch, "driver": "amdgpu", "vendor": "amd"}
+        try:
+            g["pci_id"] = int((dev / "device").read_text().strip(), 16)
+        except (OSError, ValueError):
+            pass
+        found.append(amd_apply_uma(g, gtt))            # Strix Halo: unified memory (carve-out + shared)
     return found
 
 
 def amd_problem(g):
     if g["arch"] not in AMD_ARCHS:
-        return f"not supported - Strata's AMD backend runs on {AMD_CARDS} only, this is {g['arch']}"
+        return (f"not supported - Strata's AMD backend runs on {AMD_CARDS} only, this is {g['arch']}"
+                + (" (an integrated Radeon, not Strix Halo)" if g["arch"] in ("gfx1150", "gfx1152", "gfx1103") else ""))
     if g.get("cannot_run"):                            # Windows: the installed engine's own check (--list-devices)
         return g["cannot_run"]
     return None
@@ -1637,7 +1782,18 @@ def amd_problem(g):
 def amd_gpus_win() -> list[dict]:
     """Windows: the AMD GPUs as the HIP runtime numbers them once the HIP engine is installed (hip_devices), else in
     the display-adapter order (amd_gpus_windows)."""
-    return hip_devices() or amd_gpus_windows()
+    hip = hip_devices()
+    if not hip:
+        return amd_gpus_windows()
+    halo = [g for g in hip if is_strix_halo(g)]
+    if halo:                                           # an APU: the HIP runtime's figure is not the BIOS carve-out
+        reg = [r for r in amd_gpus_windows() if is_strix_halo(r)]
+        for k, g in enumerate(halo):
+            reported = g["vram_gb"]
+            g["vram_gb"] = reg[k]["dedicated_gb"] if k < len(reg) else 0.0
+            amd_apply_uma(g)
+            g["vram_gb"] = max(g["vram_gb"], reported)
+    return hip
 
 
 def amd_parse_gpus(text, amd) -> list:
@@ -1646,7 +1802,7 @@ def amd_parse_gpus(text, amd) -> list:
     architectures: the engine is compiled for each).  Returns the cards, the main one first."""
     usable = [g for g in amd if amd_problem(g) is None]
     if str(text).strip().lower() == "all":
-        sel = [g["index"] for g in sorted(usable, key=lambda x: (-round(x["vram_gb"]), x["index"]))]
+        sel = [g["index"] for g in sorted(usable, key=amd_rank)]
     else:
         try:
             sel = [int(x) for x in str(text).split(",") if x.strip()]
@@ -1684,8 +1840,13 @@ _WIN_AMD_DID = {0x744C: "gfx1100", 0x7448: "gfx1100", 0x745E: "gfx1100",        
                 0x7590: "gfx1200",                                                  # RX 9060 XT
                 0x7550: "gfx1201", 0x7551: "gfx1201",                               # RX 9070 / 9070 XT, AI PRO R9700
                 0x73BF: "gfx1030", 0x73AF: "gfx1030", 0x73A5: "gfx1030",            # RX 6800 / 6800 XT / 6900 XT / 6950 XT
-                0x73DF: "gfx1031"}                                                  # RX 6700 XT / 6750 XT / 6800M (#881)
-_WIN_AMD_NAME = ((re.compile(r"\b9070\b|R9700", re.I), "gfx1201"),
+                0x73DF: "gfx1031",                                                  # RX 6700 XT / 6750 XT / 6800M (#881)
+                **AMD_IGPU_PCI}                                                     # Ryzen APUs: 0x1586 = Strix Halo (gfx1151)
+_WIN_AMD_NAME = ((re.compile(r"\b80[456]0S\b", re.I), "gfx1151"),                   # Radeon 8060S / 8050S / 8040S
+                 (re.compile(r"\b8[89]0M\b", re.I), "gfx1150"),                     # Radeon 890M / 880M
+                 (re.compile(r"\b8[46]0M\b", re.I), "gfx1152"),                     # Radeon 860M / 840M
+                 (re.compile(r"\b7[468]0M\b", re.I), "gfx1103"),                    # Radeon 780M / 760M / 740M
+                 (re.compile(r"\b9070\b|R9700", re.I), "gfx1201"),
                  (re.compile(r"\b9060\b", re.I), "gfx1200"),
                  (re.compile(r"RX\s*7900|W7900|W7800", re.I), "gfx1100"),
                  (re.compile(r"RX\s*7800|RX\s*7700(?!\s*S)|W7700", re.I), "gfx1101"),
@@ -1785,8 +1946,9 @@ def amd_gpus_windows(adapters=None, registry=None) -> list[dict]:
             vram = ad["ram"] / 2 ** 30                 # WMI's 32-bit figure (at most 4 GB)
         arch = win_amd_arch(did, ad.get("name", ""))
         name = ad.get("name") or AMD_NAMES.get(arch, f"AMD Radeon (device {did:04X})")
-        found.append({"index": len(found), "name": name, "vram_gb": vram, "arch": arch or f"unknown (PCI {did:04X})",
-                      "driver": driver or "amd", "vendor": "amd"})
+        g = {"index": len(found), "name": name, "vram_gb": vram, "arch": arch or f"unknown (PCI {did:04X})",
+             "driver": driver or "amd", "vendor": "amd", "pci_id": did}
+        found.append(amd_apply_uma(g))                 # Strix Halo: the registry's figure is the BIOS carve-out only
     return found
 
 
@@ -1895,7 +2057,8 @@ def hip_card(eng: Path, gpu: dict, listed: list[dict]) -> dict:
         fail(f"HIP device {m['index']} ({m['name']}) cannot be used: {amd_problem(m)}")
     if gpu.get("driver") != "hip" and m["index"] != gpu["index"]:
         ok(f"HIP numbers this card {m['index']} (an integrated GPU comes first): the engine is pointed at it")
-    return {**gpu, "index": m["index"], "count": len(hip), "vram_gb": m["vram_gb"] or gpu["vram_gb"], "driver": "hip"}
+    vram = gpu["vram_gb"] if gpu.get("uma") else (m["vram_gb"] or gpu["vram_gb"])   # an APU: not the runtime's figure
+    return {**gpu, "index": m["index"], "count": len(hip), "vram_gb": vram, "driver": "hip"}
 
 
 def get_prebuilt_hip(url_base, gpu, updating=False) -> Path | None:
@@ -1950,6 +2113,12 @@ def get_prebuilt_hip(url_base, gpu, updating=False) -> Path | None:
     elif gpu["arch"] not in meta.get("archs", []):
         why = (f"it is built for {', '.join(meta.get('archs', []))}; your GPU is {gpu['arch']}.  A card it has no code "
                "for runs from a self-build of the engine: see docs/AMD_HIP.md (--build)")   # #881
+        if is_strix_halo(gpu):                         # never a zip without gfx1151 code: say so, and what to do
+            why = (f"it is built for {', '.join(meta.get('archs', [])) or 'other GPUs'} and has no gfx1151 code: your "
+                   f"{gpu['name']} (Strix Halo) needs a ready-made engine from Strata 0.1.40 or newer, whose zip is "
+                   "built for gfx1151 too.  Until then: the Linux guide docs/STRIX_HALO.md, or compile the engine "
+                   "here with tools\\hip\\build_windows.bat (its default list has gfx1151) and start setup with "
+                   "--prebuilt <its dist folder>")
     if why:
         warn(f"the ready-made AMD engine at {base} cannot be used: {why}")
         shutil.rmtree(tmp, ignore_errors=True)
@@ -3238,7 +3407,7 @@ def engine_version(exe: Path) -> tuple:
     v = str(meta.get("version") or "")
     if not v:                                          # the version compiled into the binary: 0.1.13 and newer
         try:                                           # carry it, so a binary without it is older
-            m = re.search(rb"engine=(\d+\.\d+\.\d+)\n", Path(exe).read_bytes())
+            m = re.search(rb"engine=(\d+\.\d+\.\d+)(?:\.\d+)?\n", Path(exe).read_bytes())
             v = m.group(1).decode() if m else "0.1.12"
         except OSError:
             v = "0"
@@ -3273,7 +3442,7 @@ def hip_config_cards(sel) -> list[dict]:
     amd = amd_gpus()
     if sel is None:
         usable = [g for g in amd if amd_problem(g) is None]
-        sel = max(usable, key=lambda x: (round(x["vram_gb"]), -x["index"]))["index"] if usable else None
+        sel = min(usable, key=amd_rank)["index"] if usable else None
     byid = {g["index"]: g for g in amd}
     cards = []
     for i in (sel if isinstance(sel, list) else [sel]):
@@ -4152,7 +4321,8 @@ def main() -> int:
         say("  This PC has NVIDIA and AMD cards Strata can use:")
         say("  1) NVIDIA: " + ", ".join(f"{g['name']} ({g['vram_gb']:.0f} GB)" for g in found if gpu_problem(g) is None)
             + "   (recommended)")
-        say("  2) AMD: " + ", ".join(f"{g['name']} ({g['vram_gb']:.0f} GB)" for g in amd_ok)
+        say("  2) AMD: " + ", ".join(f"{g['name']} ({g['vram_gb']:.0f} GB{', unified memory' if g.get('uma') else ''})"
+                               for g in amd_ok)
             + f"   ({'the ready-made AMD engine, no images' if WIN else 'compiled here, images on the CPU'}"
               " - docs/AMD_HIP.md)")
         hip = ask("Which cards?", ["1", "2"], "1", a.yes or a.check) == "2"
@@ -4165,8 +4335,14 @@ def main() -> int:
         say("  Your AMD GPUs:" if amd else "  No AMD GPU found (" + ("Windows lists no AMD display adapter)." if WIN
                                                                    else "the amdgpu driver's KFD topology is empty)."))
         for g in amd:
-            say(f"    GPU {g['index']}: {g['name']}, {g['vram_gb']:.0f} GB VRAM - " + (amd_problem(g) or "can be used"))
+            say(f"    GPU {g['index']}: {g['name']}, {amd_mem_text(g)} - " + (amd_problem(g) or "can be used"))
         usable = [g for g in amd if amd_problem(g) is None]
+        if not amd and not WIN:                        # the KFD topology is empty: name a Strix Halo the kernel sees
+            for d in amd_pci_devices():
+                if d["pci_id"] in STRIX_HALO_PCI_IDS:
+                    say(f"    The kernel lists an AMD Strix Halo (PCI 1002:{d['pci_id']:04x}) but /dev/kfd's topology is "
+                        "empty: ROCm cannot use it yet (docs/STRIX_HALO.md: the amdgpu driver and /dev/kfd access, "
+                        "your user in the render and video groups)")
         if not usable:
             fail("no AMD GPU Strata can use", f"the AMD backend runs on {AMD_CARDS}")
         if a.gpus:                                     # a layer split across these cards, the first one the main
@@ -4178,8 +4354,13 @@ def main() -> int:
                 fail(f"AMD GPU {a.gpu} cannot be used", "use one of: " + ", ".join(f"--gpu {g['index']}" for g in usable))
             chosen = [gpu]
         else:
-            gpu = max(usable, key=lambda x: (round(x["vram_gb"]), -x["index"]))
+            gpu = min(usable, key=amd_rank)            # a discrete card before an APU, then the most memory
             chosen = [gpu]
+            if len(usable) > 1 and any(g.get("uma") for g in usable) != all(g.get("uma") for g in usable):
+                others = [g for g in usable if g is not gpu]
+                say(f"  Using GPU {gpu['index']} ({gpu['name']}); setup recommends the card with its own memory over "
+                    "the APU's shared memory. To use another: "
+                    + ", ".join(f"--gpu {g['index']} ({g['name']})" for g in others))
         # the engine is compiled for every chosen card's architecture
         gpu = {**gpu, "count": len(amd), "archs": sorted({g["arch"] for g in chosen})}
         chosen = [gpu] + chosen[1:]
@@ -4188,7 +4369,11 @@ def main() -> int:
         a.gpu = gpu["index"] if len(amd) > 1 else a.gpu
         if multi:
             ok("GPUs: " + " + ".join(gpu_name(x) for x in chosen) + " together (the model's layers are split across them)")
-        ok(f"GPU: {gpu['name']}, {gpu['vram_gb']:.1f} GB VRAM, {gpu['arch']} (AMD: docs/AMD_HIP.md)")
+        ok(f"GPU: {gpu['name']}, {amd_mem_text(gpu) if gpu.get('uma') else format(gpu['vram_gb'], '.1f') + ' GB VRAM'}, "
+           f"{gpu['arch']} (AMD: docs/{'STRIX_HALO' if gpu.get('uma') else 'AMD_HIP'}.md)")
+        if gpu.get("uma"):
+            for line in strix_halo_notes(gpu, ram_gb()):
+                (warn if line.startswith("!") else say)(line.lstrip("!"))
     else:
         if not found:
             fail("no NVIDIA GPU found (nvidia-smi did not answer)",
@@ -4216,11 +4401,12 @@ def main() -> int:
                  ("" if cuda_tk == 12 else f" (or --cuda 12: the experimental CUDA 12 engine runs with driver "
                                            f"{CUDA12_MIN_DRIVER} or newer, docs/OLDER_GPUS.md)"))
     if gpu["vram_gb"] < 11:
-        warn("less than 12 GB of VRAM: Strata will run, but most experts stay on the CPU and it will be slow")
+        warn("less than 12 GB of " + ("GPU memory (this APU's carve-out + shared memory)" if gpu.get("uma") else "VRAM")
+             + ": Strata will run, but most experts stay on the CPU and it will be slow")
     ram = ram_gb()
     cpu, avx2, avx512 = cpu_info()
     need = min(d["ram_gb"] for d in MODELS.values())
-    low_ok = low_ram_fits("IQ1_M", ram, gpu["vram_gb"]) and a.low_ram != "off"   # the smallest model, mapped
+    low_ok = low_ram_fits("IQ1_M", ram, low_ram_vram(gpu)) and a.low_ram != "off"   # the smallest model, mapped
     if ram < need - 4 and not a.check and not low_ok:
         # every model keeps ALL its experts in RAM (23+ GB); VRAM only holds a copy of the most-used ones, so a
         # bigger GPU does not lower this.  The owner's rule: a stop by default, a risk the user can take (--model
@@ -4268,9 +4454,9 @@ def main() -> int:
                            "read from the SSD" if ram >= d["ram_gb"] else "does not fit")
                 if hip:                                # #429: not run on AMD yet (its prompt kernels are CUDA-only)
                     verdict += " - NVIDIA only so far, untested on AMD"
-            elif low_ram_needed(m, ram) and low_ram_fits(m, ram, gpu["vram_gb"]) and a.low_ram != "off":
-                verdict = (f"fits in the low-RAM mode (the GPU holds ~{100 * low_ram_gpu_share(m, gpu['vram_gb']):.0f}% "
-                           "of its experts, " + ("the rest stays in RAM)" if low_ram_resident(m, ram, gpu["vram_gb"])
+            elif low_ram_needed(m, ram) and low_ram_fits(m, ram, low_ram_vram(gpu)) and a.low_ram != "off":
+                verdict = (f"fits in the low-RAM mode (the GPU holds ~{100 * low_ram_gpu_share(m, low_ram_vram(gpu)):.0f}% "
+                           "of its experts, " + ("the rest stays in RAM)" if low_ram_resident(m, ram, low_ram_vram(gpu))
                                                  else "the rest is read from the SSD as needed)"))
             any_fits = any_fits or not verdict.startswith("does not fit")
             say(f"  {m:8s} needs ~{d['ram_gb']} GB RAM: {verdict}")
@@ -4289,10 +4475,13 @@ def main() -> int:
     if a.family:
         family = a.family
     else:
+        rec_fam = STRIX_HALO_FAMILY if strix_halo_recommends(gpu, ram) and STRIX_HALO_FAMILY in fams else fams[0]
         for i, f in enumerate(fams, 1):
             d = FAMILIES[f]
-            say(f"  {i}) {d['title']:20s} {d['by']} - {d['about']}" + ("   [experimental]" if d.get("experimental") else ""))
-        family = fams[int(ask("Which model?", [str(i) for i in range(1, len(fams) + 1)], "1", a.yes)) - 1]
+            say(f"  {i}) {d['title']:20s} {d['by']} - {d['about']}" + ("   [experimental]" if d.get("experimental") else "")
+                + (f"   (recommended for Strix Halo: {STRIX_HALO_MODEL})" if f == rec_fam and rec_fam != fams[0] else ""))
+        family = fams[int(ask("Which model?", [str(i) for i in range(1, len(fams) + 1)],
+                              str(fams.index(rec_fam) + 1), a.yes)) - 1]
     fam = FAMILIES[family]
     ok(f"model: {fam['title']}")
     if fam.get("license"):
@@ -4314,9 +4503,9 @@ def main() -> int:
             say(f"  {i}) {m} {d['about']}; download {d['download_gb']:.0f} GB, keeps ~"
                 f"{resident_budget_gib(m, ram)} GB of its {d['arena_gb']:.0f} GB of experts in RAM{fit}")
             continue
-        if low_ram_needed(m, ram) and low_ram_fits(m, ram, gpu["vram_gb"]) and a.low_ram != "off":
-            fit = (f"   <- fits in the low-RAM mode (the GPU holds ~{100 * low_ram_gpu_share(m, gpu['vram_gb']):.0f}%, "
-                   + ("the rest in RAM)" if low_ram_resident(m, ram, gpu["vram_gb"]) else "the rest from the SSD)"))
+        if low_ram_needed(m, ram) and low_ram_fits(m, ram, low_ram_vram(gpu)) and a.low_ram != "off":
+            fit = (f"   <- fits in the low-RAM mode (the GPU holds ~{100 * low_ram_gpu_share(m, low_ram_vram(gpu)):.0f}%, "
+                   + ("the rest in RAM)" if low_ram_resident(m, ram, low_ram_vram(gpu)) else "the rest from the SSD)"))
         say(f"  {i}) {m:8s} {d['about']}; download {d['download_gb']:.0f} GB, uses ~{d['arena_gb']:.0f} GB of RAM{fit}")
     rec = str(names.index("IQ3_XXS") + 1) if ram >= 60 and "IQ3_XXS" in names else "1"
     model = a.model or names[int(ask("Which size?", [str(i) for i in range(1, len(names) + 1)], rec, a.yes)) - 1]
@@ -4452,13 +4641,13 @@ def main() -> int:
     resident = False
     if low_ram:
         arena = MODELS[model]["arena_gb"]
-        vram = gpu["vram_gb"] - (VISION[vision]["reserve_mib"] / 1024 if vision != "none" else 0)
+        vram = low_ram_vram(gpu) - (VISION[vision]["reserve_mib"] / 1024 if vision != "none" else 0)
         share = low_ram_gpu_share(model, vram, ctx, kv)
         rest = arena - low_ram_gpu_gb(model, vram, ctx, kv)
         resident = a.low_ram == "resident" or (a.low_ram != "mmap" and low_ram_resident(model, ram, vram, ctx, kv))
         if multi:      # every chosen card's share (the image encoder on the main one); #364 #384: the mapped variant
             held = min(arena, low_ram_gpu_gb(model, vram, ctx, kv) +
-                       sum(low_ram_gpu_gb(model, x["vram_gb"], ctx, kv) for x in chosen[1:]))
+                       sum(low_ram_gpu_gb(model, low_ram_vram(x), ctx, kv) for x in chosen[1:]))
             share, rest = held / arena, arena - held
             # #642: the resident variant on a split, by the same rule as on one card - what no card holds fits the RAM
             resident = resident_split() and (a.low_ram == "resident" or

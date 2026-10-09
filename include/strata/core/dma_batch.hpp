@@ -107,19 +107,19 @@ inline cudaError_t copy_blobs(void* const* dst, const void* const* src, const si
 inline cudaError_t copy_expert_blobs(uint8_t* dst, const uint8_t* const* src, int n, size_t bytes,
                                      cudaStream_t stream, int batch_mode) {
     if (n <= 0) return cudaSuccess;
-    constexpr int cap = 128;
-    if (batch_mode == 0 || n > cap) {   // the old loop, with no staging of its own
+    constexpr size_t cap = 128;
+    if (batch_mode == 0 || (size_t) n > cap) {   // the old loop, with no staging of its own
         for (int i = 0; i < n; ++i) {
             const cudaError_t e = cudaMemcpyAsync(dst + (size_t) i * bytes, src[i], bytes, cudaMemcpyHostToDevice, stream);
             if (e != cudaSuccess) return e;
         }
         return cudaSuccess;
     }
-    std::array<void*, cap> d{};
-    std::array<const void*, cap> s{};
-    std::array<size_t, cap> b{};
+    void* d[cap] = {};   // plain arrays: nvcc on Linux (13.0, g++) rejects std::array<T, cap> here ("template argument 2 is invalid")
+    const void* s[cap] = {};
+    size_t b[cap] = {};
     for (int i = 0; i < n; ++i) { d[i] = dst + (size_t) i * bytes; s[i] = src[i]; b[i] = bytes; }
-    return copy_blobs(d.data(), s.data(), b.data(), (size_t) n, stream, batch_mode);
+    return copy_blobs(d, s, b, (size_t) n, stream, batch_mode);
 }
 
 }  // namespace strata::core

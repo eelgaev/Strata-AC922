@@ -4,7 +4,9 @@
 
 #include <cuda_runtime.h>
 
+#include <chrono>
 #include <cstdio>
+#include <thread>
 #include <vector>
 
 using strata::core::VmmChunk;
@@ -30,7 +32,10 @@ int main() {
     std::vector<uint8_t> h(6 * G), back(6 * G);
     for (size_t i = 0; i < h.size(); ++i) h[i] = (uint8_t) (i * 2654435761u >> 13);
     CHECK(cudaMemcpy(a.base(), h.data(), h.size(), cudaMemcpyHostToDevice) == cudaSuccess);
-    // chunks 4 and 5 move to b's chunks 1 and 0
+    // chunks 4 and 5 move to b's chunks 1 and 0. The host-to-device copy above may still be in flight (a pageable
+    // cudaMemcpy returns once the data is staged), and a chunk unmapped under a copy faults it (an illegal memory access
+    // that sticks to every later call), so the device is drained first, as generate.cpp does before it unmaps
+    CHECK(cudaDeviceSynchronize() == cudaSuccess);
     const VmmChunk c4 = a.unmap(4), c5 = a.unmap(5);
     CHECK(c4 != 0 && c5 != 0 && !a.mapped(4) && a.unmap(4) == 0);
     std::vector<VmmChunk> give = {c4, c5};   // map_range takes them from the back: chunk 0 <- c5, chunk 1 <- c4
@@ -54,7 +59,11 @@ int main() {
     cudaMemGetInfo(&f0, &t);
     a.release();
     b.release();
-    cudaMemGetInfo(&f1, &t);
+    for (int i = 0; i < 20; ++i) {   // the free-memory counter may lag a release by a moment on Windows (WDDM)
+        cudaMemGetInfo(&f1, &t);
+        if (f1 >= f0 + 8 * G) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
     CHECK(f1 >= f0 + 8 * G);   // 7 + 2 chunks went back (the driver may round)
     CHECK(cudaGetLastError() == cudaSuccess);
     std::printf("vmm_test: %s\n", fails ? "FAILED" : "ok");

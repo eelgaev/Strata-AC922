@@ -118,7 +118,10 @@ def main() -> int:
     for f in (rbin / "rocblas" / "library").iterdir():
         m = re.search(r"gfx[0-9a-f]+", f.name)
         if m is None or m.group() in archs:
-            shutil.copy2(f, lib / f.name)
+            if f.is_dir():                                # the gfx1151 wheel keeps its rocBLAS kernels in library/gfx1151/
+                shutil.copytree(f, lib / f.name)
+            else:
+                shutil.copy2(f, lib / f.name)
     for arch in archs:
         src = rbin / "hipblaslt" / "library" / arch
         if src.is_dir():                                  # hipBLASLt has no RDNA2 (gfx1030) kernels

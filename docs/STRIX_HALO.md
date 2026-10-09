@@ -3,8 +3,12 @@
 Strata runs on the Ryzen AI Max "Strix Halo" APUs (Radeon 8060S / 8050S, RDNA3.5, `gfx1151`, one pool of LPDDR5X shared by the
 CPU and the GPU) through the same HIP backend as the Radeon cards in [AMD_HIP.md](AMD_HIP.md). **Status: experimental.**
 Everything here was built and measured on one machine, the maintainers' Strix Halo box (Ryzen AI Max+ 395, 128 GB,
-Ubuntu 26.04, kernel 7.0, ROCm 7.14.1). There is no ready-made engine for it and setup (`setup.sh`) does not offer it:
-it lists integrated Radeon GPUs as not supported. You build the engine yourself, as below.
+Ubuntu 26.04, kernel 7.0, ROCm 7.14.1). Setup (`setup.sh`, `START-HERE.bat`) recognizes it from 0.1.40, by its PCI id (`1002:1586`, one id for the 8060S, 8050S and 8040S) and by
+`gfx1151` exactly: a Strix Point (890M / 880M, gfx1150), Krackan (860M / 840M, gfx1152) or Phoenix / Hawk Point (780M / 760M, gfx1103) Radeon is
+named as what it is and not supported. On Linux setup compiles the engine for gfx1151 itself (the steps below are the same, by hand). On
+Windows the ready-made `strata-windows-x64-hip.zip` carries gfx1151 code from 0.1.40 (untested on a Windows Strix Halo so far); a zip
+without it is refused with a message, never used. Setup counts the GPU's memory as the BIOS carve-out plus the shared memory
+(the GTT pool; on Windows half the RAM) and recommends UD-IQ4_XS from about 80 GB of memory; it changes no BIOS or kernel setting.
 
 What the engine does differently on this chip:
 
