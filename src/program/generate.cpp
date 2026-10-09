@@ -544,6 +544,8 @@ struct Options {
     /// The --batch slots in this many groups pipelined through the stages of a layer split (stage k
     /// runs one group while stage k+1 runs another).  1 = every slot in one window, stage after stage.
     int batch_groups = 1;
+    bool batch_groups_set = false;    ///< --batch-groups was given (a number or auto): no default then
+    bool batch_groups_auto = false;   ///< --batch-groups auto (#417 stage 1): one group per stage of a layer split, if it divides --batch
     bool batch_mtp = false;      ///< --batch-mtp / STRATA_BATCH_MTP=1 (opt-in): one MTP proposal per batch slot
     std::string spec_oracle;
     int spec_corrupt = 0;
@@ -1081,6 +1083,37 @@ MemSample mem_sample() {
 }
 
 // the stage the watchdog names: "<where> <detail>", and the prompt chunk a batched read is in (#251)
+// #1407: the file tier's activity as the OS counts it (Linux: major page faults and bytes read from storage). The #29
+// watchdog treats a growing count as "the step is slow, not stuck": a prompt layer whose experts are re-read from the
+// pack (low RAM, mmap experts) can take minutes while the heartbeat stands still. Zero where unavailable.
+static uint64_t file_tier_activity() {
+#if defined(__linux__)
+    uint64_t total = 0;
+    if (FILE* f = std::fopen("/proc/self/stat", "r")) {
+        char buf[1024] = {};
+        const size_t n = std::fread(buf, 1, sizeof(buf) - 1, f);
+        std::fclose(f);
+        const char* p = std::strrchr(buf, ')');
+        if (p != nullptr && n > 0) {
+            // after "(comm)": state ppid pgrp session tty tpgid flags minflt cminflt majflt
+            unsigned long long majflt = 0;
+            if (std::sscanf(p + 2, "%*c %*d %*d %*d %*d %*d %*u %*u %*u %llu", &majflt) == 1) total += majflt;
+        }
+    }
+    if (FILE* f = std::fopen("/proc/self/io", "r")) {
+        char line[256];
+        while (std::fgets(line, sizeof(line), f) != nullptr) {
+            unsigned long long v = 0;
+            if (std::sscanf(line, "read_bytes: %llu", &v) == 1) total += v >> 20;   // MiB
+        }
+        std::fclose(f);
+    }
+    return total;
+#else
+    return 0;
+#endif
+}
+
 std::string stage_text() {
     const strata::core::Progress& p = strata::core::progress();
     std::string s = std::string(p.where.load()) + " " + std::to_string((long long) p.detail.load());
@@ -1826,7 +1859,12 @@ int main(int argc, char** argv) {
         else if (a == "--batch") o.batch = std::atoi(next("--batch"));
         else if (a == "--slots") o.batch = std::atoi(next("--slots"));   // the same as --batch
         else if (a == "--trim-stage-weights") o.trim_stage_weights = true;
-        else if (a == "--batch-groups") o.batch_groups = std::atoi(next("--batch-groups"));
+        else if (a == "--batch-groups") {
+            const char* bgv = next("--batch-groups");
+            o.batch_groups_set = true;
+            if (std::strcmp(bgv, "auto") == 0) o.batch_groups_auto = true;
+            else o.batch_groups = std::atoi(bgv);
+        }
         else if (a == "--batch-mtp") o.batch_mtp = true;
         else if (a == "--spec-oracle") o.spec_oracle = next("--spec-oracle");
         else if (a == "--spec-corrupt") o.spec_corrupt = std::atoi(next("--spec-corrupt"));
@@ -3261,6 +3299,12 @@ int main(int argc, char** argv) {
     //   - an expert no cache holds costs ~190 ms per unit of routed mass: the CPU pool in decode and the PCIe stream
     //     in prompts (fitted: the sweep's best K, 26-28, is where one more layer on the faster card stops paying
     //     for the ~0.1% of the mass it pushes out of its cache);
+    //     SCALED PER STAGE BY ITS PROBED LINK against the 20 GB/s x16 reference (pcie_frac_for_gbps' rule): the
+    //     prompt path fetches a missed expert over ITS stage's link, so a stage on a narrow link pays
+    //     proportionally more per missed unit.  Without this the search is blind to asymmetric cards:
+    //     2026-10-04, 2x 4090 D with CUDA1 on a physical x1 link (1.6 GB/s), auto chose K=22 and read prompts
+    //     at ~350 tok/s; with the scale (x12 on CUDA1) it chooses the fit-in-cache boundary K=38: ~1400 tok/s.
+    //     With every scale 1.0 the objective is the formula the 190 ms was fitted with (unchanged).
     //   - which experts a cache holds: its layers' profiled pairs, hottest first, until its free VRAM (less the
     //     reserve, the prompt path's buffers and, on a later GPU, 1 GiB for its windows and the drafter) is used;
     //     the routed mass a cache holds follows the COVERAGE CURVE below, not the (r+1)^-1.2 this used to use.
@@ -3381,6 +3425,20 @@ int main(int argc, char** argv) {
                                  "%.2f GiB free before its session carve\n", dev, sms, khz / 1e6, layer_ms[(size_t) i],
                          (double) cap[(size_t) i] / 1073741824.0);
         }
+        // The per-stage link, measured here (the stage-setup probes are skipped when --pcie-frac is given, and the
+        // search needs the reading either way).
+        std::vector<double> link_scale((size_t) ns, 1.0);
+        for (int i = 0; i < ns; ++i) {
+            const int dev = i == 0 ? 0 : stages[(size_t) i - 1]->dev;
+            const strata::core::OnDevice on(dev);
+            std::string bursts;
+            const double bw = native_pack ? probe_pcie_h2d_gbps(&bursts) : -1.0;
+            // Never below 1.0: a link at or above the 20 GB/s reference keeps the fitted cost exactly (a x16
+            // gen4/5 reads 26-28 and must not credit misses below the formula the sweep's K was fitted with).
+            if (bw > 0.0) link_scale[(size_t) i] = std::clamp(20.0 / bw, 1.0, 64.0);
+            std::fprintf(stderr, "strata generate: layer split auto: CUDA%d link %.1f GB/s -> miss cost x%.2f\n",
+                         dev, bw, link_scale[(size_t) i]);
+        }
         const double miss_ms = std::getenv("STRATA_SPLIT_MISS_MS") ? std::atof(std::getenv("STRATA_SPLIT_MISS_MS")) : 190.0;
         // ---- THE COVERAGE CURVE: HOW MUCH ROUTED MASS A CACHE HOLDS, AND WHY IT IS NO LONGER A POWER LAW.
         //
@@ -3450,20 +3508,27 @@ int main(int argc, char** argv) {
             std::fill(held_cnt.begin(), held_cnt.end(), 0);
             held_mass = 0;
             held = 0;
+            std::vector<double> mass_i((size_t) ns, 0.0), held_i((size_t) ns, 0.0);
             std::vector<bool> full((size_t) ns, false);
             for (size_t r = 0; r < profile.size(); ++r) {
                 const int64_t l = profile[r].first;
                 int st = 0;
                 while (st + 1 < ns && l >= at[(size_t) st]) ++st;
+                mass_i[(size_t) st] += mass[r];
                 if (full[(size_t) st]) continue;
                 if (used[(size_t) st] + cost(l) > capr[(size_t) st]) { full[(size_t) st] = true; continue; }   // as the fill
                 used[(size_t) st] += cost(l);
                 held_mass += mass[r];
+                held_i[(size_t) st] += mass[r];
                 ++held;
                 ++held_cnt[(size_t) st];
             }
             held_mass /= std::max(total_mass, 1e-9);
-            double ms = miss_ms * (1.0 - held_mass);
+            // Each stage's misses on its own link (link_scale; 1.0 everywhere = the fitted single-constant formula).
+            double ms = 0.0;
+            for (int i = 0; i < ns; ++i)
+                ms += miss_ms * link_scale[(size_t) i] * std::max(0.0, mass_i[(size_t) i] - held_i[(size_t) i]) /
+                      std::max(total_mass, 1e-9);
             for (int i = 0; i < ns; ++i) {
                 const int64_t lb = i == 0 ? 0 : at[(size_t) i - 1], le = i + 1 < ns ? at[(size_t) i] : g.n_layers;
                 ms += (double) (le - lb) * layer_ms[(size_t) i];
@@ -3950,6 +4015,21 @@ int main(int argc, char** argv) {
             o.batch = cap;
         }
     }
+    // --batch-groups auto: the pipeline needs one group per GPU stage to keep every card busy (4 x R9700, 8 clients:
+    // 90 tok/s in one group, 136 in 2, 166 in 4).  The most groups, at most one per stage, that divide the slots.
+    auto resolve_groups_auto = [&] {
+        // default (0.1.41): a layer split with --batch pipelines one group per stage; --batch-groups 1 opts out
+        if (!o.batch_groups_set && !stages.empty() && o.batch > 1) o.batch_groups_auto = true;
+        if (!o.batch_groups_auto) return;
+        int best = 1;
+        for (int d = 2; d <= (int) stages.size() + 1 && d <= o.batch; ++d)
+            if (o.batch % d == 0) best = d;
+        if (stages.empty()) best = 1;
+        o.batch_groups = best;
+        std::fprintf(stderr, "strata generate: --batch-groups auto: %d group%s of %d slot%s\n", best, best == 1 ? "" : "s",
+                     o.batch / best, o.batch / best == 1 ? "" : "s");
+    };
+    if (o.batch > 0) resolve_groups_auto();
     if (o.batch > 0 && o.batch_groups > 1 && (stages.empty() || o.batch % o.batch_groups != 0)) {
         std::fprintf(stderr, "strata generate: WARNING: --batch-groups %d needs a layer split and to divide --batch %d; "
                              "one group\n", o.batch_groups, o.batch);
@@ -3997,6 +4077,7 @@ int main(int argc, char** argv) {
             o.batch = 0;
         } else {
             o.batch = fit;
+            resolve_groups_auto();   // (the slots that fit may not be the ones asked for)
             if (o.batch_groups > 1 && o.batch % o.batch_groups != 0) o.batch_groups = 1;
             // the sessions' VRAM is the expert cache's: say what it costs (docs/BATCHING.md has the measured trade)
             std::fprintf(stderr, "strata generate: --batch %d: the slot sessions take %.2f GiB of VRAM on CUDA0 that the "
@@ -8223,7 +8304,8 @@ int main(int argc, char** argv) {
                         o.spec_min_p, (long long) o.conversation_cache_mib, o.conversation_cache_slots,
                         (long long) o.conversation_cache_min_free_mib, (long long) o.tail_role_token, xcache.segmented() ? 1 : 0,
                         o.batch > 0 ? (" batch_slots=" + std::to_string(o.batch) +
-                                       " slot_cache=" + std::to_string(o.prompt_cache > 0 ? 1 : 0)).c_str() : "");
+                                       " slot_cache=" + std::to_string(o.prompt_cache > 0 ? 1 : 0) +
+                                       " batch_groups=" + std::to_string(o.batch_groups)).c_str() : "");
         }
         // issue #29: a request whose heartbeat (tokens, prompt chunks, verify windows) stops for this long is stuck on
         // a flag nobody will raise - end the engine with where it was, so the server starts it again instead of the
@@ -8232,17 +8314,38 @@ int main(int argc, char** argv) {
         {
             const char* ws = std::getenv("STRATA_WATCHDOG_S");
             const int limit = ws ? std::atoi(ws) : 60;   // one step (a prompt layer, a verify window) takes seconds
+            // #1407: while the OS is still reading the file tier (major faults / bytes read advance), a silent step is
+            // slow, not stuck; it gets up to STRATA_WATCHDOG_IO_S (default 10 x the limit) of such time. 0 = no allowance.
+            const char* wio = std::getenv("STRATA_WATCHDOG_IO_S");
+            const int io_limit = wio ? std::atoi(wio) : limit * 10;
             if (limit > 0)
-                std::thread([limit] {
+                std::thread([limit, io_limit] {
                     strata::core::Progress& p = strata::core::progress();
                     uint64_t last = p.beats.load(), ticks_at = p.ticks.load();
                     auto since = std::chrono::steady_clock::now();
+                    auto io_since = since;
+                    uint64_t io_last = file_tier_activity();
+                    bool io_noted = false;
                     for (;;) {
                         std::this_thread::sleep_for(std::chrono::seconds(1));
                         const auto now = std::chrono::steady_clock::now();
                         const uint64_t b = p.beats.load();
-                        if (!p.busy.load() || b != last) { last = b; ticks_at = p.ticks.load(); since = now; continue; }
+                        if (!p.busy.load() || b != last) { last = b; ticks_at = p.ticks.load(); since = now; io_since = now; io_noted = false; io_last = file_tier_activity(); continue; }
                         if (now - since < std::chrono::seconds(limit)) continue;
+                        if (io_limit > limit && now - io_since < std::chrono::seconds(io_limit)) {
+                            const uint64_t a = file_tier_activity();
+                            if (a >= io_last + 16) {   // 16 = faults + MiB read in the last second: the file tier is busy
+                                io_last = a;
+                                if (!io_noted) {
+                                    io_noted = true;
+                                    std::fprintf(stderr, "strata serve: no step finished for %d s, but the file tier is still being read "
+                                                         "(slow storage or low RAM): waiting up to %d s in all (STRATA_WATCHDOG_IO_S) (#1407)\n",
+                                                 limit, io_limit);
+                                }
+                                continue;
+                            }
+                            io_last = a;
+                        }
                         // a blocking step's explicit allowance (session files): still within it, not yet stuck
                         if (strata::core::progress_now_ms() < p.allow_until_ms.load()) continue;
                         std::fprintf(stderr, "strata serve: no progress for %d s during a request (%s) - stopping "
@@ -8704,7 +8807,10 @@ int main(int argc, char** argv) {
                         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
                         std::printf("BDONE %d %lld %s %.1f\n", gi * GS + t, (long long) sl.produced, fin, ms);
                         sl.active = false;
-                        sl.cached = false;   // the pipeline's pad rows: a pipelined slot is not reused as a cache
+                        // a pipelined slot is a cache again (#857: a request left alone in its slot goes back to the solo path with its
+                        // drafts): its state is final once its last window has left the last stage.  A later group window whose pad
+                        // row writes this slot clears the flag (below, where the group starts), so a stale state is never reused
+                        sl.cached = o.prompt_cache > 0 && !sl.img;
                     } else {
                         sl.x = y;
                         sl.p += 1;
@@ -10826,6 +10932,20 @@ int main(int argc, char** argv) {
                 if (!ver.run(T, window.data(), p, win_pool_fn, win_pool_user, outv.data(), err) || drive.d.failed) {
                     std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
                     return 1;
+                }
+                // Diagnostics (as in generate): STRATA_DUMP_FIRST_LOGITS=<path> writes the logits of each request's first
+                // window to <path>.<n>, so the prompt paths (a peer card's share, a split) can be compared by KL
+                if (first_window) {
+                    static const char* fl = std::getenv("STRATA_DUMP_FIRST_LOGITS");
+                    static int fl_n = 0;
+                    if (fl != nullptr) {
+                        std::vector<float> row((size_t) ver.vocab());
+                        const std::string path = std::string(fl) + "." + std::to_string(fl_n++);
+                        std::FILE* f = ver.copy_logits(0, row.data()) ? std::fopen(path.c_str(), "wb") : nullptr;
+                        if (f == nullptr || std::fwrite(row.data(), sizeof(float), row.size(), f) != row.size())
+                            std::fprintf(stderr, "strata serve: STRATA_DUMP_FIRST_LOGITS: cannot write %s\n", path.c_str());
+                        if (f) std::fclose(f);
+                    }
                 }
                 int a = 0;
                 while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;

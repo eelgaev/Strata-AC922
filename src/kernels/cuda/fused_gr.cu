@@ -1,5 +1,6 @@
 // src/kernels/cuda/fused_gr.cu - see include/strata/kernels/fused_gr.hpp.
 #include "strata/core/emulate.hpp"
+#include "strata/kernels/q8_1_finite.hpp"   // #606: q8_1_ds
 #include "strata/kernels/fused_gr.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 
@@ -198,11 +199,11 @@ __device__ __forceinline__ void gr_q8_tail(const GrMulti& m, int d0) {
     for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
-    const float d = amax / 127.0f;
-    const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+    const float d = q8_1_finite(amax / 127.0f);   // #606: as native_quantize_q8_1_kernel - finite blocks bit for bit
+    const int8_t q = q8_1_quant(xi, d, amax);
     GrQ81* y = reinterpret_cast<GrQ81*>(m.a[warp].q8_mixed) + c0 / 32;
     y->qs[lane] = q;
-    if (lane == 0) y->ds = make_half2(d, sum);
+    if (lane == 0) y->ds = q8_1_ds(d, sum);   // #606: clamped scale/sum - an unclamped pair NaN-poisons the dot path
 }
 // Step 1 of `gr_down_kernel`, one block per token, same threads and reduction order: rs[t] and xn[t] to global.
 __global__ void __launch_bounds__(THREADS) gr_norm_multi_kernel(GrMulti m) {
@@ -630,9 +631,9 @@ __global__ void __launch_bounds__(THREADS) gr_up_v3_kernel(GrMulti m, const floa
 // compares them on the card before a verify window uses them (STRATA_HC_SPLIT below).
 //  - the norm (split and staged): one block per token AND stream instead of one per token.  Each thread visits
 //    exactly the elements, in the order, it visited for that stream in the plain read, so every sum of squares and rs
-//    is the same; then it recomputes its R' * w_norm and writes it times rs (the plain read stored the product and
-//    scaled it in place: the same two roundings).  On an RTX 4080 SUPER, the plain read's norm took 0.58 ms per
-//    4-token round (96 launches of 1-4 blocks), this one 0.23 ms.
+//    is the same; it stores R' * w_norm and scales it in place, with the plain read's two roundings.
+//    Before this scratch reuse, the split norm measured 0.23 ms per 4-token round (96 launches) on an RTX 4080
+//    SUPER, compared with 0.58 ms for the plain read's norm.
 //  - the down projection, split: the plain read's kernel.
 //  - the down projection, staged: the plain read's 8 rows per block and lane order, but the activations arrive by
 //    cp.async in half-stream tiles, two in flight, so no thread waits on a chain of loads, and they sit in shared
@@ -667,6 +668,10 @@ __global__ void __launch_bounds__(THREADS) gr_norm_split_kernel(GrMulti m) {
         }
         const float sq = r.x * r.x + r.y * r.y + r.z * r.z + r.w * r.w;
         ss += sq;
+        // Retain the unscaled product in the existing scratch instead of reloading R
+        // and recomputing the pending write after the reduction.
+        const float4 g = *reinterpret_cast<const float4*>(a.w_norm + i);
+        *reinterpret_cast<float4*>(xn + i) = make_float4(r.x * g.x, r.y * g.y, r.z * g.z, r.w * g.w);
     }
     const float v = warp_sum(ss);
     if (lane == 0) part[warp] = v;
@@ -679,19 +684,7 @@ __global__ void __launch_bounds__(THREADS) gr_norm_split_kernel(GrMulti m) {
     }
     __syncthreads();
     const float rs = s_rs;
-    for (int i = t * 4; i < D; i += THREADS * 4) {
-        if (i / N != c) continue;
-        const int d = i - c * N;
-        float4 r = *reinterpret_cast<const float4*>(a.R + i);
-        if (a.apply) {
-            const float4 b = *reinterpret_cast<const float4*>(a.bo_prev + d);
-            r.x = fmaf(b.x, gw, r.x); r.y = fmaf(b.y, gw, r.y);
-            r.z = fmaf(b.z, gw, r.z); r.w = fmaf(b.w, gw, r.w);
-        }
-        const float4 g = *reinterpret_cast<const float4*>(a.w_norm + i);
-        const float px = r.x * g.x, py = r.y * g.y, pz = r.z * g.z, pw = r.w * g.w;
-        *reinterpret_cast<float4*>(xn + i) = make_float4(px * rs, py * rs, pz * rs, pw * rs);
-    }
+    for (int d = t; d < N; d += THREADS) xn[c * N + d] *= rs;
 }
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(__HIPCC__)

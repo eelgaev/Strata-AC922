@@ -2148,6 +2148,110 @@ void gather_rows16(const uint16_t* x16, const int32_t* src, uint16_t* dst16, int
     gather_rows16_kernel<<<blocks_for(n * (width / 8)), 256, 0, (cudaStream_t) stream>>>(x16, src, dst16, n, width);
     check("gather_rows16");
 }
+namespace {
+__global__ void moe_combine_peer_kernel(const float* __restrict__ Dm, const int32_t* __restrict__ slot,
+                                        const float* __restrict__ w, const float* __restrict__ shared,
+                                        const float* __restrict__ sg, const float* __restrict__ peer, int64_t rows_local,
+                                        float* __restrict__ bo, int64_t T) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= T * N) return;
+    const int64_t t = i / N, d = i % N;
+    float s = 0.0f;
+#pragma unroll
+    for (int k = 0; k < 10; ++k) {
+        const int32_t r = slot[t * 10 + k];
+        if (r < rows_local) s = fmaf(w[t * 10 + k], Dm[(int64_t) r * N + d], s);
+    }
+    bo[i] = (s + peer[i]) + shared[i] * sigm(sg[t]);
+}
+__global__ void peer_scatter_add_kernel(float* __restrict__ sum, const float* __restrict__ rows,
+                                        const float* __restrict__ wk, const int32_t* __restrict__ pair, int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n * N) return;
+    const int64_t r = i / N, d = i % N;
+    const int32_t p = pair[r];
+    float* o = sum + (int64_t) (p / 10) * N + d;
+    *o = fmaf(wk[p], rows[i], *o);
+}
+__global__ void moe_combine_peer16_kernel(const float* __restrict__ Dm, const int32_t* __restrict__ slot,
+                                          const float* __restrict__ w, const float* __restrict__ shared,
+                                          const float* __restrict__ sg, const uint16_t* __restrict__ peer16,
+                                          int64_t rows_local, float* __restrict__ bo, int64_t T) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= T * N) return;
+    const int64_t t = i / N, d = i % N;
+    float s = 0.0f;
+#pragma unroll
+    for (int k = 0; k < 10; ++k) {
+        const int32_t r = slot[t * 10 + k];
+        if (r < rows_local) s = fmaf(w[t * 10 + k], Dm[(int64_t) r * N + d], s);
+    }
+    bo[i] = (s + __half2float(__ushort_as_half(peer16[i]))) + shared[i] * sigm(sg[t]);
+}
+__global__ void peer_gather_add_kernel(float* __restrict__ sum, const float* __restrict__ rows, int64_t r0,
+                                       const float* __restrict__ wk, const int32_t* __restrict__ pair,
+                                       const int32_t* __restrict__ tok, const int32_t* __restrict__ start,
+                                       const int32_t* __restrict__ list) {
+    const int64_t d = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (d >= N) return;
+    const int b = blockIdx.y;
+    float* o = sum + (int64_t) tok[b] * N + d;
+    float s = *o;
+    for (int i = start[b]; i < start[b + 1]; ++i) {
+        const int r = list[i];
+        s = fmaf(wk[pair[r]], rows[(r - r0) * N + d], s);
+    }
+    *o = s;
+}
+__global__ void sums_to_f16_kernel(const float* __restrict__ x, uint16_t* __restrict__ y, int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] = hf_sat(x[i]);
+}
+__global__ void f16_to_f32_wide_kernel(float4* __restrict__ dst, const uint4* __restrict__ src, int64_t n8) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;   // eight values
+    if (i >= n8) return;
+    const uint4 v = src[i];
+    const __half2* h = reinterpret_cast<const __half2*>(&v);
+    const float2 a = __half22float2(h[0]), b = __half22float2(h[1]), c = __half22float2(h[2]), e = __half22float2(h[3]);
+    dst[2 * i] = make_float4(a.x, a.y, b.x, b.y);
+    dst[2 * i + 1] = make_float4(c.x, c.y, e.x, e.y);
+}
+}  // namespace
+void moe_combine_peer16(const float* Dm, const int32_t* slot, const float* w, const float* shared, const float* sg,
+                        const uint16_t* peer16, int64_t rows_local, float* bo, int64_t T, void* stream) {
+    moe_combine_peer16_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(Dm, slot, w, shared, sg, peer16,
+                                                                                      rows_local, bo, T);
+    check("moe_combine_peer16");
+}
+void peer_gather_add(float* sum, const float* rows, int64_t r0, const float* wk, const int32_t* pair, const int32_t* tok,
+                     const int32_t* start, const int32_t* list, int64_t n_tok, void* stream) {
+    if (n_tok <= 0) return;
+    peer_gather_add_kernel<<<dim3((unsigned) ((N + 255) / 256), (unsigned) n_tok), 256, 0, (cudaStream_t) stream>>>(
+        sum, rows, r0, wk, pair, tok, start, list);
+    check("peer_gather_add");
+}
+void sums_to_f16(const float* x, uint16_t* y, int64_t n, void* stream) {
+    if (n <= 0) return;
+    sums_to_f16_kernel<<<blocks_for(n), 256, 0, (cudaStream_t) stream>>>(x, y, n);
+    check("sums_to_f16");
+}
+void f16_to_f32_wide(float* dst, const uint16_t* src, int64_t n, void* stream) {
+    if (n <= 0) return;
+    f16_to_f32_wide_kernel<<<blocks_for(n / 8), 256, 0, (cudaStream_t) stream>>>(reinterpret_cast<float4*>(dst),
+                                                                                    reinterpret_cast<const uint4*>(src), n / 8);
+    check("f16_to_f32_wide");
+}
+void moe_combine_peer(const float* Dm, const int32_t* slot, const float* w, const float* shared, const float* sg,
+                      const float* peer, int64_t rows_local, float* bo, int64_t T, void* stream) {
+    moe_combine_peer_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(Dm, slot, w, shared, sg, peer, rows_local,
+                                                                                    bo, T);
+    check("moe_combine_peer");
+}
+void peer_scatter_add(float* sum, const float* rows, const float* wk, const int32_t* pair, int64_t n, void* stream) {
+    if (n <= 0) return;
+    peer_scatter_add_kernel<<<blocks_for(n * N), 256, 0, (cudaStream_t) stream>>>(sum, rows, wk, pair, n);
+    check("peer_scatter_add");
+}
 void moe_combine(const float* Dm, const int32_t* slot, const float* w, const float* shared, const float* sg, float* bo,
                  int64_t T, void* stream) {
 #ifndef STRATA_W_NO_COMB

@@ -707,13 +707,21 @@ class StrataEngine:
         if asked and self.batch != asked:
             print(f"[strata] parallel requests: {asked} asked, the engine runs {self.batch or 'one at a time'} "
                   "(its log says why)", flush=True)
-        groups = int(args[args.index("--batch-groups") + 1]) if "--batch-groups" in args else 1
+        _bg = args[args.index("--batch-groups") + 1] if "--batch-groups" in args else "default"
+        # no `--batch-groups` (the default on a layer split) or `auto`: the engine picks the groups and says so
+        # (INFO batch_groups=G); a number is the group count asked for (1 = off)
+        groups = int(self.info.get("batch_groups") or 1) if _bg in ("auto", "default") else int(_bg)
         groups = groups if self.batch and groups > 0 and self.batch % groups == 0 else 1
         gs = self.batch // groups if self.batch else 0
         # slots in the order that spreads requests over the pipeline's groups first: 0, gs, 2gs, .., 1, gs+1, ..
         self.slot_order = [g * gs + t for t in range(gs) for g in range(groups)]
         self.slot_group = [b // gs if gs else 0 for b in range(self.batch)]   # each slot's pipeline group
         self.slot_groups = groups
+        # pipelined groups (the engine says how many it runs: INFO batch_groups; older engines: the args).  A pipelined
+        # group's window spans its slots up to its last busy one, and the engine keeps no pipelined slot as a
+        # conversation cache - see pick_slot
+        groups_run = int(self.info.get("batch_groups") or groups)
+        self.slot_gs = gs if groups > 1 and groups_run > 1 else 0
         self.slot_q = [queue.Queue() for _ in range(self.batch)]
         self.slot_busy = [False] * self.batch
         # what each slot's sessions hold (prompt + every token a window fed), so a conversation's next turn goes to
@@ -1420,6 +1428,16 @@ class StrataEngine:
         free = [b for b in self.slot_order if not self.slot_busy[b]]
         if not free:
             return None
+        gs = getattr(self, "slot_gs", 0)
+        if gs:
+            # pipelined groups: the engine keeps no pipelined slot as a conversation cache, so nothing is worth keeping
+            # free for a next turn.  A group's window spans its slots up to its last busy one, so first fill a hole
+            # below a busy slot of the same group (it costs no extra row), then follow the spreading order
+            # (reported on #793: least-recently-used picks left leading holes, [_ B], that cost a whole row each)
+            def fills_hole(b):
+                g0 = b - b % gs
+                return any(self.slot_busy[x] for x in range(b + 1, g0 + gs))
+            return min(free, key=lambda b: (not fills_hole(b), self.slot_order.index(b)))
         def held_prefix(b):
             h = self.slot_held[b]
             return len(h) if h and len(h) < len(prompt) and prompt[:len(h)] == h else 0
@@ -1772,6 +1790,31 @@ def network_path(path: str) -> bool:
     return p.startswith("\\\\") or p.startswith("\\??\\")
 
 
+def vision_start_error(line: str, log=None) -> str:
+    """The message when the image encoder answered something other than READY.  #1445: a card in the Exclusive_Process
+    compute mode (or one another process holds) refuses the encoder's CUDA context with "busy or unavailable"; that
+    cause is named instead of leaving the user the first line of a traceback.  `log` is the encoder's stderr file, whose
+    tail is searched too (the CUDA error is printed there)."""
+    text = line.strip()
+    tail = ""
+    try:
+        name = getattr(log, "name", None)
+        if name:
+            with open(name, "rb") as f:
+                f.seek(0, 2)
+                f.seek(max(0, f.tell() - 16384))
+                tail = f.read().decode("utf-8", "replace")
+    except (OSError, ValueError):
+        pass
+    if "busy or unavailable" in (text + tail).lower():
+        return ("the vision encoder did not start: the GPU refused a second CUDA context (\"CUDA-capable device(s) "
+                "is/are busy or unavailable\"). This is usually the compute mode Exclusive_Process: only one process "
+                "may use the card, and the engine already holds it. Check with: nvidia-smi --query-gpu=compute_mode "
+                "--format=csv; set it back with: sudo nvidia-smi -c DEFAULT (or run the encoder on another card). "
+                "First line from the encoder: " + (text or "(none)"))
+    return "the vision encoder did not start: " + text
+
+
 class Vision:
     """The resident image encoder: `strata-vision` (llama.cpp mtmd + the mmproj file) reads `ENC <image> <out>`
     lines and writes each image's embeddings; results are cached by the image's hash, so a conversation that
@@ -1837,7 +1880,7 @@ class Vision:
                 proc.wait(timeout=5)
             except (OSError, subprocess.TimeoutExpired):
                 pass
-            raise RuntimeError("the vision encoder did not start: " + line.strip())
+            raise RuntimeError(vision_start_error(line, self.spawn[1]))
         self.stopped = False
 
     def _readline(self, timeout: float, what: str) -> str:
@@ -5171,6 +5214,10 @@ class Server(ThreadingHTTPServer):
     # On Windows SO_REUSEADDR lets a second server bind a port that is already serving, and requests then land on
     # either one (a forgotten second start of run-<model>.bat).  Without it the second start fails loudly instead.
     allow_reuse_address = os.name != "nt"
+    # socketserver listens with a backlog of 5: a burst of 30-40 clients at once got "connection reset by peer" on the
+    # first ones (measured on 4 x R9700, also with one request at a time); the requests wait in the server, not the kernel
+    # (STRATA_HTTP_BACKLOG overrides it)
+    request_queue_size = max(5, int(os.environ.get("STRATA_HTTP_BACKLOG") or 256))
 
     def handle_error(self, request, client_address):
         if not isinstance(sys.exc_info()[1], ConnectionError):   # a client that hangs up needs no stack trace

@@ -808,6 +808,24 @@ def gpu_drives_display(g) -> bool:
     return text.strip().lower() == "enabled"
 
 
+def gpu_compute_mode(index: int) -> str:
+    """#1445: nvidia-smi's compute mode for this card ("Default", "Exclusive_Process", "Prohibited", ...); "" when it
+    does not say."""
+    return out(["nvidia-smi", "-i", str(index), "--query-gpu=compute_mode", "--format=csv,noheader"]).strip()
+
+
+def compute_mode_warning(index: int, mode: str) -> str | None:
+    """#1445: the warning for a card that is not in the Default compute mode, or None.  In Exclusive_Process only one
+    process may hold a CUDA context, so the engine, the vision encoder and the tuning run cannot share the card
+    ("CUDA-capable device(s) is/are busy or unavailable"); Prohibited allows none.  A warning only: it is the
+    administrator's setting, Strata never changes it."""
+    if not mode or mode.lower() == "default" or mode.lower().startswith("n/a") or mode.lower().startswith("[n/a"):
+        return None
+    return (f"GPU {index} is in the compute mode {mode}, not Default: a second process cannot use the card while "
+            "the first holds it, so the vision encoder or the tuning run can fail with \"CUDA-capable device(s) is/are "
+            f"busy or unavailable\". If it does, set it back with: sudo nvidia-smi -i {index} -c DEFAULT")
+
+
 def pcie_link(index: int) -> dict | None:
     """The NVIDIA card's PCIe link: {"gen": the generation card and board both run (an idle card drops to a lower
     one, so the current generation is not asked), "gpu_gen", "host_gen", "width", "max_width"}; None when nvidia-smi
@@ -1167,10 +1185,11 @@ def split_budget(cfg: dict, yes: bool = False, explicit: bool = False) -> bool:
 
 
 REMOTE_EXPERT_OPT = "--remote-expert-opt"
+HELPER_CACHE_FLAGS = ("--expert-cache-device1", "--expert-cache-device2", "--expert-cache-device3")
 
 
 def recommend_remote_expert_opt(cfg: dict, off: bool = False) -> None:
-    """0.1.39b (#578): a config on two or more GPUs gets --remote-expert-opt - the helper expert caches
+    """0.1.39b (#578): a config on two or more GPUs with a helper cache gets --remote-expert-opt - the helper expert caches
     (--expert-cache-device1..3) then stay complementary to the main GPU's, return their rows already weighted and skip
     the CPU's activation quantization where no expert is left to it (dual RTX 4090: +63% mixed, +132% code over the
     plain helper path).  The engine uses it only with a helper cache; a layer split runs as before.  A recommendation:
@@ -1194,6 +1213,11 @@ def recommend_remote_expert_opt(cfg: dict, off: bool = False) -> None:
         else:
             ok("multi-GPU: --pipeline-windows is set, so --remote-expert-opt is not added (the helper caches turn the "
                "pipeline off; docs/MULTI_GPU.md)")
+        return
+    # #1447: the flag acts only on the helper caches (--expert-cache-device1..3); without one the engine builds nothing
+    # from it, and a plain layer split gained a flag that says "helpers" for no reason. Setup adds it only beside a
+    # helper cache; a flag already in the config stays (the user's, or an earlier setup's - harmless).
+    if not any(a.split("=", 1)[0] in HELPER_CACHE_FLAGS for a in args):
         return
     if REMOTE_EXPERT_OPT not in args:
         args.append(REMOTE_EXPERT_OPT)
@@ -3212,6 +3236,15 @@ def isa_floor_defs(floor: str, bdir: Path, meta: dict) -> list:
     return [f"-DSTRATA_ISA_FLOOR={floor}"] if floor else []
 
 
+def toolkit_root_defs(nvcc) -> list:
+    """CUDAToolkit_ROOT for the toolkit whose nvcc builds the engine.  Without it CMake can take cudart and cuBLAS from
+    another toolkit: with STRATA_NVCC=/opt/cuda-13.0/bin/nvcc on Ubuntu 24.04 that also has the distribution's CUDA
+    12.0 (nvidia-cuda-toolkit), the engine was compiled with the 13.0 headers but linked libcudart.so.12 from
+    /usr/lib/x86_64-linux-gnu.  The distribution's own nvcc (/usr/bin) keeps CMake's search as before."""
+    root = Path(nvcc).resolve().parent.parent
+    return [] if root == Path("/usr") else [f"-DCUDAToolkit_ROOT={root}"]
+
+
 def engine_defs(archs, toolkit=13) -> list:
     """Extra CMake definitions for the engine: the experimental Pascal/Volta build (#295) for cards below sm_75, and
     for every CUDA 12 engine (the same build as the ready-made CUDA 12 one: it admits the older cards)."""
@@ -3271,7 +3304,8 @@ def build_engine(gpu, vision, yes, llama, toolkit=None) -> Path:
             if local and (eng / EXE).exists() else "  Compiling the Strata engine for your GPU (10-20 minutes, once) ...")
         cmake_build(ROOT, bdir, "strata",
                     ["-DSTRATA_ENABLE_CUDA=ON", "-DSTRATA_BUILD_TESTS=OFF", f"-DCMAKE_CUDA_ARCHITECTURES={cuda_archs}",
-                     f"-DCMAKE_CUDA_COMPILER={nvcc}", f"-DSTRATA_GGML_DIR={llama}", *engine_defs(archs, toolkit),
+                     f"-DCMAKE_CUDA_COMPILER={nvcc}", *toolkit_root_defs(nvcc), f"-DSTRATA_GGML_DIR={llama}",
+                     *engine_defs(archs, toolkit),
                      *isa_floor_defs(floor, bdir, meta),
                      *([f"-DGGML_CPU_ARM_ARCH={arm_cpu_arch()}"] if ARM else [])],
                     vcvars, "build-strata-cuda12.bat" if t12 else "build-strata.bat")
@@ -3283,7 +3317,8 @@ def build_engine(gpu, vision, yes, llama, toolkit=None) -> Path:
         if ARM:
             defs.append(f"-DGGML_CPU_ARM_ARCH={arm_cpu_arch()}")
         if vision == "gpu":
-            defs += [f"-DCMAKE_CUDA_ARCHITECTURES={cuda_archs}", f"-DCMAKE_CUDA_COMPILER={nvcc}"]
+            defs += [f"-DCMAKE_CUDA_ARCHITECTURES={cuda_archs}", f"-DCMAKE_CUDA_COMPILER={nvcc}",
+                     *toolkit_root_defs(nvcc)]
         cmake_build(ROOT / "tools" / "vision", vdir, "strata-vision", defs, vcvars,
                     "build-vision-cuda12.bat" if t12 else "build-vision.bat")
         shutil.copy2(vdir / "bin" / VEXE, eng / VEXE)
@@ -3987,7 +4022,7 @@ def calibrate_config(cfg_path: Path) -> bool:
     cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
     say()
     say("  Tuning Strata for this PC: the output speed is measured with a few engine settings (the PCIe share, the")
-    say("  draft depth, the CPU threads, the expert cache). It takes about 10 minutes; the PC is busy meanwhile.")
+    say("  draft depth, the CPU threads, the expert cache). It takes roughly 15-30 minutes (3 rounds of each value); the PC is busy meanwhile.")
     try:
         since = os.path.getsize(cfg["log"]) if cfg.get("log") and os.path.isfile(cfg["log"]) else 0
     except OSError:
@@ -4694,7 +4729,7 @@ def main() -> int:
                     help="where the ready-made engine is (a URL folder or a local folder)")
     ap.add_argument("--check", action="store_true", help="only check this PC and exit")
     ap.add_argument("--calibrate", action="store_true",
-                    help="tune the engine's settings for this PC (about 5-10 minutes), then start the model")
+                    help="tune the engine's settings for this PC (about 15-30 minutes, longer on a slow card), then start the model")
     ap.add_argument("--draft-vocab", choices=list(DRAFT_VOCABS),
                     help="the draft layer's tokens: cjk = with Chinese, Japanese and Korean (default), en = English "
                          "and code only (~110 MiB less VRAM, English answers 1-2%% faster), cyrillic = English, code "
@@ -5507,6 +5542,12 @@ def main() -> int:
     if not hip and not multi and a.vram_reserve_mib is None and gpu_drives_display(gpu):
         say("  tip: this card drives a display. If the PC freezes or the screen goes black once the model is loaded "
             f"(#779), keep more VRAM free: run setup again with --vram-reserve-mib {DISPLAY_RESERVE_MIB}")   # a tip only
+    if not hip:
+        for gi in ([g for g in multi] if multi else [gpu.get("index", 0)]):
+            gi = gi["index"] if isinstance(gi, dict) else gi
+            w = compute_mode_warning(gi, gpu_compute_mode(gi))
+            if w:
+                warn(w)                                   # #1445: a warning only, never a refusal
     if esp is not None:
         # the package's profile, with llama.cpp's flags (the engine takes the same ones)
         args += ["--control-vector-scaled", f"{esp}:1.0", "--control-vector-layer-range", "4", "44",
@@ -5582,7 +5623,7 @@ def main() -> int:
     script = write_run_script(tag, cfg_path, port, cfg.get("open_browser") is not False)
     # offered only when someone answers: --yes installs and adopted earlier installs are not held up by it
     if cal is None and not hip and not a.no_start and not a.yes and ask(
-            "Tune Strata for this PC now? It measures a few engine settings (about 5-10 minutes; the PC is busy "
+            "Tune Strata for this PC now? It measures a few engine settings (about 15-30 minutes, longer on a slow card; the PC is busy "
             "meanwhile; later: START-HERE --calibrate)", ["y", "n"], "y", a.yes) == "y":
         tuned = calibrate_config(cfg_path)
     else:

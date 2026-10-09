@@ -457,7 +457,7 @@ START-HERE.bat --gguf-dir D:\models\IQ2_XS       use GGUF files you already have
 START-HERE.bat --data-dir E:\Strata-data         keep the model files somewhere else
 START-HERE.bat --port 8081                      another port
 START-HERE.bat --gpu 1                          another GPU (numbered as nvidia-smi; setup picks the one with the most VRAM)
-START-HERE.bat --calibrate                      tune the engine for this PC (about 5-10 minutes), then start
+START-HERE.bat --calibrate                      tune the engine for this PC (about 15-30 minutes, longer on a slow card), then start
 ```
 
 With more than one model installed, it asks which one to start. `run-<model>.bat` starts a model directly.
@@ -511,6 +511,8 @@ In the task's properties set both of these (the defaults are the opposite):
 
 (Both were changed at once, so the isolated effect of each is not measured.) If the model still starts
 slowly, the engine prints a hint under its `loaded ... GiB at ...` line naming this cause.
+
+**Large pages need a new logon (#1412).** Granting "Lock pages in memory" (`secpol.msc`, User Rights Assignment) to the account that runs the engine takes effect at the next logon: Windows puts the privilege in the access token when the session starts, so log off and on (or reboot) after granting it. Until then the startup log still says the large pages were refused.
 
 ### Chat in the terminal (optional)
 
@@ -1641,3 +1643,7 @@ with **262,144 characters per input/output/reasoning/response field** and visibl
 responses are unaffected. Headers are not recorded, and the monitor key is kept in this tab's session storage.
 Treat request history as sensitive input/output when exposing Strata on a network: set an API key as above.
 The page uses relative URLs and works through the existing host binding or a reverse proxy.
+
+### Prompt buffers: `bo` shares `emb` (#1454)
+
+The prompt path's half-output buffer `bo` reuses the embedding buffer `emb`, which is dead after the first hyper-connection broadcast: T x 2560 floats less VRAM per chunk (320 MiB at 32768 rows). The planner still counts those bytes by default, so the auto chunk and the cache slots the prompt path borrows are exactly those of 0.1.40.3 and the output bits are unchanged. `STRATA_EMB_REUSE_ACCOUNT=1` lets the planner use the saved bytes: where VRAM limits the chunk it grows (RTX 3060, IQ3_XXS: 6400 to 6656 tokens, 1652 to 1670 borrowed slots, prompt about +3.9%). A different chunk changes the prompt path's rounding, so prompt residuals are not byte-identical to the default; greedy output matched in our runs. Opt-in until it has a KL measurement.
