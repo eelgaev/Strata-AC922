@@ -1231,16 +1231,29 @@ class StrataEngine:
                 while True:
                     if slot is None:
                         # a free slot (they free themselves at BDONE, which needs no control lines): the one that holds
-                        # the start of this prompt (its conversation's last turn), else the one used longest ago
-                        with self.slot_cv:
-                            while True:
+                        # the start of this prompt (its conversation's last turn), else the one used longest ago.
+                        # With none free the control lines are given back while waiting: a slot can be held by a read
+                        # that gave way (BYIELD) and needs them to go on, so waiting with them is a deadlock - long,
+                        # long, short at 0.25 s steps under parallel: 2 (ENGINE_REVIEW finding 1, reproduced in 0.1.41).
+                        while True:
+                            with self.slot_cv:
                                 slot = self.pick_slot(prompt)
                                 if slot is not None:
                                     self.slot_busy[slot] = True
                                     break
-                                self.slot_cv.wait(timeout=10.0)
-                                if cancel.is_set():
+                            if holding:
+                                self.ctl.release()
+                                holding = False
+                            with self.slot_cv:
+                                if self.pick_slot(prompt) is None:
+                                    self.slot_cv.wait(timeout=1.0)
+                            if cancel.is_set():
+                                return
+                            if not holding:
+                                ok = yield from self._take_control(cancel, len(prompt))
+                                if not ok:
                                     return
+                                holding, born = True, self.gen
                     if self._yielded is not None:           # it gave way: the others waiting then go first
                         self.slot_held[slot] = list(prompt[:self._yielded[1]])
                         self._yielded = None
@@ -2138,7 +2151,83 @@ def hip_visible(cfg: dict) -> list[int]:
             return [int(str(ordinal).strip())]
         except ValueError:
             pass
-    return gpu_list(cfg)
+    return ordered_gpus(cfg)
+
+
+def gpu_speed_scores(indices: list[int]) -> dict[int, float] | None:
+    """Multiprocessors x max clock for each NVIDIA card, numbered as nvidia-smi numbers them (the CUDA driver API,
+    which every driver ships: no toolkit needed); None when it cannot say for every one of them."""
+    code = (
+        "import ctypes,sys,os\n"
+        "os.environ['CUDA_DEVICE_ORDER']='PCI_BUS_ID'\n"
+        "lib=ctypes.CDLL('nvcuda.dll' if os.name=='nt' else 'libcuda.so.1')\n"
+        "assert lib.cuInit(0)==0\n"
+        "n=ctypes.c_int()\n"
+        "assert lib.cuDeviceGetCount(ctypes.byref(n))==0\n"
+        "for i in range(n.value):\n"
+        "    d=ctypes.c_int()\n"
+        "    assert lib.cuDeviceGet(ctypes.byref(d),i)==0\n"
+        "    sm=ctypes.c_int(); mhz=ctypes.c_int()\n"
+        "    lib.cuDeviceGetAttribute(ctypes.byref(sm),16,d)\n"
+        "    lib.cuDeviceGetAttribute(ctypes.byref(mhz),13,d)\n"
+        "    print(i,sm.value,mhz.value)\n")
+    try:
+        env = dict(os.environ)
+        env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+        env.pop("CUDA_VISIBLE_DEVICES", None)
+        r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=30, env=env)
+        got = {}
+        for line in r.stdout.splitlines():
+            i, sm, khz = (int(x) for x in line.split())
+            got[i] = float(sm) * float(khz)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    return got if all(i in got and got[i] > 0 for i in indices) else None
+
+
+def hip_speed_scores(indices: list[int], root: str = "/sys/class/kfd/kfd/topology/nodes") -> dict[int, float] | None:
+    """AMD on Linux: SIMDs x max engine clock of each card, from the KFD topology (the order setup and the engine use
+    for "gpu" there: the GPU nodes in node order).  None when the files are not there (Windows, no ROCm driver)."""
+    try:
+        nodes = sorted((int(n) for n in os.listdir(root) if n.isdigit()))
+    except OSError:
+        return None
+    cards = []
+    for n in nodes:
+        try:
+            props = dict(line.split() for line in open(os.path.join(root, str(n), "properties")) if len(line.split()) == 2)
+            simd, clk = int(props.get("simd_count", 0)), int(props.get("max_engine_clk_fcompute", 0))
+        except (OSError, ValueError):
+            continue
+        if simd > 0:
+            cards.append(float(simd) * float(clk or 1))
+    got = dict(enumerate(cards))
+    return got if all(i in got for i in indices) else None
+
+
+def ordered_gpus(cfg: dict, scores=None) -> list[int]:
+    """#1352: the cards of a layer split in the order the engine stages them.  With "layer_split": "auto" (the
+    default) the faster card goes LAST - the last stage runs the head, the draft layer and the verify, and a prompt
+    chunk waits on it (the reporter's 4070 Ti SUPER + 5060 Ti: a 6K prompt took 50 s one way round and 15 s the
+    other); "faster" is multiprocessors x max clock.  Equal cards keep the config's order (the sort is stable), and
+    so does anything we cannot measure.  "gpu_order": "as_given" keeps the config's order whatever the cards.  A
+    manual "layer_split" ("24") also keeps it: the user placed the layers.  scores: {index: score} (tests); None asks
+    the driver."""
+    gl = gpu_list(cfg)
+    if len(gl) < 2 or cfg.get("gpu_order") == "as_given":
+        return gl
+    args = cfg.get("args") or []
+    if "--peer-device" in args or "--layer-split" in args or layer_split_value(cfg) != "auto":
+        return gl
+    hip = cfg.get("backend") == "hip"
+    sc = scores if scores is not None else (hip_speed_scores(gl) if hip else gpu_speed_scores(gl))
+    if not sc or any(i not in sc for i in gl):
+        return gl
+    out = sorted(gl, key=lambda i: sc[i])
+    if out != gl:
+        print(f"[strata] layer split: card order {','.join(map(str, out))} (the faster card last; "
+              f'"gpu_order": "as_given" keeps {",".join(map(str, gl))}, #1352)', flush=True)
+    return out
 
 
 def child_env(cfg: dict) -> dict:
@@ -2149,7 +2238,7 @@ def child_env(cfg: dict) -> dict:
         env["HIP_VISIBLE_DEVICES"] = ",".join(str(i) for i in hip_visible(cfg))
     elif gpu_list(cfg):                              # issue #51: the GPU(s) to run on, numbered as nvidia-smi does; CUDA's
         env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"      # own default order (fastest first) can number the cards otherwise
-        env["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in gpu_list(cfg))
+        env["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in ordered_gpus(cfg))
     for k, v in (cfg.get("env") or {}).items():      # engine settings the config carries (AMD: the GEMM tuning table)
         env[str(k)] = str(v)
     dirs = [d for d in cfg.get("lib_dirs") or [] if Path(d).is_dir()]
@@ -3967,6 +4056,17 @@ def anthropic_collect(events) -> dict:
 CHUNKED_BODY_MAX = 256 << 20                # #893: the most a Transfer-Encoding: chunked body may hold (read into memory)
 
 
+def body_limit() -> int:
+    """The most a request body may hold, in bytes (read into memory): 256 MiB, which is a million-token conversation
+    with room to spare; STRATA_MAX_BODY_MIB changes it (0 or an unreadable value: the default).  A larger one is
+    answered 413 before it is read (a Content-Length of 10 TB used to be read until the client gave up)."""
+    try:
+        mib = int(os.environ.get("STRATA_MAX_BODY_MIB", "0"))
+    except ValueError:
+        mib = 0
+    return mib << 20 if mib > 0 else CHUNKED_BODY_MAX
+
+
 class BadBody(Exception):
     """A request body that cannot be read (a malformed or oversized chunked body): the status and the sentence."""
 
@@ -3988,8 +4088,13 @@ def make_handler(svc: Service):
             pass
 
         def handle_one_request(self):
+            self.answer_started = False
             super().handle_one_request()
             self._drain_body()
+
+        def send_response(self, code, message=None):
+            self.answer_started = True                 # a malformed-request answer can only replace one not yet begun
+            super().send_response(code, message)
 
         def _chunked(self) -> bool:
             """#893: a body sent as Transfer-Encoding: chunked (a relay or proxy that does not buffer it).  By RFC 9112
@@ -4039,9 +4144,20 @@ def make_handler(svc: Service):
 
         def _body(self) -> bytes:
             self.body_read = True
+            limit = body_limit()
             if self._chunked():
-                return self._read_chunked(CHUNKED_BODY_MAX)
-            return self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                return self._read_chunked(limit)
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+            except ValueError:
+                raise BadBody(400, "invalid Content-Length") from None
+            if length < 0:
+                raise BadBody(400, "invalid Content-Length")
+            if length > limit:
+                self.close_connection = True               # the body is not read: the connection ends with the answer
+                raise BadBody(413, f"the request body is larger than {limit >> 20} MiB "
+                                   "(STRATA_MAX_BODY_MIB raises the limit)")
+            return self.rfile.read(length)
 
         def _drain_body(self):
             """An answer sent before the body was read (a 401, a 403, /load, a method with no handler) must not close
@@ -4055,7 +4171,7 @@ def make_handler(svc: Service):
                 return
             if self._chunked():
                 try:
-                    self._read_chunked(CHUNKED_BODY_MAX, keep=False, deadline=time.monotonic() + self.DRAIN_SECONDS)
+                    self._read_chunked(body_limit(), keep=False, deadline=time.monotonic() + self.DRAIN_SECONDS)
                 except (BadBody, OSError):
                     self.close_connection = True
                 return
@@ -4467,6 +4583,17 @@ def make_handler(svc: Service):
                                           "message": str(e)}})
             except (GpuBusy, EngineStarting) as e:
                 self._json(503, {"error": {"type": "server_error", "message": str(e)}})
+            except (TypeError, KeyError, AttributeError, IndexError, UnicodeError) as e:
+                # a body that is JSON but the wrong shape ("messages": 5, a content part that is a number): a 400 that
+                # says so, with the traceback in the log, instead of a dropped connection - unless the answer began
+                if getattr(self, "answer_started", False):
+                    raise
+                import traceback
+                print(f"[strata] 400 malformed request ({type(e).__name__}: {e}):\n" + traceback.format_exc(),
+                      flush=True)
+                body = {"error": {"type": "invalid_request_error",
+                                  "message": f"the request is malformed ({type(e).__name__}: {e})"}}
+                self._json(400, responses_error_body(body["error"]["message"]) if path == "/v1/responses" else body)
             except EngineDied as e:                          # before the answer started (not streamed)
                 self._json(503, {"error": {"type": "server_error", "message": f"{e}; the next request restarts it"}})
             except EngineStuck as e:                         # an unload or restart that could not end the engine
@@ -4969,6 +5096,14 @@ class Server(ThreadingHTTPServer):
         if not isinstance(sys.exc_info()[1], ConnectionError):   # a client that hangs up needs no stack trace
             super().handle_error(request, client_address)
 
+    def server_close(self):
+        # the hardware sampler serve() started for this server stops with it (test isolation: every Service a test
+        # started used to leave its sampler running, 21 of them after test_responses, which slowed test_parallel's timing)
+        tel = getattr(getattr(self, "svc", None), "telemetry", None)
+        if tel is not None and hasattr(tel, "close"):
+            tel.close()
+        super().server_close()
+
 
 def warn_tight_ram(arena_mib) -> None:
     """The model's experts live in RAM (INFO arena_mib, engine 0.1.10+).  With less than ~6 GB left beside them for the
@@ -5196,6 +5331,7 @@ def serve(svc: Service, host="127.0.0.1", port=8095) -> ThreadingHTTPServer:
     svc.host_names = host_names_for(host, svc.allowed_hosts, svc.trusted_origins)
     svc.start_telemetry()
     httpd = Server((host, port), make_handler(svc))
+    httpd.svc = svc
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     return httpd
 

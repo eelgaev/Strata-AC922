@@ -1595,6 +1595,40 @@ class GpuChoice(unittest.TestCase):
         self.assertEqual(plain.get("CUDA_VISIBLE_DEVICES"), os.environ.get("CUDA_VISIBLE_DEVICES"))
         self.assertEqual(plain.get("CUDA_DEVICE_ORDER"), os.environ.get("CUDA_DEVICE_ORDER"))
 
+    def test_card_order(self):
+        """#1352: with an auto layer split the faster card (SMs x clock) goes last; ties, a manual split, a
+        measurement we lack, HIP and "gpu_order": "as_given" keep the config's order."""
+        from serve.server import child_env, hip_speed_scores, ordered_gpus
+        fast_first = {0: 8448.0 * 2610, 2: 4608.0 * 2575}      # 4070 Ti SUPER (66 SMs) vs 5060 Ti (36 SMs), shaped
+        base = {"gpu": [0, 2], "args": []}
+        self.assertEqual(ordered_gpus(base, fast_first), [2, 0])
+        self.assertEqual(ordered_gpus({"gpu": [2, 0], "args": []}, fast_first), [2, 0])
+        self.assertEqual(ordered_gpus(base, {0: 5.0, 2: 5.0}), [0, 2])                       # identical cards
+        self.assertEqual(ordered_gpus({**base, "gpu_order": "as_given"}, fast_first), [0, 2])
+        self.assertEqual(ordered_gpus({**base, "layer_split": "24"}, fast_first), [0, 2])
+        self.assertEqual(ordered_gpus({**base, "args": ["--layer-split", "24"]}, fast_first), [0, 2])
+        self.assertEqual(ordered_gpus({**base, "backend": "hip"}, fast_first), [2, 0])           # AMD: same rule
+        self.assertEqual(ordered_gpus({**base, "backend": "hip"}, {0: 7.0, 2: 7.0}), [0, 2])      # identical cards (the R9700s)
+        self.assertEqual(ordered_gpus(base, {0: 1.0}), [0, 2])                               # a card unmeasured
+        self.assertEqual(ordered_gpus({"gpu": 1, "args": []}, {1: 1.0}), [1])
+        self.assertEqual(ordered_gpus({"gpu": [0, 1, 2], "args": []}, {0: 3.0, 1: 9.0, 2: 6.0}), [0, 2, 1])
+        self.assertEqual(ordered_gpus({"gpu": [0, 1, 2], "args": []}, {0: 3.0, 1: 3.0, 2: 3.0}), [0, 1, 2])
+        self.assertEqual(child_env({"gpu": [0, 2], "args": [], "gpu_order": "as_given"})["CUDA_VISIBLE_DEVICES"], "0,2")
+        self.assertIsNone(hip_speed_scores([0], root="/nonexistent/kfd"))
+
+    def test_kfd_scores(self):
+        """AMD on Linux: the GPU nodes of the KFD topology, SIMDs x clock, node order = the config's index."""
+        import tempfile
+        from serve.server import hip_speed_scores
+        with tempfile.TemporaryDirectory() as d:
+            for n, simd, clk in ((0, 0, 0), (1, 128, 2350), (2, 64, 2000), (3, 128, 2350)):
+                os.makedirs(os.path.join(d, str(n)))
+                with open(os.path.join(d, str(n), "properties"), "w") as f:
+                    f.write(f"simd_count {simd}\nmax_engine_clk_fcompute {clk}\ngfx_target_version 120001\n")
+            sc = hip_speed_scores([0, 1, 2], root=d)
+            self.assertEqual(sc, {0: 128 * 2350.0, 1: 64 * 2000.0, 2: 128 * 2350.0})
+            self.assertIsNone(hip_speed_scores([0, 1, 2, 3], root=d))      # a card the topology does not have
+
     def test_vision_device(self):
         # #408: the image encoder on its own card; the engine's environment stays as it was
         from serve.server import child_env, vision_env

@@ -1374,18 +1374,28 @@ test images.
 
 **Stager waits (0.1.40.2, `STRATA_STAGER_SLEEP`):** the prompt-staging threads sleep while they wait on Linux and spin on Windows, because spinning is a little faster there (a 5070 read an 8K Q2_0 prompt 1.2% faster). `STRATA_STAGER_SLEEP=1` makes Windows sleep too, which is the choice when sharing the machine matters more than speed: on a Ryzen 9 7940HS laptop with an RTX 4070 (IQ3_S, 64K context) sleeping waits read 5,914 and 22,305 token prompts 5-6% slower while the whole-machine CPU use fell from 77-90% to 21-25% (issue #1101, thanks to midhatn). `STRATA_STAGER_SLEEP=0` forces spinning on Linux. The output is the same either way.
 
-## Short prompts: let the CPU share the experts (opt-in, `STRATA_PREFILL_CPU_SHARE`)
+**Stager threads for a GGUF read in place (0.1.41, #1353):** a native pack read from its GGUF shards in place (UD-Q4_K_XL, a Q8_0 pack) copies each expert with 32 threads and a 128-deep ring when the bytes are page faults on an SSD. If the shards' pages are already in the page cache (a big-RAM box, a warm start) those copies are memory copies and the same profile ran 4-7x slower than the 4-thread default (a 124K-token Q8 prompt: 57 -> 350-410 tok/s with the default). The engine now checks a sample of the experts with `mincore` at the first prompt (Linux) and takes the RAM profile when 90% or more of their pages are resident, saying so in its log; a cold or partly cached GGUF keeps the SSD profile. `STRATA_STAGER_SSD=1` / `0` forces either profile; `STRATA_STAGER_THREADS` still wins. The bytes copied are the same.
 
-A prompt chunk below 1,024 tokens (an agent's tool result, a test's output, a short follow-up) streams every routed
-expert that is not in VRAM over PCIe, while the CPU pool that decodes sits idle and the RAM arena already holds those
-experts. `STRATA_PREFILL_CPU_SHARE=auto` hands the pool the experts few of the chunk's tokens route to, measures per
-layer how long each side takes and gives the CPU the share at which both end together (`STRATA_PREFILL_CPU_SHARE=0.4`
-fixes a share). It is off unless you set it, and then the output is byte-identical to the build without it.
+## Short prompts: the CPU shares the experts (on by default on one NVIDIA GPU, `STRATA_PREFILL_CPU_SHARE`)
+
+A prompt chunk of a few thousand tokens (an agent's tool result, a test's output, a short follow-up) streams every routed
+expert that is not in VRAM over PCIe, while the CPU pool that decodes sits idle and RAM already holds those experts.
+`STRATA_PREFILL_CPU_SHARE=auto` hands the pool the experts few of the chunk's tokens route to, measures per layer how
+long each side takes and gives the CPU the share at which both end together (`STRATA_PREFILL_CPU_SHARE=0.4` fixes a
+share). `auto` also checks that sharing pays: it times layers with the share and without it (the first ones alternate until three comparisons are in, then one in 29 runs the other way) and shares only while the layers that share are the faster ones. Where sharing is slower (every share was, on an RX 7900 GRE with a Ryzen 7 5700X3D under ROCm, #1282), the experts stay on the GPU apart from those measuring layers. It is off unless you set it, and then the output is byte-identical to the build without it.
+
+**0.1.41: on by default** on CUDA builds with one GPU and no `--batch` slots, for prompt chunks below 1,024 tokens: unset behaves as `auto` with `STRATA_PREFILL_CPU_SHARE_MAX=1024`, and the engine prints one line at start saying so. Measured (interleaved whole-engine runs, 8 rounds, medians): 512 tokens -28..-34% and 1,000 tokens -20..-26% prompt time on an RTX 3060, a Tesla P100 and an RTX 5070, 8/8 pairs each; mean KL against the share off 0.004 (max 0.025). The answers can differ slightly from 0.1.40.3. **`STRATA_PREFILL_CPU_SHARE=0` turns it off and gives 0.1.40.3's exact bytes.** The layer split, batch slots and AMD (HIP) builds keep it off unless you set the variable; `STRATA_PREFILL_CPU_SHARE_MAX=3072` (the extension to larger chunks) also stays opt-in: it lost 2% at 2,048 tokens on the 5070.
+
+With it on, chunks below 3,072 tokens are staged after their routing (only those can hand the CPU a share) instead of
+streaming every expert from 1,024 tokens on; `STRATA_PREFILL_CPU_SHARE_MAX=1024` keeps the old limit. The CPU takes
+experts it reads from RAM as they are: the arena, the page-locked copy of the resident RAM mode, or the mapped
+`experts.bin`'s pages in the file cache (`--mmap-experts`), not only page-locked ones. Serve without `--batch`; on a
+layer split every stage has the pool and one stage at a time takes it for a chunk.
 
 When on, the CPU's rows are computed in the CPU's own activation format, so the output changes in the last bits (first
 token KL against off: mean 0.006, max 0.026 nats over 22 prompts; about half of the 32-token greedy answers on 500 and
-1,000-token prompts are identical, the rest part at a near tie after about 23 tokens). Prompts of 2K tokens and longer
-read the same either way (their chunks are above the limit). Serve without `--batch`, one GPU.
+1,000-token prompts are identical, the rest part at a near tie after about 23 tokens). Chunks of 3,072 tokens and more
+read the same either way.
 
 Prompt time, medians of 10 interleaved pairs (off / auto, ms, `--expert-cache 1500`):
 
@@ -1394,6 +1404,18 @@ Prompt time, medians of 10 interleaved pairs (off / auto, ms, `--expert-cache 15
 | RTX 5070, Ryzen 5 7600, Q2_0 | 1,376 / 1,019 (-26%) | 1,788 / 1,392 (-22%) | unchanged |
 | RTX 3060, Core Ultra 7 265, IQ3_XXS | 1,620 / 1,159 (-28%) | 2,196 / 1,770 (-19%) | unchanged |
 | Tesla P100, Xeon E5-2690 v4, IQ3_XXS | 4,805 / 3,126 (-35%) | 6,821 / 5,085 (-25%) | unchanged |
+
+Up to 3,072 tokens and with mapped experts, fresh prompts read after an 8K prewarm, medians of 5 interleaved rounds
+(off / auto, ms; Ryzen 9 5900XT, 96 GB DDR4-3200, Windows 11, `--mmap-experts`, q4_0 KV; before this the share took no
+expert here: none was page-locked):
+
+| machine | 512 tokens | 1,000 tokens | 2,000 tokens | 3,000 tokens |
+|---|---|---|---|---|
+| RTX 5070 Ti (PCIe 3.0 x8), Swift 1.5 IQ3_XXS (huihui-ai's build) | 3,322 / 1,706 (-49%) | 3,990 / 2,357 (-41%) | 5,413 / 3,354 (-38%) | 5,525 / 4,309 (-22%) |
+| RTX 3060 + RTX 5070 Ti (layers 0-11 / 12-47, both PCIe 3.0 x8), IQ3_S | 3,452 / 2,037 (-41%) | 4,506 / 2,680 (-41%) | 6,376 / 3,869 (-39%) | 6,733 / 5,138 (-24%) |
+
+A coding agent's recorded conversation on the two cards (a 100K-token start, then 8 turns of 1-5K tokens of code, 128
+tokens written a turn, the same tokens read by both): 137.4 s off, 130.6 s auto (reading 121.1 -> 114.3 s).
 
 ---
 

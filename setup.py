@@ -1183,6 +1183,18 @@ def recommend_remote_expert_opt(cfg: dict, off: bool = False) -> None:
         if REMOTE_EXPERT_OPT in args:
             args.remove(REMOTE_EXPERT_OPT)
         return
+    # #1352: --pipeline-windows (the first card starts the next window) is switched off by --remote-expert-opt (the
+    # helper caches), so a config that asks for it keeps its pipeline: one of the two, not both (docs/MULTI_GPU.md)
+    pw = args.index("--pipeline-windows") if "--pipeline-windows" in args else -1
+    if pw >= 0 and pw + 1 < len(args) and args[pw + 1] != "0":
+        if REMOTE_EXPERT_OPT in args:
+            warn("--pipeline-windows and --remote-expert-opt are both in this config: the engine turns the pipeline off "
+                 "beside the helper caches. Keep one - remove --remote-expert-opt for the pipeline "
+                 "(docs/MULTI_GPU.md, #1352)")
+        else:
+            ok("multi-GPU: --pipeline-windows is set, so --remote-expert-opt is not added (the helper caches turn the "
+               "pipeline off; docs/MULTI_GPU.md)")
+        return
     if REMOTE_EXPERT_OPT not in args:
         args.append(REMOTE_EXPERT_OPT)
         ok("multi-GPU: --remote-expert-opt (helper expert caches complementary to the main GPU's, #578; "
@@ -2741,6 +2753,7 @@ def verify_engine_archive(z: Path, asset: str, base: str) -> None:
         got = h.hexdigest()
         drop_download(z)
         raise UnverifiedEngine(f"{z.name} has the wrong SHA-256 ({got}, expected {sha})")
+    ok(f"{z.name}: SHA-256 checksum verified against GitHub's ({sha[:12]}...)")
 
 
 def engine_refused(asset: str, e: Exception, updating: bool) -> None:
@@ -2804,6 +2817,17 @@ def install_unpacked(tmp: Path, eng: Path) -> None:
             shutil.move(str(prev / dst.name), str(dst))
         shutil.rmtree(prev, ignore_errors=True)
         raise
+    # #1403 debt: get_prebuilt moved the old BUILD.json aside (BUILD.json.prev) instead of deleting it; it goes with the
+    # engine it describes, so engine_version_of(.previous) says the version instead of "?"
+    kept = eng / "BUILD.json.prev"
+    if kept.exists():
+        try:
+            if moved and not (prev / "BUILD.json").exists():
+                shutil.move(str(kept), str(prev / "BUILD.json"))
+            else:
+                kept.unlink()
+        except OSError:
+            pass
     if moved:
         ok(f"the engine it replaced ({engine_version_of(prev)}) is kept in {prev}; "
            "setup.py --rollback-engine puts it back")
@@ -2856,7 +2880,7 @@ def get_prebuilt(url_base, gpu, vision, updating=False, toolkit=13) -> Path | No
             ok("ready-made engine already installed")
             return eng
         say(f"  Updating the ready-made engine ({meta.get('version')} -> {'.'.join(map(str, MIN_ENGINE))} or newer) ...")
-        info.unlink()
+        info.replace(eng / "BUILD.json.prev")   # kept for the .previous copy
     if not url_base:
         return None
     eng.mkdir(exist_ok=True)

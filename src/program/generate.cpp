@@ -1584,6 +1584,13 @@ int main(int argc, char** argv) {
     // pipe or a file is block-buffered, so a program that dies loses every line it had already printed - which
     // turns "it crashed at step 7" into "it crashed somewhere", and the difference is a debugging session.
     std::setvbuf(stdout, nullptr, _IONBF, 0);
+    // `strata --version` / `-V` (also `strata generate --version`): the version and nothing else, before any GPU is touched
+    for (int i = 1; i < argc && i < 3; ++i) {
+        if (std::strcmp(argv[i], "--version") == 0 || std::strcmp(argv[i], "-V") == 0) {
+            std::printf("strata %s\n", STRATA_VERSION);
+            return 0;
+        }
+    }
 #if (defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)) && !defined(_WIN32)
     // AMD, a file-backed arena (STRATA_ARENA_MMAP): ROCclr copies a pageable source of 1 MiB or more by locking its
     // pages in place (a GPU userptr), and keeps them - so every expert the VRAM fill copied from the mapped
@@ -6284,6 +6291,14 @@ int main(int argc, char** argv) {
 #endif
     }
     if (o.adapt_async && !src.complement_ready()) adapt_async_off("the resident RAM mode is not running");
+    // pp-opt: with the file tier unbuffered, the mapped view of experts.bin is only a fallback from here on - and while
+    // it exists NTFS serves the unbuffered reads one at a time (drop_mapping).  STRATA_KEEP_MAPPING=1 keeps it (A/B).
+    if (srcp == &src && src.unbuffered() && std::getenv("STRATA_KEEP_MAPPING") == nullptr) {
+        std::string why;
+        const bool dropped = src.drop_mapping(why);
+        std::fprintf(stderr, "strata generate: the mapped view of the experts %s (%s)\n",
+                     dropped ? "is closed" : "stays open", why.c_str());
+    }
     if (o.serve) {
         if (o.spec < 2 || o.prefill_chunk <= 0 ||
             (graph_hits && (thits.d_res == nullptr || host_res.empty()))) {
@@ -6298,6 +6313,10 @@ int main(int argc, char** argv) {
         // confirms every emitted token against the real model regardless of where the draft came from.
         const bool use_mtp = !o.mtp.empty();
         strata::prefill::Prefill sp;
+        // the pool is idle while a prompt is read unless batch slots decode between its parts; with
+        // STRATA_PREFILL_CPU_SHARE the staged-chunk limit before the chunk below sizes the loans (bytes_needed reads it)
+        const bool share_pool = o.batch <= 0 && !o.no_pool;
+        strata::prefill::Prefill::arm_cpu_share(share_pool, share_pool && stages.empty() && !multi_gpu);
         void* borrow = nullptr;
         uint64_t borrow_bytes = 0;
         int32_t lend_first = -1;          // the first slot the prompt path may borrow (its largest chunk)
@@ -6590,6 +6609,7 @@ int main(int argc, char** argv) {
                     sb = st.cache.device_slot(pf_parts[i + 1].first);
                     sbb = part_bytes(pf_parts[i + 1], pf_parts[i + 1].first);
                 }
+                if (share_pool) st.sp.set_cpu_pool(&pool);   // one stage at a time takes it for a chunk (prefill.cpp)
                 if (!st.sp.init(st.wt, g, st.ss, srcp, &st.cache, host_res.data(), o.prefill_chunk, (void*) st.stream,
                                 err, sb, sbb)) {
                     err = "layer split, CUDA" + std::to_string(st.dev) + " prompt path: " + err;
@@ -6597,8 +6617,7 @@ int main(int argc, char** argv) {
                 }
             }
             if (multi_gpu) sp.set_stage(0, split_at[0], &stages[0]->sp);
-            // the pool is idle while a prompt is read unless batch slots decode between its parts
-            if (!multi_gpu && o.batch <= 0 && !o.no_pool) sp.set_cpu_pool(&pool);
+            if (share_pool) sp.set_cpu_pool(&pool);
             if (!sp.init(wt, g, ss, srcp, &xcache, host_res.data(), o.prefill_chunk, main_cs, err, borrow, borrow_bytes))
                 return err.find("do not fit") != std::string::npos ? 2 : 1;
             return 0;
@@ -8563,6 +8582,11 @@ int main(int argc, char** argv) {
         // ---- --batch-groups: the slot groups pipelined through the stages (--batch-groups G > 1 with a layer split)
         const int n_pipe = (int) stages.size() + 1;
         const bool piped = o.batch > 0 && o.batch_groups > 1 && n_pipe > 1;
+        if (piped && batch_mtp)   // #1413: said, not silent
+            std::fprintf(stderr,
+                         "strata generate: WARNING: --batch-groups %d runs the pipelined path, which builds one row per slot: "
+                         "--batch-mtp's per-slot MTP drafts do not run there (their drafters still hold VRAM, about 0.9 GB per "
+                         "slot). Drop --batch-mtp, or use --batch-groups 1.\n", o.batch_groups);
         const int GS = piped ? o.batch / o.batch_groups : o.batch;
         struct PGroup {
             bool inflight = false;
@@ -11171,6 +11195,7 @@ int main(int argc, char** argv) {
     int64_t pos_start = 0;
     int64_t spec_pos = 0;   // plan v0.3 P6: where the speculative loop starts (0 = not used)
     strata::prefill::Prefill prefill;
+    strata::prefill::Prefill::arm_cpu_share(!multi_gpu && !o.no_pool, !multi_gpu && !o.no_pool && o.batch <= 0);   // before the chunk below sizes the loan
     bool kvg_started = false;   // the elastic K/V took this run's cells
     double prefill_batched_ms = 0;
     std::FILE* final_r = o.dump_final_r.empty() ? nullptr : std::fopen(o.dump_final_r.c_str(), "wb");

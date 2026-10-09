@@ -387,6 +387,36 @@ class ParallelService(unittest.TestCase):
             self.assertEqual(len(self.svc.history), 2)
         self.assertFalse(any(self.engine.slot_busy))
 
+    def test_three_requests_long_long_short_do_not_deadlock(self):
+        """ENGINE_REVIEW finding 1 (0.1.41 check): two long prompts fill both slots, a short one arrives a moment later
+        and wants one of them (the yield path).  The reviewer's repro: long, long, short at 0.25 s steps.  Every
+        request must be answered; none may wait on the control lock that the yielding read holds."""
+        self.start(2)
+        texts = ["long " * 600, "lung " * 600, "short"]
+        res, errors = {}, []
+
+        def go(t):
+            t0 = time.time()
+            try:
+                r = self.chat(t, max_tokens=64)
+                res[t] = (r["choices"][0]["message"]["content"], time.time() - t0)
+            except Exception as e:      # noqa: BLE001 - a timeout is the failure this test looks for
+                errors.append((t[:6], repr(e)))
+        threads = []
+        for t in texts:
+            th = threading.Thread(target=go, args=(t,))
+            th.start()
+            threads.append(th)
+            time.sleep(0.25)
+        for th in threads:
+            th.join(45)
+        self.assertFalse(any(th.is_alive() for th in threads), "a request never finished (deadlock)")
+        self.assertEqual(errors, [])
+        self.assertEqual(sorted(r[0] for r in res.values()), ["ok, done."] * 3)
+        self.assertFalse(any(self.engine.slot_busy))
+        with self.svc.status_lock:
+            self.assertEqual(len(self.svc.history), 3)
+
     def test_an_admission_gives_way_too(self):
         """The same while another request decodes in a slot: the long one is being admitted, a short one waits."""
         self.start(3)

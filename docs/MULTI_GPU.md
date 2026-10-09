@@ -65,6 +65,8 @@ number per card after the first, not a count of layers per card. With 4 cards an
 (or `[24, 36, 42]`) puts layers 0-23 on the first card, 24-35 on the second, 36-41 on the third and 42-47 on the last.
 The server checks it before the start and says what is wrong (0.1.39, #644).
 
+**Card order with `"auto"`** (NVIDIA, #1352): the faster card (multiprocessors x max clock) goes **last** - the last stage runs the head, the draft layer and the verify, and a prompt chunk waits on it (a 4070 Ti SUPER + 5060 Ti read a 6K prompt in 50 s one way round and 15 s the other). Equal cards keep your order; a manual split keeps it too. `"gpu_order": "as_given"` keeps the order you wrote under `"auto"` as well. The engine log line `layer split: card order ...` says when it changed.
+
 **Skip the split when the first card holds everything** (opt-in, 0.1.31): `"split_skip_if_fits": true` in the config
 (engine flag `--split-skip-if-fits`, with `--layer-split auto`) runs on the first card alone when it holds every
 profiled expert plus the context's KV, the draft layer and the reserve, and says so in the log; otherwise the split
