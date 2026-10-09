@@ -55,6 +55,7 @@
 #include "strata/kernels/qsa.hpp"
 #include "strata/core/native_head.hpp"
 #include "strata/core/verify.hpp"
+#include "strata/core/ep_twin.hpp"
 #include "strata/core/mtp.hpp"
 #include "strata/prefill/prefill.hpp"
 #include "strata/core/native_dense.hpp"
@@ -2031,6 +2032,24 @@ int main(int argc, char** argv) {
     }
 #endif
     strata::core::set_coupled_draft(o.coupled_draft);
+    // --ep-twins (STRATA_EP_TWINS=1, opt-in; strata/core/ep_twin.hpp): expert parallelism inside each NVLink pair.  A
+    // layer-split stage's partner GPU computes the routed experts it holds while the stage runs; the two caches trade
+    // half their experts at the start.  The tiers that move experts at run time (the adaptive tier, the elastic K/V)
+    // stay off with it, as do the batch slots, the pipelined windows and a peer device.
+    const bool ep_twins = [] { const char* v = std::getenv("STRATA_EP_TWINS"); return v != nullptr && std::atoi(v) != 0; }();
+    if (ep_twins) {
+        if (o.batch > 0 || o.pipeline_windows > 0 || o.peer_device >= 1) {
+            std::fprintf(stderr, "strata generate: STRATA_EP_TWINS=1 does not run with --batch, --pipeline-windows or --peer-device\n");
+            return 2;
+        }
+        o.adapt_every = 0;
+        o.adapt_async = 0;
+        // the prompt path's loan borrows the tail of a stage's cache and refills only the stage's own layers: the
+        // partner's experts traded into that tail would come back as prompt buffers (M2: lend around them)
+        o.no_prefill_borrow = true;
+        std::fprintf(stderr, "strata generate: STRATA_EP_TWINS=1: expert parallelism inside each NVLink pair (the adaptive tier "
+                             "and the prompt path's cache loan are off)\n");
+    }
     {   // --host-core / STRATA_HOST_CORE, before the pool and the session pin any thread
         std::string hc = o.host_core;
         if (hc.empty())
@@ -4957,6 +4976,81 @@ int main(int argc, char** argv) {
     }
     if (multi_gpu)
         std::fprintf(stderr, "strata generate: layer split: CUDA0 runs layers 0-%lld\n", (long long) (split_at[0] - 1));
+    // --ep-twins: each NVLink pair's two caches trade every other cached expert of the pair's most common blob size,
+    // slot for slot (stage A's odd-ranked ones for stage B's), so each cache holds half of its own stage's set and half
+    // of its partner's.  Each stage's set - the union - is what it was, so the outputs stay the same.
+    std::vector<int> ep_partner, ep_dev;
+    if (ep_twins && multi_gpu) {
+        const int n_st = 1 + (int) stages.size();
+        int dev0 = 0;
+        cudaGetDevice(&dev0);
+        ep_dev.resize((size_t) n_st);
+        for (int st = 0; st < n_st; ++st) ep_dev[(size_t) st] = st == 0 ? dev0 : stages[(size_t) st - 1]->dev;
+        ep_partner.assign((size_t) n_st, -1);
+        for (int st = 0; st < n_st; ++st)
+            for (int o2 = 0; o2 < n_st && ep_partner[(size_t) st] < 0; ++o2) {
+                if (o2 == st || gpu_numa_node(ep_dev[(size_t) o2]) < 0 ||
+                    gpu_numa_node(ep_dev[(size_t) o2]) != gpu_numa_node(ep_dev[(size_t) st]))
+                    continue;
+                int can = 0;
+                cudaDeviceCanAccessPeer(&can, ep_dev[(size_t) st], ep_dev[(size_t) o2]);
+                if (can) ep_partner[(size_t) st] = o2;
+            }
+        auto cache_of = [&](int st) -> strata::core::ExpertCache& { return st == 0 ? xcache : stages[(size_t) st - 1]->cache; };
+        auto prof_of = [&](int st) -> const std::vector<std::pair<int32_t, int32_t>>& {
+            return st == 0 ? profile : stages[(size_t) st - 1]->profile;
+        };
+        const auto& lay = strata::kernels::cpu::expert_layout();
+        for (int a = 0; a < n_st; ++a) {
+            const int b = ep_partner[(size_t) a];
+            if (b <= a || ep_partner[(size_t) b] != a) continue;   // each pair once
+            for (int d = 0; d < 2; ++d) {
+                const strata::core::OnDevice on(ep_dev[(size_t) (d ? b : a)]);
+                if (cudaDeviceEnablePeerAccess(ep_dev[(size_t) (d ? a : b)], 0) != cudaSuccess) (void) cudaGetLastError();
+            }
+            std::map<uint64_t, int64_t> sizes;
+            for (int64_t l = 0; l < g.n_layers; ++l)
+                if (stage_of(l) == a || stage_of(l) == b) ++sizes[lay.blob_bytes(l)];
+            uint64_t std_b = 0;
+            int64_t best_n = -1;
+            for (const auto& [sz, cnt] : sizes) if (cnt > best_n) { best_n = cnt; std_b = sz; }
+            auto picks = [&](int st) {
+                std::vector<std::pair<int32_t, int32_t>> v;
+                int64_t rank = 0;
+                for (const auto& pr : prof_of(st)) {
+                    if (lay.blob_bytes(pr.first) != std_b || cache_of(st).slot_of(pr.first, pr.second) < 0) continue;
+                    if (rank++ % 2 == 1) v.push_back(pr);
+                }
+                return v;
+            };
+            const auto va = picks(a), vb = picks(b);
+            size_t n = std::min(va.size(), vb.size());
+            if (const char* v = std::getenv("STRATA_EP_TRADE_MAX"); v != nullptr)   // tests: at most this many trades
+                n = std::min<size_t>(n, (size_t) std::max(0, std::atoi(v)));
+            for (size_t i = 0; i < n; ++i) {
+                const int32_t la = va[i].first, ea = va[i].second, lb2 = vb[i].first, eb = vb[i].second;
+                const int32_t sa = cache_of(a).slot_of(la, ea), sb = cache_of(b).slot_of(lb2, eb);
+                // one blob at a time: a GPU-held expert is not in the RAM copy, and the source may read it into a buffer
+                // the next call reuses
+                const uint8_t* bb = srcp->blob_stable(lb2, eb);
+                bool okf = bb != nullptr;
+                if (okf) { const strata::core::OnDevice on(ep_dev[(size_t) a]); okf = cache_of(a).fill_slot_blocking(sa, bb, err, (int64_t) std_b); }
+                const uint8_t* ba = okf ? srcp->blob_stable(la, ea) : nullptr;
+                okf = okf && ba != nullptr;
+                if (okf) { const strata::core::OnDevice on(ep_dev[(size_t) b]); okf = cache_of(b).fill_slot_blocking(sb, ba, err, (int64_t) std_b); }
+                if (!okf) {
+                    std::fprintf(stderr, "strata generate: STRATA_EP_TWINS: the trade failed: %s\n", err.c_str());
+                    return 1;
+                }
+                cache_of(a).reassign(la, ea, lb2, eb);
+                cache_of(b).reassign(lb2, eb, la, ea);
+            }
+            std::fprintf(stderr, "strata generate: STRATA_EP_TWINS: CUDA%d (stage %d) and CUDA%d (stage %d) traded %zu cached "
+                                 "experts each (%llu-byte blobs; %zu and %zu were eligible)\n",
+                         ep_dev[(size_t) a], a + 1, ep_dev[(size_t) b], b + 1, n, (unsigned long long) std_b,
+                         va.size() * 2, vb.size() * 2);
+        }
+    }
 
     // ---- LAYER 2: exact startability probe on the live free figures.  Every session, cache and batch slot is
     // carved by now, so `cudaMemGetInfo` reads what serve's own_fits (5855-5869) will read.  Run serve's own
@@ -5740,6 +5834,7 @@ int main(int argc, char** argv) {
     // Plan v0.3 P4: with a PROFILE-filled cache the residency is static, so the hit decision moves onto the
     // device and the token graph keeps it.  (A cache filled on demand still needs the per-layer host path.)
     std::vector<int32_t> host_res;
+    std::vector<std::vector<int32_t>> ep_res;   ///< --ep-twins: per stage, (layer, expert) -> slot in the partner's cache
     // The residency table is read by kernels on non-blocking streams, which do not wait for the legacy stream a plain
     // cudaMemcpy runs on, and a pageable copy can return before its DMA has landed: each upload waits for its own copy
     // (the current device's legacy stream, stream 0 - nothing else; HIP has no cudaStreamLegacy name, #550).
@@ -5753,14 +5848,28 @@ int main(int argc, char** argv) {
     const bool graph_hits = hit_fn != nullptr && !profile.empty() && !o.no_pool;
     if (graph_hits && !o.no_capture && !o.no_token_graph && layer_dump == nullptr && half_dump == nullptr) {
         host_res.assign((size_t) (g.n_layers * g.n_expert), strata::core::kNotResident);
-        int64_t resident = 0;
+        int64_t resident = 0, twin_held = 0;
+        if (!ep_partner.empty())
+            ep_res.assign(ep_partner.size(), std::vector<int32_t>((size_t) (g.n_layers * g.n_expert), strata::core::kNotResident));
         for (int64_t l = 0; l < g.n_layers; ++l)
             for (int64_t e = 0; e < g.n_expert; ++e) {
                 const int st = multi_gpu ? stage_of(l) : 0;
-                const int32_t slot = st > 0 ? stages[(size_t) st - 1]->cache.slot_of(l, e) : xcache.slot_of(l, e);
+                int32_t slot = st > 0 ? stages[(size_t) st - 1]->cache.slot_of(l, e) : xcache.slot_of(l, e);
+                if (slot == strata::core::kNotResident && !ep_partner.empty() && ep_partner[(size_t) st] >= 0) {
+                    const int p = ep_partner[(size_t) st];   // --ep-twins: the stage's partner holds it
+                    const int32_t ps = p > 0 ? stages[(size_t) p - 1]->cache.slot_of(l, e) : xcache.slot_of(l, e);
+                    if (ps >= 0) {
+                        ep_res[(size_t) st][(size_t) (l * g.n_expert + e)] = ps;
+                        slot = strata::core::kTwinHeld;
+                        ++twin_held;
+                    }
+                }
                 host_res[(size_t) (l * g.n_expert + e)] = slot;
-                if (slot != strata::core::kNotResident) ++resident;
+                if (slot >= 0) ++resident;
             }
+        if (twin_held > 0)
+            std::fprintf(stderr, "strata generate: STRATA_EP_TWINS: %lld experts computed by the stages' NVLink partners\n",
+                         (long long) twin_held);
         if (cudaMalloc((void**) &d_res, host_res.size() * sizeof(int32_t)) != cudaSuccess ||
             cudaMalloc((void**) &d_hit_count, sizeof(int32_t)) != cudaSuccess ||
             res_put(d_res) != cudaSuccess) {
@@ -5779,7 +5888,7 @@ int main(int argc, char** argv) {
             uint64_t released = 0;
             if (!keep)
                 for (size_t i = 0; i < host_res.size(); ++i)
-                    if (host_res[i] != strata::core::kNotResident)
+                    if (host_res[i] >= 0)   // a GPU holds it (kTwinHeld: the partner's prompt path may still stream it)
                         released += srcp->release((int64_t) i / g.n_expert, (int64_t) i % g.n_expert);
             if (released > 0)
                 std::fprintf(stderr, "strata generate: expert arena: %.2f GiB of VRAM-held experts handed back to the OS\n",
@@ -6051,7 +6160,7 @@ int main(int argc, char** argv) {
         int64_t grows = 0, trims = 0, fresh = 0, evicted = 0, refilled = 0;
     } kvg;
     auto kvg_start = [&](int64_t top) {
-        kvg.on = strata::core::qsa_kv_elastic() && xcache.vmm_range() != nullptr && d_res != nullptr &&
+        kvg.on = !ep_twins && strata::core::qsa_kv_elastic() && xcache.vmm_range() != nullptr && d_res != nullptr &&
                  !host_res.empty() && srcp != nullptr && top > kvg.floor;
         if (!kvg.on) return;
         kvg.top = kvg.lo = top;
@@ -7068,6 +7177,7 @@ int main(int argc, char** argv) {
                 stage_ver(st).set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
             }
         }
+        std::vector<std::unique_ptr<strata::core::EpTwin>> ep_twin_objs;   // --ep-twins: outlive the serve loop
         // the missed-expert fetch: each stage's same-socket peer GPU (an AC922's NVLink pair) fetches half of it
         if (n_stages > 1 && !split_same) {
             ver.set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
@@ -7083,6 +7193,32 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: %s\n", err.c_str());
                     return 1;
                 }
+            }
+        }
+        // --ep-twins: each stage's partner computes the experts its cache holds for the stage
+        if (!ep_partner.empty() && !ep_res.empty() && n_stages > 1 && !split_same) {
+            for (int st = 0; st < n_stages; ++st) {
+                const int p = ep_partner[(size_t) st];
+                if (p < 0) continue;
+                strata::core::ExpertCache& cp = p == 0 ? xcache : stages[(size_t) p - 1]->cache;
+                const uint64_t* so = cp.slot_offsets();
+                if (so == nullptr) {
+                    std::fprintf(stderr, "strata serve: STRATA_EP_TWINS needs a native pack (sized cache slots)\n");
+                    return 1;
+                }
+                const std::vector<uint64_t> offs(so, so + cp.slots() + 1);
+                const int64_t lb = st == 0 ? 0 : split_at[(size_t) st - 1];
+                const int64_t le = st + 1 < n_stages ? split_at[(size_t) st] : g.n_layers;
+                auto tw = std::make_unique<strata::core::EpTwin>();
+                if (!tw->init(ep_dev[(size_t) st], ep_dev[(size_t) p], lb, le, g.n_expert, (int) ss.k, g.n_embd,
+                              strata::kernels::kVerifyMaxT, cp.device_slot(0), offs, ep_res[(size_t) st], err)) {
+                    std::fprintf(stderr, "strata serve: %s\n", err.c_str());
+                    return 1;
+                }
+                stage_ver(st).set_ep_twin(tw.get());
+                std::fprintf(stderr, "strata serve: STRATA_EP_TWINS: stage %d (CUDA%d, layers %lld-%lld): its twin is CUDA%d\n",
+                             st + 1, ep_dev[(size_t) st], (long long) lb, (long long) (le - 1), ep_dev[(size_t) p]);
+                ep_twin_objs.push_back(std::move(tw));
             }
         }
         if (pipe) {   // the odd windows' pool routing: the same as the even ones', with their plans

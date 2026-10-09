@@ -36,6 +36,9 @@ namespace strata::core {
 /// needs, and a table that has to be re-derived from a bitmask is a table that will be re-derived differently
 /// in the two places that use it.
 inline constexpr int32_t kNotResident = -1;
+/// --ep-twins (ep_twin.hpp): in the engine's residency table, an expert of this stage that its NVLink partner's
+/// cache holds and computes - not a miss, not the CPU's, not the PCIe share's.
+inline constexpr int32_t kTwinHeld = -2;
 
 /// **THE STATIC RESIDENCY PLAN, READ BACK FROM THE FILE `tools/make_profile.py` WROTE.**
 ///
@@ -149,6 +152,15 @@ public:
     /// sweep) and a placeholder policy would set the hit rate that everything downstream is then sized against.
     int32_t admit(int64_t layer, int64_t expert);
 
+    /// --ep-twins: the slot of (old_layer, old_expert) now holds (new_layer, new_expert) (after its copy completed).
+    /// The copy refilled a slot that was filled already: it does not count as a fill (fills() == resident() is the
+    /// "cache fully filled" check of the resident RAM copy).
+    void reassign(int64_t old_layer, int32_t old_expert, int64_t new_layer, int32_t new_expert) {
+        auto& old = residency_[(size_t) old_layer * n_expert_ + old_expert];
+        residency_[(size_t) new_layer * n_expert_ + new_expert] = old;
+        old = kNotResident;
+        --fills_;
+    }
     /// Publish a same-layer replacement after its slot copy has completed.
     void replace(int64_t layer, int32_t old_expert, int32_t new_expert) {
         auto& old = residency_[(size_t) layer * n_expert_ + old_expert];

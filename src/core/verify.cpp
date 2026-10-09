@@ -1,5 +1,6 @@
 // src/core/verify.cpp - see include/strata/core/verify.hpp.
 #include "strata/core/verify.hpp"
+#include "strata/core/ep_twin.hpp"
 #include "strata/core/weight_form.hpp"
 #include "strata/core/remote_expert_opt.hpp"
 #include "strata/core/dma_batch.hpp"
@@ -787,6 +788,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     };
     bool sg_gated_[2] = {false, false};   // per group: the combine applies the shared gate
     if (!batch_rec_) groups_[T] = G;
+    if (ep_twin_ != nullptr && !batch_rec_) ep_twin_->rec_begin(cs);   // --ep-twins: this window's epoch
     // Programmatic dependent launch (pdl.hpp; sm_90+, opt-in: STRATA_DF_PDL=1): the window's quantizations and dense
     // projections may start while the kernel before them finishes, loading their weights before they wait for its
     // output.  Only a launch whose predecessors in the graph are all kernels gets programmatic edges; every value is
@@ -1473,6 +1475,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         } else
             quantize_q8_0_scaled(xm, hit_xq_ + (size_t) tb * (N / 32) * 34, hit_xs_ + (size_t) tb * (N / 32), (int64_t) n * N, cs);
         stamp(l, 18, grp);
+        if (ep_twin_ != nullptr)   // --ep-twins: the experts' input and the routed ids to the twin
+            ep_twin_->rec_push_input((int) ((l - lb_) * G + grp), nat_xq_ + (size_t) tb * (N / 32) * 36, n, ids_ + tb * K,
+                                     n * (int) K, cs);
         return true;
     };
 
@@ -1576,6 +1581,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             }
             moe_hit_add(parts_out, hit_out, p_dst, p_counts + 1, cap, N, cs);
         }
+        // --ep-twins: the rows of the experts the twin holds, merged before the combine reads them
+        if (ep_twin_ != nullptr) ep_twin_->rec_merge((int) ((l - lb_) * G + grp), grp, parts_out, n * (int) K, cs);
         // Same condition as `sh_fork` above, which is per group and out of scope here: wait only when the fork
         // actually ran (a wait on an event never recorded is a no-op, but saying it outright reads better).
         if (sh_stream_on() && !prof_on_ && sh_cs_ != nullptr && ev_fork_ != nullptr && ev_join_ != nullptr) {
@@ -1870,6 +1877,7 @@ bool Verifier::capture(int T, std::string& err) {
     cudaMemGetInfo(&vfree, &vtotal);
     std::fprintf(stderr, "strata verify: captured the %d-token window (upload %s, sync %s; %zu MiB of VRAM free)\n", T,
                  cudaGetErrorString(ue), cudaGetErrorString(us), vfree >> 20);
+    if (ep_twin_ != nullptr && !ep_twin_->capture(T, groups_[T] > 0 ? groups_[T] : 1, err)) return false;
     return true;
 }
 
@@ -2045,6 +2053,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     const cudaError_t le = cudaGraphLaunch(ar_off_ ? exec_nr_[T] : exec_[T], cs_);
     trace_ev("LAUNCHED", -1, -1, (int64_t) le);
     if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
+    if (ep_twin_ != nullptr && !ep_twin_->launch(T, err)) return false;   // --ep-twins: beside the stage's graph
     (void) cudaStreamQuery(cs_);
     VDBG("launched\n");
     volatile uint32_t* const seq = h_seq_;
@@ -2177,6 +2186,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     const cudaError_t se = cudaStreamSynchronize(cs_);
     trace_ev("SYNCED", -1, -1, (int64_t) se);
     if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
+    if (ep_twin_ != nullptr && !ep_twin_->sync(err)) return false;
     if (ar_on() && h_plan_err_ != nullptr && *(volatile uint32_t*) h_plan_err_ != 0) {   // #871: refresh_ar saw the table whole
         *(volatile uint32_t*) h_plan_err_ = 0;
         err = "verify: the all-resident plan met an expert that is not in VRAM (the residency table changed during the window)";

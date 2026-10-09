@@ -2043,7 +2043,8 @@ void RouterLookahead::run() {
                               [&](int32_t a, int32_t b) { return lt[(size_t) a] > lt[(size_t) b]; });
             for (int j = 0; j < k_; ++j) {
                 const int64_t e = order[(size_t) j];
-                if (host_res != nullptr && host_res[(size_t) (layer * n_expert_ + e)] >= 0) continue;   // on the GPU
+                if (host_res != nullptr && (host_res[(size_t) (layer * n_expert_ + e)] >= 0 ||
+                                            host_res[(size_t) (layer * n_expert_ + e)] == kTwinHeld)) continue;   // on a GPU
                 if (std::find(want.begin(), want.end(), e) == want.end()) want.push_back(e);
             }
         }
@@ -3313,6 +3314,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 distinct[nd++] = i;
                 const int32_t e = ids[i];
                 if (e >= 0 && e < d.n_expert && d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] < 0 &&
+                    d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] != kTwinHeld &&
                     !(d.peer != nullptr && d.peer->has(d.layers, e)) && !helper_holds(e)) ++nmiss;
             }
         }
@@ -3333,6 +3335,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                     kd = 0;
                     ptr = (unsigned long long) (d.cache_base + (d.cache_slot_off ? (size_t) d.cache_slot_off[slot]
                                                                                  : (size_t) slot * (size_t) d.cache_blob));
+                } else if (slot == kTwinHeld) {
+                    kd = 3;                        // --ep-twins: the stage's NVLink partner computes it (ep_twin.hpp)
                 } else if (d.peer != nullptr && d.peer->has(d.layers, e)) {
                     kd = 2;                        // multi-GPU: the second GPU computes it
                 } else if (helper_holds(e)) {
@@ -3395,6 +3399,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             const int32_t e = ids[i];
             kind[i] = (e >= 0 && e < d.n_expert && d.host_res != nullptr &&
                        d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0) ? 0
+                    : (e >= 0 && e < d.n_expert && d.host_res != nullptr &&
+                       d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] == kTwinHeld) ? 3
                     : (e >= 0 && e < d.n_expert && d.peer != nullptr && d.peer->has(d.layers, e)) ? 2 : -1;
         }
     }
