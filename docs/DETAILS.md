@@ -110,6 +110,20 @@ answer after a start differ from the next ones. Measured here (IQ3_XXS, a 3.6K-t
 three switches 1 answer of 4, without `--pcie-frac 0` 2 of 4 (the first one differs), with the defaults 2 of 4.
 `--pcie-frac 0` costs decode speed (the missed experts all run on the CPU), so keep it for A/B runs.
 
+**Coupled drafts with Gumbel-max picks (opt-in, `STRATA_SPEC_COUPLED=1` and `STRATA_SPEC_GUMBEL=1`):** for a request
+that samples (temperature above 0), `STRATA_SPEC_COUPLED=1` lets the draft layer sample its guesses with the target's own
+chain and random draw instead of taking its most likely token. `STRATA_SPEC_GUMBEL=1` changes how both of them pick from
+that chain: the token with the largest p / E, where E is exponential noise keyed by the seed, the position and the token
+id (the Gumbel-max trick; it is still an exact sample of the same distribution). With the default pick, one random number
+walked over the candidates sorted by probability, a draft and a target whose candidate lists differ in one token tend to
+land on different tokens; with noise keyed by the token, a token gets the same noise on both sides, so they agree on the
+tokens they share. Greedy requests are unchanged, and without the variables nothing changes. Measured on a Ryzen AI
+Max+ 395 (Radeon 8060S, Linux, ROCm 7.14.1, the iGPU alone), UD-Q4_K_XL, `--spec 4 --mtp` (the base model's draft
+layer), temperature 1.0 / top_p 0.95 / top_k 20, a 1.3K-token prompt and 512 output tokens, 12-13 requests per arm:
+drafts accepted 52.8% -> 59.9%, tokens per verify window 2.65 -> 2.88, output 41.1 -> 44.9 tokens/s (+9%); a window
+costs the same (draft 8.8 -> 9.1 ms of 64). `sampler_parity` checks the pick against a host reference on every sampled
+path, and that its frequencies match the softmax. On an RTX 3060 (IQ3_XXS, `--spec 4 --mtp`, temperature 1.0 / top_p 0.95 / top_k 20, 12 interleaved pairs of 200-token story and code requests) `STRATA_SPEC_COUPLED=1` raised the accepted drafts from 62.1% to 66.9% and adding `STRATA_SPEC_GUMBEL=1` to 68.0%, but decode speed did not move beyond the run-to-run spread (median 43.3 tok/s with coupled alone, 42.8 with Gumbel as well): try it on your own card before relying on it.
+
 **The draft layer's tokens (0.1.27, `--draft-vocab`):** the MTP draft layer can only propose tokens from a subset
 of the vocabulary (`mtp/rt/draft_vocab.bin`). Since 0.1.27 the subset includes every Chinese, Japanese and Korean
 token (106,299 ids), so answers in those languages are 15-38% faster (Q2_0, RTX 5070). Its head takes ~180 MiB of
@@ -205,6 +219,28 @@ saves the 23-50 GB copy on the disk. The answers are the same: on the Coder, 64 
 from the GGUF gave identical tokens and logits. An expert read from the GGUF is three reads instead of one, so the
 engine fetches a layer's missing experts on 8 threads (`STRATA_FETCH_THREADS`) with one batched page request
 (Windows `PrefetchVirtualMemory`). With an `experts.bin` in the pack, nothing changes. Setup does not use this yet.
+
+**Linux file-tier I/O path (opt in, `STRATA_IO_PREFETCH=1`; 0.1.40.2):** the mapped file tier reads experts through
+page faults. With this on, the layer's uncached experts and the router-predicted ones of the next layer (`STRATA_LOOKAHEAD_K`,
+`STRATA_IO_PREFETCH_DEPTH`, default 2 when on) are read by I/O threads (`STRATA_IO_PF_THREADS`, default 8) with whole-blob
+`pread`s into the page cache, and the CPU kernels read the mapping as before. The bytes are the same, so the output is the
+same (greedy IQ3_XXS and Q2_0 hashes identical, prefetch off vs on). `STRATA_IO_PF_STAGE=1` instead stages every uncached
+expert in a buffer and makes the layer wait for them; `STRATA_IO_PF_AHEAD=0` keeps only the demand reads. The per-request
+log line "file tier I/O" shows what the OS read from the drive (/proc/self/io, major faults) against the engine's expert
+reads; `STRATA_IO_STATS=1` (or prefetch on) adds the page-cache hit / miss split (mincore) and the read-ahead used / unused counts.
+Measured (interleaved A/B, 10 pairs, 200-token greedy medians, page cache dropped before each run, memory limit by cgroup):
+
+| box, lane | default (fill) | `STRATA_IO_PF_STAGE=1` |
+|---|---|---|
+| RTX 3060, 32 GB, IQ3_XXS | -3.4% | **+25.7%** |
+| RTX 3060, 16 GB, IQ3_XXS | -1.8% | -32.6% |
+| Radeon 780M iGPU, 16 GB, Q2_0 (adaptive tier off) | -0.7% (story +3.8%, code +4.1%) | -19% |
+
+With the experts warm in the page cache (46 GB on the 3060, 60 GB on the iGPU box) the file tier already runs at the
+resident speed, so there is nothing to win; the gap is the cold start and the low-RAM lanes. So it is off by default, and
+the staging variant is worth trying only on a 32 GB-class box. **iGPU caveat:** on a Radeon 780M, prefetch together with the
+adaptive tier (`--adapt-every`, on by default) under memory pressure reset the GPU in about 7 of 9 runs (the engine
+prints a warning and runs as asked); with `--adapt-every 100000` there were no resets in ~40 runs. The cause is not found.
 
 **A RAM budget (engine 0.1.31, `--resident-budget-gib N`):** the resident variant for a model whose experts do not all
 fit: the N GiB of experts the GPU cache does not hold that the expert profile ranks hottest are copied into RAM at
@@ -441,6 +477,19 @@ install; `START-HERE.bat --calibrate` (Linux: `./setup.sh --calibrate`) does it 
 speed with each setting and keeps one only when it is more than 3% faster. The result is remembered per PC and model
 (in the settings file next to the data folder's record), so updates keep it.
 
+Measuring the worker count needs a fresh engine, so the model is loaded more than once: the PC is busy, and can
+stop responding for a minute or two, once per restart. It then starts the model, like a plain `START-HERE.bat`.
+
+**Manual CPU task granularity.** `--pool-tasks N` sets the target total number of row tasks in each batched
+CPU expert Gate/Up and Down phase, not the number of threads or tasks per expert. The default `0` keeps
+three tasks per participating thread (including the host when enabled). Values `1..4096` are capped by
+each phase's row count; native batches larger than the pool's capacity apply the target to each sub-batch.
+For example, `--pool-workers 13 --pool-tasks 192` uses 14 participating threads with the default host worker.
+More tasks can reduce imbalance between cores, but also add scheduling overhead: compare against `0` with
+the same worker count and workload. This does not change kernels, phase barriers, or PCIe placement, and
+does not affect the legacy single-token/oracle fallback. Setup's `--calibrate` does not tune it yet.
+For the server, add `"--pool-tasks", "192"` to the existing `args` list in its configuration, then restart it.
+
 ### Running it at startup (Task Scheduler)
 
 To have the model up at logon, people start the serve from **Task Scheduler** (or a service). Beware: Windows
@@ -513,7 +562,8 @@ the OS file cache, so loading again takes seconds while that RAM is not needed e
 16 GB with Q2_0 in the low-RAM mode: unloading takes ~0.3 s, and a request to an unloaded model answered after
 4.6 s (text) or 14.7 s (a picture, image encoder on the CPU).
 
-**Giving part of the VRAM back while it keeps serving (#533, opt-in, one NVIDIA GPU).** With `"vram_elastic": true`
+**Giving part of the VRAM back while it keeps serving (#533, opt-in, one NVIDIA GPU; every request and answer:
+[VRAM_ELASTIC.md](VRAM_ELASTIC.md)).** With `"vram_elastic": true`
 in the config (the engine flag `--vram-elastic`), the expert cache is allocated in 512 MiB segments
 (`"vram_segment_mib"`), and `POST /v1/vram` with `{"reserve_mib": 8000}` shrinks it between requests until that much
 VRAM is free for another program; `{"reserve_mib": null}` grows it back towards its full size, keeping the reserve
@@ -596,7 +646,32 @@ The server listens on `http://127.0.0.1:8080` (change with `--port` in setup, or
 | What the model is doing right now | `GET /status`, `GET /slots` (busy or idle, with `n_prompt_tokens`; one entry per slot with `--batch`) |
 | Save / restore the conversation to a file (session files, below) | `POST /slots/0?action=save\|restore` |
 | Everything the Monitor tab shows (engine, live state, last requests, hardware) | `GET /metrics` |
+| The same for Prometheus, with vLLM's metric names (asked with `Accept: text/plain` or `?format=prometheus`) | `GET /metrics` |
 | The MCP servers, their state and tools ([below](#tools-from-mcp-servers)) | `GET /mcp` |
+
+`GET /metrics` answers a Prometheus scrape (`Accept: text/plain` or `application/openmetrics-text`) in the text
+format with vLLM's names - `vllm:num_requests_running` / `_waiting`, `vllm:kv_cache_usage_perc`, the token and
+request counters, `vllm:prefix_cache_queries_total` / `_hits_total` (prompt tokens read / reused),
+`vllm:spec_decode_num_draft_tokens_total` / `_accepted_tokens_total` (the MTP drafts), and the histograms
+`vllm:time_to_first_token_seconds`, `vllm:inter_token_latency_seconds` and `vllm:e2e_request_latency_seconds` - so the
+dashboards and alerts written for a vLLM server read this one. With an API key, the scraper sends it as a bearer
+token. Any other request keeps the JSON.
+
+The JSON's own facts that vLLM has no name for come in the same scrape under `strata:`, named after their JSON key,
+so a Monitor-tab panel and a Grafana panel read the same value: `strata:live_state{state="..."}`, `strata:live_tok_s`,
+`strata:live_prefill_tok_s_mean`, `strata:live_prompt_read`, `strata:engine_max_context`,
+`strata:totals_prompt_seconds_total` / `strata:totals_decode_seconds_total`, `strata:last_hit_rate` and
+`strata:last_decode_tok_s` (the last request's), and the hardware - `strata:gpu_util`, `strata:gpu_mem_used_bytes`,
+`strata:gpu_mem_total_bytes`, `strata:gpu_temp_celsius`, `strata:gpu_power_watts` (one sample per card, label
+`gpu`), `strata:cpu`, `strata:ram_used_bytes`, `strata:ram_total_bytes`. A value the server does not have (no GPU
+telemetry, an older engine) has no sample rather than a zero.
+
+Ready to use, in `docs/monitoring/`: `prometheus.yml` (a scrape config, the API key as a bearer token),
+`servicemonitor.yaml` (the same for the Prometheus Operator) and `grafana-strata.json`, a Grafana dashboard to
+import (it asks for the Prometheus data source): requests running and waiting, tokens per second, time to first
+token, time between tokens and request duration (p50 / p95), the prompt cache and MTP draft rates, and the engine's
+own panels (state, batch slots, rates, expert cache hit rate, GPU and RAM). Its first row uses only vLLM's names, so
+it also reads a vLLM server.
 
 `/models` and `/v1/models` list only the loaded model, with its context limit and input modalities. `/props` exposes the original chat template, context limit, configured generation defaults (shared settings take precedence), model path and engine version when available. Context means the full engine context, not the resident KV window. `n_predict: -1` means no fixed output cap. Unconfigured sampling fields are omitted. `/slots` uses llama.cpp's names: `n_ctx` and `n_prompt_tokens` (the running request's prompt size, kept after it ends: what a front-end's context meter divides by `n_ctx`). `total_slots` in `/props` is the number of `--batch` slots (1 without). `autoload` has no effect; an unknown `model` returns 404. These metadata endpoints and `/slots` require the API key when one is configured. They do not load, unload or restart models.
 
@@ -679,6 +754,13 @@ print(r.choices[0].message.content)
   long prompt the stream sends keep-alives, so agents do not time out; the server window prints progress every
   15 s, and `GET /status` says what it is doing (`reading the prompt`, `answering`, tokens so far). Closing the
   connection or pressing stop in your app really stops the model, so the next request starts at once.
+- **Tool calls in other forms (opt-in).** `"tool_call_recovery": true` in `strata-<model>.json` reads a call of a
+  tool the request declared also when the model writes it as `<parameter=NAME>` instead of `<function=NAME>`, as JSON
+  (`{"name": ..., "arguments": ...}`) inside `<tool_call>`, as a `<function=NAME>` block at the start of a line
+  without `<tool_call>` (outside code), or as a second call inside the same `<tool_call>` (without the switch the
+  second call's parameters merge into the first). Anything else in those forms stays the text it is. Measured on
+  1,462 agent turns (Qwen3.8 under Claude Code, from signalnine/q27's drift corpus): 98.3% read as intended with it,
+  92.9% without. Off by default, so what a client gets back is unchanged unless you turn it on.
 - **Prefill progress in the stream (opt-in).** `"return_progress": true` puts that progress on the stream instead of
   sending only the keep-alive, as one extra field on a chunk with an empty delta: `prompt_progress` with `total`,
   `cache`, `processed` and `time_ms`. Those are llama.cpp's four fields and mean the same there (`time_ms` is the time
@@ -799,6 +881,20 @@ A one-shot request that no later request continues (a classification call, a pro
 follows the reused prefix (or the root) is read in one run, and its session is not kept or parked for a next request.
 It still starts from a checkpoint it matches, and still saves the system-prompt root when that reaches
 `--prompt-cache-root`. Without the field (or with `true`) nothing changes.
+
+**One long document, many questions: a pinned shared prefix (opt-in, 0.1.40.2, [RESEARCH_RUNS.md](RESEARCH_RUNS.md)).**
+A request can say where the document ends: `"strata_prefix": {"messages": 1}` (the first message is the document),
+`{"message": 0, "chars": 210000}` (the first 210,000 characters of message 0, for a client that sends the document and
+the question in one message) or `{"tokens": 12345}`. The engine reads the prompt in two parts there, keeps the checkpoint
+at the boundary pinned (retention never evicts it, a parked conversation holding it stays parked, `SAVE` keeps it) and,
+when a later question resumes from it, does not park the question it leaves. So the next question starts at the end of
+the document, and 20 questions cost one read of it. Without the field the server's checkpoints are where they were: the
+last turn's start, the system prompt's end and every `--prompt-cache-every` tokens, so a question that follows a long
+document in the same chat re-reads up to 16K tokens of it (55 s at 262K on a Tesla P100). The field is checked against the
+prompt's own ids (the prefix is always the longest common start), a prefix that cannot be marked is said in the server's
+window and ignored, and a malformed field is a 400. One pinned prefix at a time per engine (a new one replaces it);
+it needs `--prompt-cache 3` or more. `tools/research_run.py` runs a document and a question list against a server with and
+without it. The engine's own key is `pin=N` on the `GEN` line.
 
 **Multiple conversations (opt-in).** Add `--conversation-cache-mib 8192
 --conversation-cache-slots 4` to the engine arguments to park up to four conversations
@@ -975,6 +1071,8 @@ suppresses what the model itself just said, not the prompt alone. Since engine 0
 the speculative decoding checks at once, exactly as if it decoded one token at a time (before, only the first of
 each batch got them). That makes requests with penalties 1-11% slower than in 0.1.18: the draft layer guesses
 without penalties, so more of its guesses are now rejected. Requests without penalties are unchanged. `top_k` keeps at most 64 candidates: `0` ("off") or anything above 64 uses all 64.
+
+**Sampled drafting (opt-in, 0.1.40.2).** With temperature above 0 the engine keeps a draft only when it equals the token the model sampled for that position, and the draft layer proposes its best guess. Two opt-in switches change how the draft layer drafts a sampled request; greedy requests (temperature 0) are never touched and stay byte-identical. `STRATA_SPEC_COUPLED=1` (or `--coupled-draft`) drafts by sampling with the request's own settings and the random number the checking row will use; the text for a seed does not change. `STRATA_SPEC_PROB=1` is speculative rejection sampling: the draft layer samples its guess from its own distribution q, the check accepts it with probability min(1, p/q) (p is the model's distribution after penalties, top_k, top_p, min_p and temperature) and otherwise samples the replacement from the leftover distribution, so every token is distributed exactly as without drafts (the text for a seed then depends on the drafts, so it is reproducible only for the same engine, flags and prompt). Guesses without a distribution (prompt lookup, suffix drafts) keep the exact-match rule, which is already exact. Neither is faster in a way that holds up: on an RTX 3060 (IQ3_XXS, 200-token story and code answers, 10 interleaved pairs) the default's median output speed was 42.4 / 43.2 / 43.3 tok/s at temperature 0.3 / 0.7 / 1.0, coupled drafting 40.6 / 42.4 / 43.3 and rejection sampling 41.0 / 42.6 / 42.6, with run-to-run differences of up to 5% between repeats; drafts kept per round fell at 0.3 and rose by about 5 points at 1.0, which the cost of the longer sampled windows ate. `STRATA_SPEC_DEPTH=1` prints the acceptance by draft depth for each request; `STRATA_SPEC_MIN_TEMP=0.9` limits sampled drafting to hotter requests. Proof that the rejection rule keeps the distribution: `spec_prob_test` (chi-square, 2 million trials per case) and `spec_verify_parity` (GPU against the host reference).
 
 ---
 

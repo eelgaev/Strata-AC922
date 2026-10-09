@@ -22,6 +22,8 @@
 #include <altivec.h>   // the types spelled __vector: a strict -std=c++20 has no `vector` keyword
 #endif
 
+extern "C" void quantize_row_q8_K_ref(const float* x, void* y, int64_t k);   // ggml-quants.h (ggml-base)
+
 namespace strata::kernels::cpu {
 namespace {
 
@@ -83,6 +85,8 @@ void act_quant_q8_1(const float* x, int n, ActQ& a) {
 }
 
 void act_quant_q8_1_avx2(const float* x, int n, ActQ& a) { act_quant_q8_1(x, n, a); }
+// ggml's scalar Q8_K quantizer (the bytes q8k_quant_avx2 matches); not reached here, cpu_avx2_ok() is false
+void q8k_quant_avx2(const float* x, void* y, int64_t k) { quantize_row_q8_K_ref(x, y, k); }
 
 void s2_expert_vnni(const uint8_t*, const float*, float*, ExpertScratch&) { unsupported("the Q2_0 expert kernel"); }
 void s2_expert_vnni_q(const uint8_t*, const ActQ&, float*, ExpertScratch&) { unsupported("the Q2_0 expert kernel"); }

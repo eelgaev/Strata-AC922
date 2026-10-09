@@ -538,6 +538,59 @@ class ToolRoundTrip(Server):
                          ["multi_agent_v1.spawn_agent", "apply_patch"])
 
 
+class JsonFormatWithTools(Server):
+    """#782: Codex's review request carries an `additional_tools` item, tools, and `text.format` json_schema together.
+    A tool call passes through; the schema is checked on the answer that ends in text."""
+    FMT = {"type": "json_schema", "name": "guardian_review", "strict": True,
+           "schema": {"type": "object", "properties": {"outcome": {"type": "string"}, "rationale": {"type": "string"}},
+                      "required": ["outcome", "rationale"], "additionalProperties": False}}
+
+    def request(self, **extra):
+        user = {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "review this call"}]}
+        more = {"type": "additional_tools", "role": "developer", "tools": [
+            {"type": "function", "name": "later_tool", "parameters": {"type": "object"}}]}
+        return {"model": "m", "instructions": "You are a reviewer.", "input": [more, user], "tools": TOOLS,
+                "tool_choice": "auto", "parallel_tool_calls": False, "store": False,
+                "text": {"format": self.FMT}, **extra}
+
+    def script_with(self, text):
+        self.engine.scripts = [self.tok.encode(text, parse_special=True)]
+        self.engine.script = self.engine.scripts[0]
+
+    def test_a_tool_call_passes_through(self):
+        self.script_with(CALL + "<|im_end|>")
+        for stream in (False, True):
+            code, r = self.post(self.request(stream=stream))
+            self.assertEqual(code, 200, r)
+            final = r if not stream else r[-1]["response"]
+            self.assertEqual(final["status"], "completed")
+            self.assertEqual([o["type"] for o in final["output"]][-2:], ["message", "function_call"])
+            call, = [o for o in final["output"] if o["type"] == "function_call"]
+            self.assertEqual((call["type"], call["name"], json.loads(call["arguments"])),
+                             ("function_call", "exec_command", {"cmd": "cat a.txt"}))
+        # the model is told the schema is for its final answer, not for a turn that calls a tool
+        self.assertIn("applies only to your final answer", self.tok.decode(self.engine.last_prompt))
+
+    def test_the_final_text_answer_is_the_schema_object(self):
+        self.script_with('</think>\n\n{"outcome": "allow", "rationale": "read only"}<|im_end|>')
+        code, r = self.post(self.request())
+        self.assertEqual(code, 200, r)
+        self.assertEqual(json.loads(r["output"][-1]["content"][0]["text"]),
+                         {"outcome": "allow", "rationale": "read only"})
+        code, events = self.post(self.request(stream=True))
+        self.assertEqual(events[-1]["type"], "response.completed")
+        self.assertEqual(len([e for e in events if e["type"] == "response.output_text.delta"]), 1)
+
+    def test_a_text_answer_that_breaks_the_schema_fails_as_without_tools(self):
+        try:
+            import jsonschema  # noqa: F401
+        except ImportError:
+            self.skipTest("the schema check needs jsonschema")
+        self.script_with('</think>\n\n{"outcome": 3}<|im_end|>')
+        code, r = self.post(self.request())
+        self.assertEqual((code, r["error"]["code"]), (502, "structured_output_failed"))
+
+
 class ThreadTitle(Server):
     def test_a_thread_title_is_answered_without_the_engine(self):
         self.svc.codex_thread_titles = True                      # opt-in: "codex_thread_titles": true in the config

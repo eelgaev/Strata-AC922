@@ -75,3 +75,18 @@ Notes:
 - #995 also changed the canonical `2026-09-29-speed-0126` report (matrix.json rewritten, README extended with another host's rows); that part was not ported, only the two new folders.
 - #777 and #811 are the same machine on two quants, kept as two folders.
 - The earlier community folders (`2026-09-30-community-rtx-5090`, `2026-10-03-community-2x-mi50`, `2026-10-04-community-2x-arc-pro-b60`) are listed in `docs/COMMUNITY_BENCHMARKS.md`.
+| [2026-10-06-community-rtxpro-v0140](2026-10-06-community-rtxpro-v0140/) | RTX PRO 6000 | Q4 / Q8 (MTP and ngram runs) | see the README | see the README | 0.1.40 | #1137 |
+| [2026-10-06-community-2x-rx-7900-gre](2026-10-06-community-2x-rx-7900-gre/) | 2x RX 7900 GRE (gfx1100) | layer split, #848 / #854 | see the README | see the README | 0.1.40 | #1140 |
+| [2026-10-06-community-2x-p100](2026-10-06-community-2x-p100/) | 2x Tesla P100 16 GB | Flash-Next IQ3_S, 128K | see the README | see the README | 0.1.40 | #1157 |
+| [2026-10-06-community-rtx4090-opt-ins](2026-10-06-community-rtx4090-opt-ins/) | RTX 4090 | IQ3_S 140K / IQ3_XXS 200K opt-ins and tool-call hotfix | see the README | see the README | 0.1.38 to 0.1.40 | #1158 |
+| [2026-10-06-community-rtx4090-toolcall-hotfix](2026-10-06-community-rtx4090-toolcall-hotfix/) | RTX 4090 | IQ3_S 140K / IQ3_XXS 200K opt-ins and tool-call hotfix | see the README | see the README | 0.1.38 to 0.1.40 | #1158 |
+| [2026-10-06-q8-prefill8192-rtxpro](2026-10-06-q8-prefill8192-rtxpro/) | RTX PRO 6000 | Q8, --prefill 8192 | see the README | see the README | 0.1.40 | #1171 |
+| [2026-10-06-community-rx-7900-xtx](2026-10-06-community-rx-7900-xtx/) | RX 7900 XTX, Windows 11 | IQ3_S | see the README | see the README | 0.1.40 | #1173 |
+| [2026-10-06-community-4x-tesla-p100](2026-10-06-community-4x-tesla-p100/) | 4x Tesla P100 16 GB (CUDA 12 engine) | IQ3_XXS | see the README | see the README | 0.1.40 | #1192 |
+| [2026-10-06-community-rtx3090-egpu-64gb](2026-10-06-community-rtx3090-egpu-64gb/) | RTX 3090 eGPU, 64 GB RAM | IQ2_XS vs IQ3_XXS | see the README | see the README | 0.1.40 | #1199 |
+| [2026-10-06-community-r9-2x-rtx-2080-ti](2026-10-06-community-r9-2x-rtx-2080-ti/) | 2x RTX 2080 Ti (R9) | see README | see the README | see the README | 0.1.40 | #1225 |
+| [2026-10-06-community-2x-rtx-pro-4500-engine-0.1.40.1](2026-10-06-community-2x-rtx-pro-4500-engine-0.1.40.1/) | 2x RTX PRO 4500 Blackwell | Swift IQ3_XXS | see the README | see the README | 0.1.40.1 | #1226 |
+| [2026-10-05-community-rtx5080-9900x3d](2026-10-05-community-rtx5080-9900x3d/) | RTX 5080, Ryzen 9 9900X3D | Coder IQ1_M and others | see the README | see the README | 0.1.40 | #1243 |
+| [2026-10-07-community-rtx-5090-laptop-ud-iq4xs](2026-10-07-community-rtx-5090-laptop-ud-iq4xs/) | RTX 5090 Laptop 24 GB | UD-IQ4_XS (first NVIDIA measurement) | see the README | see the README | 0.1.40.1 | #1245 |
+| [2026-10-06-community-rtx-5090-laptop](2026-10-06-community-rtx-5090-laptop/) | RTX 5090 Laptop 24 GB, Windows 11 | see README | see the README | see the README | 0.1.40.1 | #1263 |
+| [2026-10-06-community-2x-rx-6900xt-0.1.40.1](2026-10-06-community-2x-rx-6900xt-0.1.40.1/) | 2x RX 6900 XT (gfx1030), Ryzen 5 5600X | IQ3_S, 131K | see the README | see the README | 0.1.40.1 | #1270 |

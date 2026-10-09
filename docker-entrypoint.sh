@@ -59,7 +59,9 @@ if [ "${REINSTALL:-0}" = "1" ] || [ ! -f "$cfg" ]; then
   .venv/bin/python setup.py --setup --yes "$@"
   [ -e "/opt/strata/strata-$tag.json" ] && { cmp -s "/opt/strata/strata-$tag.json" "$cfg" || cp -f "/opt/strata/strata-$tag.json" "$cfg"; }
 else
-  [ -e "/opt/strata/strata-$tag.json" ] || ln -s "$cfg" "/opt/strata/strata-$tag.json"
+  # #1244: the copy on the volume is the one that counts, so a regular file left in /opt/strata by an earlier setup
+  # (or by an image built with one) must not stand in for it: edits to /data/config would be ignored
+  ln -sfn "$cfg" "/opt/strata/strata-$tag.json"
 fi
 
 # Later starts skip straight here: setup.py finds the installed config and

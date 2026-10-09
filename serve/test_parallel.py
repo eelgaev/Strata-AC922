@@ -199,6 +199,7 @@ class PickSlot(unittest.TestCase):
         e.slot_held = [[] for _ in range(n)]
         e.slot_used = [0.0] * n
         e.slot_live = [None] * n
+        e.slot_group = [0] * n
         return e
 
     def test_the_slot_that_holds_the_conversation(self):
@@ -214,6 +215,21 @@ class PickSlot(unittest.TestCase):
         self.assertIsNone(e.pick_slot([7, 8]))
         e.slot_busy = [False] * 3
         self.assertEqual(e.pick_slot([1, 2, 3]), 1)                 # a held prompt is never the WHOLE prompt
+
+    def test_batch_groups_spread_requests_over_the_groups(self):
+        # #1249: with --batch-groups 2 over 4 slots (groups {0,1} and {2,3}) a second request goes to the other group,
+        # and a short held prefix does not pull it back into the busy one
+        e = self.engine(4)
+        e.slot_groups = 2
+        e.slot_group = [0, 0, 1, 1]
+        e.slot_busy[0] = True
+        e.slot_held[1] = [1, 2, 3]
+        self.assertEqual(e.pick_slot([1, 2, 3, 4, 5]), 2)
+        e.slot_held[1] = list(range(1, 601))                       # a long prefix is worth the unbalanced group
+        self.assertEqual(e.pick_slot(list(range(1, 700))), 1)
+        e.slot_groups, e.slot_group = 1, [0] * 4                   # without groups: any held prefix, as before
+        e.slot_held[1] = [1, 2, 3]
+        self.assertEqual(e.pick_slot([1, 2, 3, 4, 5]), 1)
 
     def test_slots_view(self):
         e = self.engine(2)

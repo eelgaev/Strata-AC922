@@ -1,6 +1,7 @@
 #include "strata/kernels/bf16_gemv.hpp"
 #include "s26_tsum.cuh"
 #include "strata/kernels/bf16_bits.hpp"
+#include "strata/kernels/pdl.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -91,8 +92,8 @@ __global__ void bf16_f32_mmvf_kernel(const float* __restrict__ x, const void* __
 // token keeps its own accumulator with exactly the single-row kernel's order (pairs, two ordered FMAs, the same warp
 // and block reductions), so each output is bit-identical to a bf16_f32_mmvf_kernel launch of its own.
 template <int BLOCK_SIZE, int NT, int WF = 0, bool EXACT_T = false>
-__global__ void bf16_f32_mmvf_multi_kernel(const float* __restrict__ x, int64_t ldx, const void* __restrict__ w,
-                                          float* __restrict__ y, int64_t ldy, int n_in, int n_tok) {
+__global__ void bf16_f32_mmvf_multi_kernel(const float* STRATA_PDL_RESTRICT x, int64_t ldx, const void* __restrict__ w,
+                                          float* STRATA_PDL_RESTRICT y, int64_t ldy, int n_in, int n_tok) {
     const int t = threadIdx.x;
     const void* row = mmvf_row<WF>(w, n_in);
     __shared__ float partials[NT][32];
@@ -104,6 +105,9 @@ __global__ void bf16_f32_mmvf_multi_kernel(const float* __restrict__ x, int64_t 
     float acc[NT];
 #pragma unroll
     for (int k = 0; k < NT; ++k) acc[k] = 0.0f;
+    // PDL (pdl.hpp): a no-op below sm_90 and outside the verify window; ac922 keeps the plain loop of every weight
+    // form here (upstream's prefetch of the first BF16 pairs before the wait is not taken)
+    pdl_wait();
     for (int pair = t; pair < n_in / 2; pair += BLOCK_SIZE) {
         float w0, w1;
         mmvf_pair<WF>(row, pair, w0, w1);
@@ -334,13 +338,13 @@ void gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const void* w, WForm f, f
     }
 #define STRATA_MMVF_MF(N, WF) \
     switch (n_tok) { \
-        case 1: bf16_f32_mmvf_multi_kernel<N, 1, WF, true><<<(unsigned) n_out, N, 0, st>>>(x, ldx, w, y, ldy, (int) n_in, n_tok); break; \
-        case 2: bf16_f32_mmvf_multi_kernel<N, 2, WF, true><<<(unsigned) n_out, N, 0, st>>>(x, ldx, w, y, ldy, (int) n_in, n_tok); break; \
-        case 3: bf16_f32_mmvf_multi_kernel<N, 3, WF, true><<<(unsigned) n_out, N, 0, st>>>(x, ldx, w, y, ldy, (int) n_in, n_tok); break; \
-        case 4: bf16_f32_mmvf_multi_kernel<N, 4, WF, true><<<(unsigned) n_out, N, 0, st>>>(x, ldx, w, y, ldy, (int) n_in, n_tok); break; \
-        case 5: bf16_f32_mmvf_multi_kernel<N, 5, WF, true><<<(unsigned) n_out, N, 0, st>>>(x, ldx, w, y, ldy, (int) n_in, n_tok); break; \
-        case 6: bf16_f32_mmvf_multi_kernel<N, 6, WF, true><<<(unsigned) n_out, N, 0, st>>>(x, ldx, w, y, ldy, (int) n_in, n_tok); break; \
-        default: bf16_f32_mmvf_multi_kernel<N, 8, WF, false><<<(unsigned) n_out, N, 0, st>>>(x, ldx, w, y, ldy, (int) n_in, n_tok); break; \
+        case 1: launch_pdl(bf16_f32_mmvf_multi_kernel<N, 1, WF, true>, dim3((unsigned) n_out), dim3(N), 0, st, x, ldx, w, y, ldy, (int) n_in, n_tok); break; \
+        case 2: launch_pdl(bf16_f32_mmvf_multi_kernel<N, 2, WF, true>, dim3((unsigned) n_out), dim3(N), 0, st, x, ldx, w, y, ldy, (int) n_in, n_tok); break; \
+        case 3: launch_pdl(bf16_f32_mmvf_multi_kernel<N, 3, WF, true>, dim3((unsigned) n_out), dim3(N), 0, st, x, ldx, w, y, ldy, (int) n_in, n_tok); break; \
+        case 4: launch_pdl(bf16_f32_mmvf_multi_kernel<N, 4, WF, true>, dim3((unsigned) n_out), dim3(N), 0, st, x, ldx, w, y, ldy, (int) n_in, n_tok); break; \
+        case 5: launch_pdl(bf16_f32_mmvf_multi_kernel<N, 5, WF, true>, dim3((unsigned) n_out), dim3(N), 0, st, x, ldx, w, y, ldy, (int) n_in, n_tok); break; \
+        case 6: launch_pdl(bf16_f32_mmvf_multi_kernel<N, 6, WF, true>, dim3((unsigned) n_out), dim3(N), 0, st, x, ldx, w, y, ldy, (int) n_in, n_tok); break; \
+        default: launch_pdl(bf16_f32_mmvf_multi_kernel<N, 8, WF, false>, dim3((unsigned) n_out), dim3(N), 0, st, x, ldx, w, y, ldy, (int) n_in, n_tok); break; \
     }
 #define STRATA_MMVF_M(N) case N: \
     if (f == WForm::Bf16) { STRATA_MMVF_MF(N, 0); } else if (f == WForm::F16) { STRATA_MMVF_MF(N, 1); } \

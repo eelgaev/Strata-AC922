@@ -476,6 +476,7 @@ class Assembler:
         self.seq = 0
         self.item = None                             # the open output item
         self.json_text = []                          # structured output: the answer, held until it is checked
+        self.called = False                          # a tool call was made: this turn is not the final answer
         reasoning = req.get("reasoning") if isinstance(req.get("reasoning"), dict) else {}
         self.response = {
             "id": new_id("resp"), "object": "response", "created_at": int(time.time()), "status": "in_progress",
@@ -579,6 +580,7 @@ class Assembler:
                                   content_index=0, delta=ev.text, logprobs=[]))
         elif kind == "tool_start":
             out += self.close()
+            out += self._call_started()
             out += self._open(self._call_item(ev))
         elif kind == "tool_args":
             item = self.item
@@ -592,6 +594,7 @@ class Assembler:
             item = self.item
             if item is None or item.get("call_id") != ev.call.id:     # a call that was not announced while written
                 out += self.close()
+                out += self._call_started()
                 out += self._open(self._call_item(ev))
                 item = self.item
                 if item["type"] == "function_call":
@@ -604,6 +607,28 @@ class Assembler:
                 out.append(self.event("response.custom_tool_call_input.delta", item_id=item["id"],
                                       output_index=self.index, delta=item["input"]))
             out += self.close()
+        return out
+
+    def _release(self, text: str) -> list[dict]:
+        """A held structured answer (or the words written beside a tool call) as one message item."""
+        if not text.strip():
+            return []
+        out = self._open({"id": new_id("msg"), "type": "message", "status": "in_progress", "role": "assistant",
+                          "content": []})
+        self.item["content"][0]["text"] = text
+        out.append(self.event("response.output_text.delta", item_id=self.item["id"], output_index=self.index,
+                              content_index=0, delta=text, logprobs=[]))
+        return out + self.close()
+
+    def _call_started(self) -> list[dict]:
+        """The first tool call of a JSON-format turn: this turn is not the final answer, so what the model wrote
+        before the call goes out as it is, ahead of the call, and the schema is checked on the turn that ends in
+        text (#782)."""
+        out = []
+        if self.json_mode and not self.called:
+            out = self._release("".join(self.json_text))
+            self.json_text = []
+        self.called = True
         return out
 
     def _call_item(self, ev: Event) -> dict:
@@ -626,13 +651,12 @@ class Assembler:
         unfinished = self.item is not None and self.item["type"] in ("function_call", "custom_tool_call")
         out = self.close("incomplete" if length or unfinished else "completed")
         if self.json_mode:
-            text = validate("".join(self.json_text), done.get("finish"))
-            out += self._open({"id": new_id("msg"), "type": "message", "status": "in_progress", "role": "assistant",
-                               "content": []})
-            self.item["content"][0]["text"] = text
-            out.append(self.event("response.output_text.delta", item_id=self.item["id"], output_index=self.index,
-                                  content_index=0, delta=text, logprobs=[]))
-            out += self.close()
+            text = "".join(self.json_text)
+            self.json_text = []
+            if self.called:
+                out += self._release(text)           # beside a tool call: as written (#782)
+            else:
+                out += self._release(validate(text, done.get("finish")))
         n = done.get("completion_tokens", 0)
         prompt = done.get("prompt_tokens", self.prompt_tokens)
         self.response["usage"] = {

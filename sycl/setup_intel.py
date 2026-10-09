@@ -86,10 +86,6 @@ def sycl_engine():
     exe = next((b for b in (ROOT / "build-sycl-aot" / "strata", ROOT / "build-sycl" / "strata") if b.exists()), None)
     if exe is None:
         return None, "it is not built (sycl/tools/build.sh; docs/INTEL.md)"
-    if not shutil.which("docker"):
-        return None, "docker is not installed (the engine runs in the oneAPI image)"
-    if subprocess.run(["docker", "image", "inspect", SYCL_IMAGE], capture_output=True).returncode != 0:
-        return None, f"the runtime image {SYCL_IMAGE} is missing (sycl/tools/Dockerfile)"
     return exe, None
 
 

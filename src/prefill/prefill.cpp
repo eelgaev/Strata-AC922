@@ -98,6 +98,14 @@ constexpr int64_t C = 10240, ZV = 6144, HV = 48;
 inline int64_t MAXBLOB() { return (int64_t) strata::kernels::cpu::expert_layout().max_blob; }
 constexpr int STAGE = 8;           // host->device expert staging ring (chunks below stream_all_min())
 constexpr int kSplitHelpRing = 48;  // layer split help: the helper stage's ring slots it streams through (at most)
+// STRATA_PREFILL_STREAM_AHEAD=0 keeps the previous routed-only upload schedule (A/B).
+inline bool stream_ahead_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_PREFILL_STREAM_AHEAD");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    return on;
+}
 // Step 3: from this chunk size on, every non-resident expert of every layer streams in a fixed order through a
 // ring_slots()-slot ring (nearly all 512 are routed at such a chunk), so the copy engine keeps working through the
 // attention halves instead of waiting for each layer's routing.
@@ -105,6 +113,22 @@ constexpr int kSplitHelpRing = 48;  // layer split help: the helper stage's ring
 // fallbacks (what an LXC container's memlock limit forces) run on a PC that can pin - for ASan / MALLOC_CHECK_=3 runs.
 inline bool force_pageable() {
     static const bool v = [] { const char* e = std::getenv("STRATA_TEST_PAGEABLE"); return e != nullptr && e[0] == '1'; }();
+    return v;
+}
+// #1057: the Stager threads wait by sleeping (atomic wait, blocking-sync events) instead of a yield spin.  On Linux the
+// spinners starved a pinned host thread (DGX Spark IQ3_S 8K prompt 91 -> 1,222 tok/s with sleeping waits); on Windows
+// the 5070 read an 8K Q2_0 prompt 1.2% slower with them (1,469.5 -> 1,452 tok/s, 10 pairs), so they stay spinning
+// there.  Same output either way.  STRATA_STAGER_SLEEP=1/0 forces either.
+inline bool stager_sleep() {
+    static const bool v = [] {
+        const char* e = std::getenv("STRATA_STAGER_SLEEP");
+        if (e != nullptr && e[0] != '\0') return e[0] != '0';
+#if defined(_WIN32)
+        return false;
+#else
+        return true;
+#endif
+    }();
     return v;
 }
 constexpr int RING_MAX = 1024;          // the arrays; the ring itself is ring_slots(), at most ring_cap()
@@ -354,7 +378,8 @@ struct Stager {
                 pageable[(size_t) i].resize(blob_bytes);
                 buf[i] = pageable[(size_t) i].data();
             }
-            if (cudaEventCreateWithFlags(&dma_done[i], cudaEventDisableTiming) != cudaSuccess) return false;
+            if (cudaEventCreateWithFlags(&dma_done[i], stager_sleep() ? (cudaEventDisableTiming | cudaEventBlockingSync)
+                                                                      : cudaEventDisableTiming) != cudaSuccess) return false;
         }
         cudaGetDevice(&device);
         for (int t = 0; t < nthreads; ++t) threads.emplace_back([this] { work(); });
@@ -386,8 +411,15 @@ struct Stager {
                 const int j = claim(seen);
                 if (j < 0) { active.fetch_sub(1, std::memory_order_acq_rel); break; }
                 const int b = j % kRing;
-                if (j >= kRing)   // job j - kRing's DMA from this buffer is queued
-                    while (issued.load(std::memory_order_acquire) <= j - kRing) std::this_thread::yield();
+                // The copies run ahead of the DMAs, so most of these threads spend most of a prompt waiting here: sleep
+                // (atomic wait, and a blocking-sync event below), not a yield spin - 32 spinners took every core
+                // (Linux; see stager_sleep for Windows).
+                if (j >= kRing) {   // job j - kRing's DMA from this buffer is queued
+                    if (stager_sleep())
+                        for (int i; (i = issued.load(std::memory_order_acquire)) <= j - kRing;) issued.wait(i);
+                    else
+                        while (issued.load(std::memory_order_acquire) <= j - kRing) std::this_thread::yield();
+                }
                 // and done - for a generation's first kRing jobs that is the previous generation's last DMA from
                 // the buffer, which nothing else waits for when a chunk ends without a sync (no MTP) or the DMA
                 // was a ring entry the routing skipped (an event never recorded returns at once)
@@ -436,11 +468,13 @@ struct Stager {
     void issued_one(int j, cudaStream_t copy) {
         cudaEventRecord(dma_done[j % kRing], copy);
         issued.store(j + 1, std::memory_order_release);
+        issued.notify_all();
     }
     /// No job is running after this (the end of a layer, or an early return in the middle of one).
     void finish() {
         head.store((uint64_t) gen << 32, std::memory_order_release);   // n = 0: nothing more to claim
         issued.store(1 << 30, std::memory_order_release);
+        issued.notify_all();
         while (active.load(std::memory_order_acquire) != 0) std::this_thread::yield();
     }
 };
@@ -2024,7 +2058,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         job = (int) js.size();
                         js.push_back({nullptr, (size_t) lay0.blob_bytes(l), m.src, (int32_t) l, e});
                     } else {
-                        b = m.src->blob(l, e);
+                        b = m.src->blob_stable(l, e);
                         if (!b) { err = "prefill: expert source has no blob"; return false; }
                         if (ps_on && m.src->pinned(l, e)) {   // multi-GPU: every ps_frac-th one goes to the peer's ring
                             ps_acc += m.pp->ps_frac;
@@ -2594,13 +2628,20 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         cudaEventRecord(m.ids_ready, m.cs);
                     }
                     // the shared expert and its scalar gate
-                    if (!native_proj(m.gemm, wsg, m.mixed_h, m.sgate, T, v.name("ffn_gate_shexp.weight"), err)) return false;
-                    if (!native_proj(m.gemm, wsu, m.mixed_h, m.sup, T, v.name("ffn_up_shexp.weight"), err)) return false;
-                    swiglu_pair(m.sgate, m.sup, m.sh_h, T, m.cs);
-                    if (!native_proj(m.gemm, wsd, m.sh_h, m.shared, T, v.name("ffn_down_shexp.weight"), err)) return false;
-                    if (wgi->ne1 > 1) { err = "prefill: the shared gate is not one row"; return false; }
-                    if (!bf16_proj(m.gemm, wgi, m.mixed_bf, m.sg, T, v.name("ffn_gate_inp_shexp.weight"), err, 0,
-                                   m.mixed_bf_lo, m.mixed)) return false;
+                    auto shared_expert = [&]() -> bool {
+                        if (!native_proj(m.gemm, wsg, m.mixed_h, m.sgate, T, v.name("ffn_gate_shexp.weight"), err)) return false;
+                        if (!native_proj(m.gemm, wsu, m.mixed_h, m.sup, T, v.name("ffn_up_shexp.weight"), err)) return false;
+                        swiglu_pair(m.sgate, m.sup, m.sh_h, T, m.cs);
+                        if (!native_proj(m.gemm, wsd, m.sh_h, m.shared, T, v.name("ffn_down_shexp.weight"), err)) return false;
+                        if (wgi->ne1 > 1) { err = "prefill: the shared gate is not one row"; return false; }
+                        if (!bf16_proj(m.gemm, wgi, m.mixed_bf, m.sg, T, v.name("ffn_gate_inp_shexp.weight"), err, 0,
+                                       m.mixed_bf_lo, m.mixed)) return false;
+                        return true;
+                    };
+                    // Only the router needs to finish before readback. Queue the shared expert afterwards
+                    // so it can overlap CPU grouping and the routed-only path's initial expert uploads.
+                    const bool defer_shared = !stream_all && stream_ahead_enabled();
+                    if (!defer_shared && !shared_expert()) return false;
                     // #136: STRATA_PF_FUSED=1 - the Q2_0 pack's experts on the fused int8 kernels (moe_fused.hpp),
                     // grouped on the GPU: no host sync.  Only where every expert's place is known before the routing -
                     // the streamed walk, in which every non-resident expert of the layer comes through the ring in id
@@ -2700,6 +2741,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         pt.fold();
                         if (pe.on) {   // the peer's marks so far are done: the primary waited for its last rows
                             int pd = 0; cudaGetDevice(&pd); cudaSetDevice(pe.dev); cudaStreamSynchronize(m.pp->s); pe.fold(); cudaSetDevice(pd);
+                        }
+                        if (defer_shared) {
+                            pt.mark(kPfRouter, cs);   // keep the existing router+shared timing attribution
+                            if (!shared_expert()) return false;
+                            pt.mark(kPfHostGroup, cs);
                         }
                         std::fill(m.cnt.begin(), m.cnt.end(), 0);
                         for (int64_t i = 0; i < T * K; ++i) {
@@ -3045,7 +3091,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     js.push_back({nullptr, (size_t) lay.blob_bytes(l), m.src, (int32_t) l, e});
                                     continue;
                                 }
-                                const uint8_t* b = m.src->blob(l, e);
+                                const uint8_t* b = m.src->blob_stable(l, e);
                                 if (!b) { err = "prefill: expert source has no blob"; return false; }
                                 js.push_back({b, (size_t) lay.blob_bytes(l)});
                             }
@@ -3061,7 +3107,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             if (fused && fg_holds(sl)) fg_flush();
                             const auto th = Clock::now();
                             const bool pinned = m.src->pinned(l, e);   // pinned: never transient
-                            const uint8_t* b = pinned ? m.src->blob(l, e) : nullptr;
+                            const uint8_t* b = pinned ? m.src->blob_stable(l, e) : nullptr;
                             if (pinned && !b) { err = "prefill: expert source has no blob"; return false; }
                             if (pinned) {
                                 // DMA straight from the page-locked arena: the copy stream only waits for the slot
@@ -3199,10 +3245,15 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         };
                         if (!stream_all) {
                             size_t staged = 0;
+                            size_t pending = 0;
+                            const bool stream_ahead = stream_ahead_enabled();
                             const size_t lookahead = STAGE - 1;
                             for (size_t j = 0; j < order.size(); ++j) {
-                                while (staged < order.size() && staged <= j + lookahead) {
+                                // Resident experts occupy no staging slot. Keep STAGE actual transfers ahead,
+                                // rather than STAGE positions in the mixed resident/streamed order.
+                                while (staged < order.size() && (stream_ahead ? pending < STAGE : staged <= j + lookahead)) {
                                     if (!stage_one(staged)) return false;
+                                    if (stage_of[staged] >= 0) ++pending;
                                     ++staged;
                                 }
                                 const int32_t e = order[j];
@@ -3213,6 +3264,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     pt.mark(kPfWaitCopy, cs);
                                     cudaStreamWaitEvent(m.cs, m.copied[stage_of[j]], 0);
                                     if (!compute(j, m.stage_dev[stage_of[j]], stage_of[j])) return false;
+                                    --pending;   // compute recorded the slot's release event before any reuse
                                 }
                             }
                         } else {
