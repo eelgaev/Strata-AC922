@@ -7,7 +7,7 @@ reads the sockets' RAM directly. Tested with Qwen3.8-Flash-Next **UD-Q4_K_XL** (
 and **IQ2_XS**, on 2 and 4 GPUs.
 
 Everything here was measured on one AC922 (RHEL 8, driver 550.54.15 - ppc64le's last - CUDA 12.4, gcc-toolset-12).
-It is not an upstream-supported platform. The branch tracks upstream: last merged v0.1.39 (2026-10-04, see
+It is not an upstream-supported platform. The branch tracks upstream: last merged v0.1.41 (2026-10-09, see
 [Merging upstream](#merging-upstream)).
 
 - [At a glance](#at-a-glance)
@@ -115,7 +115,23 @@ export STRATA_FP16=load STRATA_FP16_GATES=1
 export STRATA_FUSED_EXPERTS=1 STRATA_SELECT_VOLTA=1
 # opt-in: a per-prompt chunk size on a layer split (4K-18K prompts +6-16%)
 export STRATA_PREFILL_ADAPT=1.5 STRATA_PREFILL_ADAPT_MIN=2048
+# since the v0.1.40 merge: keep the 12/24/36 layer split and the old short-prompt upload schedule (below)
+export STRATA_SPLIT_CURVE=0139 STRATA_SPLIT_BALANCE=1 STRATA_PREFILL_STREAM_AHEAD=0
 ```
+
+The last three keep upstream's defaults in the code and set what is faster on this machine:
+
+- `STRATA_SPLIT_CURVE=0139` + `STRATA_SPLIT_BALANCE=1`: v0.1.40's four-way placement scorer picks 11/24/36 here (a
+  13-layer first stage that paces every prompt: 65K prompts 6,400 instead of 7,150 tok/s, -10%). The 0.1.39 curve,
+  plus "a placement within 1% of the best predicted decode window goes to the most balanced one", keeps 12/24/36.
+  Check the start-up line `layer split auto: K=12,24,36`.
+- `STRATA_PREFILL_STREAM_AHEAD=0`: v0.1.40's routed-only upload schedule for chunks below ~1K tokens costs ~110 ms on
+  an 80-token prompt on 2 GPUs (450 tokens: 620 instead of 830 ms; 4 GPUs: -4% to -13%). Off, the timings are the
+  pre-merge ones; prompts of 1K tokens and more do not use it.
+- Not set: `STRATA_SM70_TABLE=1` (v0.1.41, PR 1401's Volta decode kernels) is bitwise the default here, but does not
+  change the speed of UD-Q4_K_XL: its matvec table covers Q4_K/Q5_K/Q6_K/IQ4_XS dense weights (this model's are all
+  Q8_0), expert mode 8 covers IQ2 experts, and its fast norm/up reads BF16-form weights only (it stays off with
+  `STRATA_FP16=load`).
 
 Prompt attention on the V100s takes the m8n8k4 kernel by default (see At a glance); `STRATA_ATTN_WMMA=1` picks the
 older wmma kernel instead, unless `STRATA_ATTN_M884=1` is also set.
@@ -341,6 +357,23 @@ Rules worth keeping for the next merge:
 - Thread pools and helper threads keep `release_inherited_pin` / `note_host_pin` (a POWER thread starts on its
   creator's pinned core).
 - README.md: the fork's text sits above upstream's, which stays unchanged below the line, so it merges cleanly.
+
+v0.1.40 (2026-10-07..09, 274 + 25 first-parent merges, in 14 parts) and v0.1.41 (2026-10-09, 128 commits, 4 parts) were
+merged in small parts, each one checked the same way (lost lines, ctest, teacher-forced 2K and 32K byte-identical at
+equal cache slots, 4- and 2-GPU speeds up to 123K tokens, short prompts on 2 GPUs). Upstream rewrote its history once
+(the commit trailers removed, same trees): the rewritten twin of the last merged commit was recorded with
+`git merge -s ours`, then merging went on normally. More rules from those merges:
+
+- Check the layer split after a merge that touches the placement search (`layer split auto: K=12,24,36`).
+- Check short prompts on 2 GPUs: a schedule change for chunks below 1K tokens only shows there.
+- Upstream code that assumes one contiguous resident arena goes through `complement_blob` / `complement_at` /
+  `complement_dev_at` (the arena is one segment per NUMA node here).
+- Upstream's prefill now and then adds work right after the router readback; here the router ids are copied early
+  with an event the host waits on, so anything the host reads after that wait must be queued before the event.
+- Greedy outputs depend on the cache slot count of every card: match the 4 per-card `cache N slots` lines before
+  comparing (`--vram-reserve-mib` for the first card, `--vram-reserve-later-mib` for the others). Decode texts of
+  served answers are not reproducible start to start even then (the cache adapts in the background); the
+  teacher-forced logs are, and are the check.
 
 ## Hardware rules learned on the AC922
 

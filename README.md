@@ -1,7 +1,7 @@
 > [!NOTE]
 > **This is the `ac922` fork of [Niko1221/Strata](https://github.com/Niko1221/Strata)** for the **IBM Power System
 > AC922** (2x POWER9, 4x V100-SXM2 16 GB, NVLink 2.0, ppc64le, unified memory). It is experimental and not supported
-> upstream. Everything below the line is upstream's README, unchanged.
+> upstream (merged up to upstream v0.1.41). Everything below the line is upstream's README, unchanged.
 >
 > Qwen3.8-Flash-Next **UD-Q4_K_XL** (llama-benchy pp2048/pp8192 at depth 0-64K, MTP `--spec 4`):
 >
