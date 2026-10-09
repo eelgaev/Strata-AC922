@@ -186,6 +186,7 @@ class Base(unittest.TestCase):
             mock.patch.object(setup, "page_file_gb", lambda: 16.0),
             mock.patch.object(setup, "free_gb", lambda p: free),
             mock.patch.object(setup, "rotational_disk", lambda p: None),   # #605: not the test PC's disk
+            mock.patch.object(setup, "is_wsl", lambda: False),            # #974: the tests are not run inside WSL
             mock.patch.object(setup, "pip_install", lambda *a, **k: None),
             mock.patch.object(setup, "get_llama_cpp", lambda: self.t / "llama.cpp"),
             mock.patch.object(setup, "get_prebuilt", lambda *a, **k: eng),
@@ -294,6 +295,8 @@ class Main(Base):
         self.assertEqual(code, 0, out)
         for f in d.iterdir():                                                         # the first run "downloaded" them
             f.unlink()
+        import shutil
+        shutil.rmtree(self.t / "data" / "mtp", ignore_errors=True)       # #897: a draft layer already there needs less room
         (d / (list(setup.UNSLOTH_SHARDS)[0] + ".part")).write_bytes(b"x" * 1_500_000)
         with mock.patch.dict(setup.MODELS[M], {"download_gb": 0.003}):              # 1.5 MB still missing: no room
             code, out, cfg = self.main(["--context", "8192"], free=8.001)
@@ -503,6 +506,15 @@ class IQ4XS(Base):
         self.assertIn("fits with 40 GiB of its experts in RAM", line)
         self.assertNotIn("EXPERIMENTAL", line)
         self.assertIn("EXPERIMENTAL", next(ln for ln in out.splitlines() if ln.strip().startswith(M)))
+
+    def test_check_below_every_floor(self):
+        # #977: 16 GB fits no size; the RAM line is not [ok] and the verdict says so
+        code, out, _ = self.main(["--check"], ram=16.0, m=X)
+        self.assertEqual(code, 1, out)
+        self.assertNotIn("[ok] RAM", out)
+        self.assertIn("[!]  RAM: 16 GB (less than", out)
+        self.assertIn("This PC cannot run Strata yet", out)
+        self.assertNotIn("This PC can run Strata", out)
 
     def test_engine_0138(self):
         code, out, cfg = self.main(["--context", "8192"], version="0.1.37", m=X)

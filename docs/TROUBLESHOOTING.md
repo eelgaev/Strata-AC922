@@ -70,6 +70,13 @@ context.
 The monitor plugged into the graphics card and other GPU programs take VRAM from the expert cache; RAM running below
 its rated speed (enable EXPO/XMP in the BIOS) slows the CPU half.
 
+**An earlier reply that came back empty is gone from the chat history (0.1.40, #843).**
+The server leaves out finished assistant turns that have no text, so the next reply does not copy the empty ones.
+`STRATA_KEEP_EMPTY_TURNS=1` in the server's environment renders them as before.
+
+**A Turing card (RTX 20) reads prompts above ~90K tokens differently (0.1.40, #743).**
+The prompt's top-k selection takes a wider kernel there, with the same ids. `STRATA_TOPK_STREAM=0` restores the old one.
+
 **Pictures are refused, or slow.**
 "this server was started without the vision encoder": the model was set up for text only - run setup again with
 `--vision gpu` (or `--vision cpu`). Pictures that take several seconds (about 3 s at 300 image tokens on 8 cores, more with more tokens) are read by the encoder on the CPU; `--vision gpu`

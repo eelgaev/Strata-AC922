@@ -164,7 +164,9 @@ other ~18 GB), a 32 GB PC with a 12-16 GB GPU the Coder; IQ3_XXS on a 32 GB PC s
   (`--mmap-experts`): the cards together hold more of the experts, and two users measured it 1.3-1.6x faster than
   one card, but the OS file cache can fill the RAM to 0 free during long prompts. `--yes` keeps one GPU. A config
   with `--resident-experts` started with `--gpus` switches to `--mmap-experts` with a note, and the engine runs that
-  pair as `--mmap-experts` with a warning instead of refusing it.
+  pair as `--mmap-experts` with a warning instead of refusing it. **Since 0.1.40 (#642, #848)** setup requires an
+  engine that runs the resident variant on a split, so it keeps both cards, resident, as for any config:
+  [MULTI_GPU.md](MULTI_GPU.md#using-it).
 
 **A mapped arena for small RAM (Linux, opt-in, 0.1.39, PR #640):** `STRATA_ARENA_MMAP=1` maps a native pack's expert
 arena read-only from the pack's `experts.bin` instead of reading it into locked RAM, for a PC whose GPUs hold most
@@ -204,6 +206,28 @@ the next layer's router to this layer's input and asks the OS for the pages of t
 GPU nor the RAM budget holds (only pages - the experts computed are the same; `STRATA_LOOKAHEAD=0` turns it off). This
 is what runs [Unsloth's UD-Q4_K_XL](UNSLOTH_Q4.md) (72 GiB of experts) on a 64 GB PC: 7-8.5 tokens/s at N = 40 on an
 RTX 5070, against ~3 tokens/s before these changes.
+
+**Switches added in 0.1.40 (all off unless noted; none changes the default output):**
+- `--kv-grow` (or `STRATA_KV_GROW=1`; `--no-kv-grow` turns it off): the K/V takes VRAM only for the cells the requests
+  reach, and the expert cache holds the rest, giving slots back as the context grows. It needs one GPU, an expert
+  profile, the whole K/V in VRAM (no KV streaming) and every expert in RAM (not the resident low-RAM mode); otherwise,
+  and with `--batch`, `--vram-elastic` or `--peer-device`, the engine says so and stays off.
+- `--host-core last` (or `STRATA_HOST_CORE=last`, Windows): the host thread runs on the last physical core and the
+  workers take the first. Windows sends a GPU's interrupts to the first core, where a host spinning on the GPU's flags
+  waits for them (`--host-core first` is the default; the startup log names the cores).
+- `STRATA_ADAPT_LAG=2` (#764): a window takes the adaptive tier's swaps once they are two windows old (default 1,
+  as 0.1.39). `STRATA_PREFILL_EQUAL=1` (#693): a prompt segment is read in chunks of equal size, not full chunks and a
+  short last one (changes the rounding). `STRATA_OWNED_PRICE=exact` (#796): the cache sizing prices the prompt path's
+  own buffers by their real allocation instead of 0.1.39's rule.
+- `STRATA_Q2_BITPLANE=1`: a bit-plane row kernel for Q2_0 on CPUs with AVX2 and no AVX-512 (changes the last bits).
+  `STRATA_NO_AVXVNNI=1` turns the AVX-VNNI forms of the i-quant, IQ4_NL and Q2_0 rows off on CPUs that have them
+  (Alder Lake, Sapphire Rapids and later); they give the same bits as the AVX2 forms, 4-25% faster rows.
+- Draft layer: `--lookup-chain-min M` (the shortest context match `--lookup-chain` extends, default 3),
+  `--mtp-hnorm stream` (one norm per stream, as llama.cpp's MTP graph) and `--mtp-draft-vocab FILE` (a token subset
+  of your own instead of `<mtp>/draft_vocab.bin`).
+- Elsewhere: HIP `STRATA_DENSE_MMQ=1` and `STRATA_HIP_ADAPT_KERNEL_COPY=1` in [AMD_HIP.md](AMD_HIP.md#model-and-serving-configuration);
+  `STRATA_KEEP_EMPTY_TURNS=1` and `STRATA_TOPK_STREAM=0` in [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
+
 
 **Read-ahead at start (Linux):** the weights, the native dense matrices, the GPU cache's fill from the profile, the
 resident RAM copy and the MTP draft files are asked for ahead of their reads (madvise / posix_fadvise WILLNEED in
@@ -690,7 +714,9 @@ and pictures. The oldest checkpoint - in practice the end of the system prompt, 
 shares - is kept for good while the rest rotates by least recent use, so a NEW chat that shares that prefix starts
 reading after it instead of from token 0. A prompt read from the start is also checkpointed at the end of its system
 prompt when that is 2,048 tokens or more (engine 0.1.20; PR #62 + #65), so that root exists for agent clients with long
-system prompts and tool lists. Engine options: `--prompt-cache N` (0 = off), `--prompt-cache-every N`,
+system prompts and tool lists. Claude Code stamps its system prompt with a billing header that changes on every
+request (`cch=...`) and every session (the 4th part of `cc_version=`); the server pins both stamps (to `f`s, as
+llama.cpp does), so the system prompt and the tool list in front of it are the same prompt on every turn. Engine options: `--prompt-cache N` (0 = off), `--prompt-cache-every N`,
 `--prompt-cache-root N` (0 = no system-prompt checkpoint), `--turn-token ID`.
 A one-shot request that no later request continues (a classification call, a probe) can send
 `"strata_checkpoint": false` in its body: it saves no checkpoint at its last turn nor every 16K tokens, so what

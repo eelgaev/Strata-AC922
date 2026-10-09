@@ -55,8 +55,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
 from serve.frontend import (ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
-                            forced_call, images_of, mark_think_literals, openai_to_messages, tool_choice_of,
-                            unmark_think_literals)
+                            forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages,
+                            tool_choice_of, unmark_think_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve import runconfig  # noqa: E402
 from serve.winjob import contain  # noqa: E402
@@ -1722,6 +1722,12 @@ class Vision:
         except Exception:
             self.proc.kill()
 
+    def shutdown(self):
+        """#914: close() for good: the server ends, so the encoder's directory (one ~10 MB .sve per image, on a tmpfs
+        /tmp that is RAM) goes with it instead of piling up with every start.  unload() keeps it for the restart."""
+        self.close()
+        shutil.rmtree(self.dir, ignore_errors=True)
+
 
 def gpu_list(cfg: dict) -> list[int]:
     """The config's "gpu": one card (2), or several for a layer split ([0, 2] or "0,2"), numbered as nvidia-smi
@@ -1941,6 +1947,10 @@ class ByteTokenizer:
 
     ALWAYS = ()                                     # specials matched without parse_special (type 4, as <think>)
 
+    @property
+    def control_tokens(self):
+        return [s for s in self.SPECIALS if s not in self.ALWAYS]
+
     def encode(self, text, parse_special=False, plain=()):
         out, i = [], 0
         while i < len(text):
@@ -2097,6 +2107,7 @@ class Service:
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
                  fit_max_tokens: bool = False):
         self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
+        self.literals = literal_tags(getattr(tokenizer, "control_tokens", ()))   # texts that stay text inside a message
         self.fit_max_tokens = fit_max_tokens          # --fit-max-tokens: clamp the output cap instead of 400
         self.aliases: list[str] = []                  # #297: other names of the model (the config's `aliases`)
         self.sampling_defaults = dict(sampling_defaults or {})   # the run config's `sampling` block
@@ -2645,12 +2656,14 @@ class Service:
 
     def encode_prompt(self, messages, tools, kwargs) -> list[int]:
         """The request's prompt: the template rendered and tokenized.  #537: a <think> / </think> written inside a
-        message's text is encoded as the text it is, not as the model's reasoning markers (the template's own are)."""
-        marked, marked_tools, changed = mark_think_literals(messages, tools)
+        message's text is encoded as the text it is, not as the model's reasoning markers (the template's own are).
+        A control token's text (<|im_start|>, <|im_end|>, <|endoftext|>, ...) inside a message is text as well: only
+        the control tokens the template writes are control tokens."""
+        marked, marked_tools, changed = mark_think_literals(messages, tools, self.literals)
         prompt = self.render_prompt(marked, marked_tools, kwargs)
         if not changed:
             return self.tok.encode(prompt, parse_special=True)
-        prompt, plain = unmark_think_literals(prompt)
+        prompt, plain = unmark_think_literals(prompt, self.literals)
         return self.tok.encode(prompt, parse_special=True, plain=plain)
 
     def _note_unreadable_tool_images(self, messages):
@@ -4942,7 +4955,7 @@ def main() -> int:
             time.sleep(1)                               # Windows never delivers Ctrl+C to an untimed Event.wait()
     except KeyboardInterrupt:
         print("\n[strata] stopping (Ctrl+C again to end the engine at once) ...", flush=True)
-        closers = [httpd.shutdown, getattr(engine, "close", None), vision.close if vision else None,
+        closers = [httpd.shutdown, getattr(engine, "close", None), vision.shutdown if vision else None,
                    hub.close if hub is not None else None]
         for close in filter(None, closers):
             try:

@@ -35,6 +35,7 @@ std::vector<std::pair<std::string, std::string>> arch_default_env(const char* gc
         {"STRATA_GDN_SPLIT", "1"},       // the GDN step over 4 blocks per head (S25/S26)
         {"STRATA_QFUSE", "1"},           // activation q8_1 images written by their producers (S26)
         {"STRATA_PLE_BATCH", "1"},       // the verify window's PLE key / value projections at once (S25)
+        {"STRATA_SH_STREAM", "1"},       // the shared expert on its own stream: decode +1.8% / +6.7% (UD-Q4_K_XL) (140-m)
     };
     return t;
 }

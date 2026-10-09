@@ -155,41 +155,52 @@ VISION_TAGS = {"<|vision_start|>": "\U000F0E03", "<|image_pad|>": "\U000F0E04", 
                "<|video_pad|>": "\U000F0E06"}
 LITERAL_TAGS = {**THINK_TAGS, **VISION_TAGS}
 THINK_MARKS = {v: k for k, v in LITERAL_TAGS.items()}
+CONTROL_MARK0 = 0xF0E10      # the control tokens' marks start here, clear of the two sets above
 
 
-def _mark(text: str) -> str:
-    for tag, mark in LITERAL_TAGS.items():
+def literal_tags(controls) -> dict[str, str]:
+    """LITERAL_TAGS plus a mark for each control token's text (`controls`: the tokenizer's CONTROL literals,
+    <|im_start|>, <|im_end|>, <|endoftext|>, ...).  The rendered prompt is encoded with those literals parsed, so one
+    written inside a message - a file an agent reads, a pasted chat template - opened or ended a turn there.  Longest
+    first, as the tokenizer matches them: a literal inside a longer one is not marked before it."""
+    tags = {**LITERAL_TAGS, **{c: chr(CONTROL_MARK0 + k) for k, c in enumerate(c for c in controls
+                                                                                if c not in LITERAL_TAGS)}}
+    return dict(sorted(tags.items(), key=lambda t: -len(t[0])))
+
+
+def _mark(text: str, tags: dict[str, str] = LITERAL_TAGS) -> str:
+    for tag, mark in tags.items():
         text = text.replace(tag, mark)
     return text
 
 
-def _mark_deep(v):
+def _mark_deep(v, tags: dict[str, str] = LITERAL_TAGS):
     if isinstance(v, str):
-        return _mark(v)
+        return _mark(v, tags)
     if isinstance(v, dict):
-        return {k: _mark_deep(x) for k, x in v.items()}
+        return {k: _mark_deep(x, tags) for k, x in v.items()}
     if isinstance(v, list):
-        return [_mark_deep(x) for x in v]
+        return [_mark_deep(x, tags) for x in v]
     return v
 
 
-def _has_tag(v) -> bool:
+def _has_tag(v, tags: dict[str, str] = LITERAL_TAGS) -> bool:
     if isinstance(v, str):
-        return any(tag in v for tag in LITERAL_TAGS)
+        return any(tag in v for tag in tags)
     if isinstance(v, dict):
-        return any(_has_tag(x) for x in v.values())
+        return any(_has_tag(x, tags) for x in v.values())
     if isinstance(v, list):
-        return any(_has_tag(x) for x in v)
+        return any(_has_tag(x, tags) for x in v)
     return False
 
 
-def mark_think_literals(messages: list[dict], tools: list[dict] | None):
+def mark_think_literals(messages: list[dict], tools: list[dict] | None, tags: dict[str, str] = LITERAL_TAGS):
     """#537: (messages, tools) with every literal <think> / </think> (#554: and vision marker) in their text swapped for
-    LITERAL_TAGS' marks, and
+    LITERAL_TAGS' marks (or `tags`': literal_tags() adds the control tokens' texts), and
     whether there was one (None: no change, the same objects back - a prompt without them renders as it always did).
     An assistant message whose content opens with a whole <think>...</think> block (clients that send the reasoning
     inline) keeps that one block as the model's markers, as before."""
-    if not _has_tag(messages) and not _has_tag(tools):
+    if not _has_tag(messages, tags) and not _has_tag(tools, tags):
         return messages, tools, False
     out = []
     for m in messages:
@@ -197,26 +208,29 @@ def mark_think_literals(messages: list[dict], tools: list[dict] | None):
         content = m.get("content")
         for k, v in m.items():
             if k != "role":
-                m[k] = _mark_deep(v)
+                m[k] = _mark_deep(v, tags)
         if m.get("role") == "assistant" and isinstance(content, str) and content.lstrip().startswith("<think>") \
                 and "</think>" in content:
             i, j = content.index("<think>") + len("<think>"), content.index("</think>")
-            m["content"] = content[:i] + _mark(content[i:j]) + "</think>" + _mark(content[j + len("</think>"):])
+            m["content"] = (content[:i] + _mark(content[i:j], tags) + "</think>" +
+                            _mark(content[j + len("</think>"):], tags))
         out.append(m)
-    return out, _mark_deep(tools), True
+    return out, _mark_deep(tools, tags), True
 
 
 _THINK_MARK_RE = re.compile("|".join(THINK_MARKS))
 
 
-def unmark_think_literals(prompt: str) -> tuple[str, list[tuple[int, int]]]:
+def unmark_think_literals(prompt: str, tags: dict[str, str] = LITERAL_TAGS) -> tuple[str, list[tuple[int, int]]]:
     """The rendered prompt with THINK_TAGS' marks turned back into the tags' text, and the (start, end) spans of those
     tags in it: the server encodes them as ordinary text (the tokenizer's encode_plain_spans)."""
+    marks = THINK_MARKS if tags is LITERAL_TAGS else {v: k for k, v in tags.items()}
+    mark_re = _THINK_MARK_RE if tags is LITERAL_TAGS else re.compile("|".join(map(re.escape, marks)))
     out, spans, pos, n = [], [], 0, 0
-    for m in _THINK_MARK_RE.finditer(prompt):
+    for m in mark_re.finditer(prompt):
         out.append(prompt[pos:m.start()])
         n += m.start() - pos
-        tag = THINK_MARKS[m.group(0)]
+        tag = marks[m.group(0)]
         out.append(tag)
         spans.append((n, n + len(tag)))
         n += len(tag)
@@ -322,6 +336,35 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
     return _late_system_to_user(messages), tools, kwargs
 
 
+BILLING_HEADER = "x-anthropic-billing-header:"
+
+
+def pin_billing_stamp(system: str) -> str:
+    """Claude Code starts its system prompt with `x-anthropic-billing-header: cc_version=2.1.170.bf4;
+    cc_entrypoint=sdk-cli; cch=b145e;`.  cch changes on EVERY request and the version's 4th part on every session, so
+    the prompt changed ~22K tokens in (after the tool list) on every turn and the conversation cache could only reuse
+    up to its last 16K checkpoint: half of every agent prompt was read again.  Both stamps are pinned to f's, as
+    llama.cpp does (ggml-org/llama.cpp#21793); only a header at the very start of the system text is touched, and
+    only inside its first 160 characters."""
+    if not system.startswith(BILLING_HEADER):
+        return system
+    s = list(system)
+    cch = system.find("cch=", len(BILLING_HEADER))
+    if 0 <= cch <= 160:
+        v, end = cch + 4, system.find(";", cch + 4)
+        if end > v and end - v <= 16:
+            s[v:end] = "f" * (end - v)
+    cv = system.find("cc_version=")
+    if 0 <= cv <= 160:
+        v, end = cv + len("cc_version="), system.find(";", cv)
+        if v < end and end - v <= 64:
+            parts = system[v:end].split(".")
+            if len(parts) > 3:
+                tail = v + len(".".join(parts[:3])) + 1
+                s[tail:end] = "f" * (end - tail)
+    return "".join(s)
+
+
 def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[dict], list[dict] | None, dict]:
     """Anthropic Messages -> (template messages, template tools, template kwargs).  `think_unasked`: a request
     without "thinking", an effort or a budget gets the template's default (it thinks), as through 0.1.31; False
@@ -329,7 +372,7 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
     messages = []
     system = req.get("system")
     if system:
-        messages.append({"role": "system", "content": _text_of(system)})
+        messages.append({"role": "system", "content": pin_billing_stamp(_text_of(system))})
     for m in _object_list(req.get("messages"), "messages"):
         content = m.get("content")
         if isinstance(content, str):

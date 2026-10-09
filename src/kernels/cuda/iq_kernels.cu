@@ -459,8 +459,10 @@ __device__ __forceinline__ float vec_dot_q5_0_q8_1(const void* __restrict__ vbq,
 // with the CUDA chain native_expert_parity failed its 3e-2 limit on two layers of a Q4_0 Flash-Next file.  The
 // centring is the same idea as the Q5_1 min term above: the offset is applied to the activations' own int8 codes.
 __device__ __forceinline__ int q4_0_centred(const int v) {
-    const int b = v ^ 0x08080808;                    // per byte: 0..15 -> (q - 8) as a 4-bit two's complement value
-    return b | ((b & 0x08080808) * 0x1E);            // sign-extend each nibble into its byte (0x08 * 0x1E = 0xF0)
+    // Unsigned: (b & 0x08080808) * 0x1E reaches 0xF0F0F0F0, which overflows a signed int - undefined behaviour the
+    // sm_60 build (no __dp4a, strata_dp4a fallback) optimised into a wrong value (native_expert_parity gpu rel 1.7e4).
+    const uint32_t b = (uint32_t) v ^ 0x08080808u;   // per byte: 0..15 -> (q - 8) as a 4-bit two's complement value
+    return (int) (b | ((b & 0x08080808u) * 0x1Eu));  // sign-extend each nibble into its byte (0x08 * 0x1E = 0xF0)
 }
 __device__ __forceinline__ float vec_dot_q4_0_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1,
                                                    const int& kbx, const int& iqs) {

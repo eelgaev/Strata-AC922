@@ -2675,6 +2675,33 @@ def low_ram_fits(model, ram, vram_gb) -> bool:
     return ram - 6 + max(0.0, vram_gb - 5) >= arena
 
 
+def low_ram_wanted(model, ram, choice="auto") -> bool:
+    """Does setup put this model in the low-RAM mode on this PC: its experts do not fit the RAM with the usual room
+    beside them (`low_ram_needed`), or the user asked for it.  Unsloth's 4-bit file is not the low-RAM mode at all:
+    it always reads part of its experts from the files, through its RAM budget.  Step 5 applies exactly this answer,
+    and the launcher's preset diff asks it too - so a preset that says "auto" is compared with what auto decides,
+    not with the word."""
+    if MODELS[model].get("budget"):
+        return False
+    return choice in ("on", "resident", "mmap") or (choice == "auto" and low_ram_needed(model, ram))
+
+
+def kv_streaming_ram_gb(ctx, kv) -> float:
+    """The RAM a streamed KV cache takes: ~13.7 KB per context token with 8-bit KV (1.7 GB at 128K), 10.6 KB with
+    K8V4, 7.5 KB with 4-bit - 12 QSA layers + the draft layer."""
+    return ctx * (13 * KV_CELL_BYTES.get(kv, 1056)) / 1e9
+
+
+def kv_streaming_wanted(model, ctx, kv, ram, choice="auto") -> bool:
+    """Will setup stream this model's KV cache on this PC: from 64K up, when the RAM holds the cache beside the
+    model's experts (+1 GB); `--kv-streaming on|off` overrides the RAM test (the owner's rule), and WSL never
+    streams.  Step 7 writes `--kv-resident` on exactly this answer, and the launcher's preset diff
+    asks it too: a config's `--kv-resident` and a preset's "auto" are the same setting when this says yes."""
+    if is_wsl() or choice == "off":
+        return False
+    return ctx >= 65536 and (ram >= MODELS[model]["ram_gb"] + kv_streaming_ram_gb(ctx, kv) + 1 or choice == "on")
+
+
 def low_ram_one_gpu_why(model, ram, choice, sel=None) -> list[str]:
     """#250: why the low-RAM mode recommends one GPU, with the RAM math that turned it on; #364 #384: and how to use
     all of them (sel: the cards, for the --gpus example)."""
@@ -4206,8 +4233,9 @@ def main() -> int:
                      "copy of the most-used ones: it needs 32 GB of RAM or more (48 GB for the full model); --model "
                      "NAME --yes installs one anyway")
         warn(f"going on with {ram:.0f} GB of RAM, as you chose")
-    ok(f"RAM: {ram:.0f} GB" if ram >= need - 4 else f"RAM: {ram:.0f} GB (less than the {need} GB the smallest model needs)"
-       + ("; the GPU's VRAM makes up for it (the low-RAM mode)" if ram < need - 4 and low_ok else ""))
+    ram_msg = (f"RAM: {ram:.0f} GB" if ram >= need - 4 else f"RAM: {ram:.0f} GB (less than the {need} GB the smallest model needs)"
+               + ("; the GPU's VRAM makes up for it (the low-RAM mode)" if ram < need - 4 and low_ok else ""))
+    (ok if ram >= need - 4 or low_ok else warn)(ram_msg)       # #977: a RAM below every model's floor is not [ok]
     pf = page_file_gb()
     if pf is not None and pf < 4:
         warn(f"Windows' page file is {pf:.1f} GB: the graphics card's memory needs room there too (issue #60), so "
@@ -4231,6 +4259,7 @@ def main() -> int:
         a.build = True
     if a.check:
         say()
+        any_fits = False
         for m, d in MODELS.items():
             verdict = "fits" if ram >= d["ram_gb"] else "tight" if ram >= d["ram_gb"] - 8 else "does not fit"
             if d.get("budget"):
@@ -4243,7 +4272,14 @@ def main() -> int:
                 verdict = (f"fits in the low-RAM mode (the GPU holds ~{100 * low_ram_gpu_share(m, gpu['vram_gb']):.0f}% "
                            "of its experts, " + ("the rest stays in RAM)" if low_ram_resident(m, ram, gpu["vram_gb"])
                                                  else "the rest is read from the SSD as needed)"))
+            any_fits = any_fits or not verdict.startswith("does not fit")
             say(f"  {m:8s} needs ~{d['ram_gb']} GB RAM: {verdict}")
+        if not any_fits:
+            # #977: every size says "does not fit", so the verdict says so too (and the exit code, for scripts). It only
+            # reports: --model NAME --yes still installs one anyway.
+            say(f"\nThis PC cannot run Strata yet: no model size fits {ram:.0f} GB of RAM (the smallest needs about "
+                f"{need} GB). --model NAME --yes installs one anyway, slowly.")
+            return 1
         say("\nThis PC can run Strata. Run it again without --check to install.")
         return 0
 
@@ -4325,8 +4361,7 @@ def main() -> int:
     elif a.resident_budget_gib is not None:
         warn(f"--resident-budget-gib is for UD-Q4_K_XL and UD-IQ4_XS: {model} keeps all of its experts in RAM or in "
              "the low-RAM mode")
-    low_ram = budget is None and (a.low_ram in ("on", "resident", "mmap") or
-                                  (a.low_ram == "auto" and low_ram_needed(model, ram)))
+    low_ram = low_ram_wanted(model, ram, a.low_ram)
     # #642: the engines from RESIDENT_SPLIT_ENGINE run the low-RAM mode on the chosen cards as on one (decided below)
     if low_ram and multi and not resident_split() and not low_ram_together(a, model, ram, gpu, chosen):
         multi, sel, chosen = [], [gpu["index"]], [gpu]
@@ -4489,9 +4524,15 @@ def main() -> int:
     # the .part files already on the disk count
     on_disk = sum(f.stat().st_size for s in shards for f in (s, s.with_name(s.name + ".part")) if f.is_file()) / 1e9
     to_fetch = 0 if a.gguf_dir or have_model else max(MODELS[model]["download_gb"] - on_disk, 0)
-    need = to_fetch + 8 + \
-        (40 if model == "Q2_0" and avx512 and family == "qwen" else 0) + (1 if vision != "none" else 0) + \
-        (MODELS[model]["arena_gb"] + 1 if low_ram and not (model == "Q2_0" and avx512 and family == "qwen") else 0)
+    # count only what step 6 will still write: a pack whose experts.bin is already there (the AVX-512 Q2_0
+    # conversion, or the low-RAM mode's copy) and an existing MTP draft layer need no new room
+    pack_now = find_in(roots, f"packs/{tag.lower()}") or data / "packs" / tag.lower()
+    pack_bin = (pack_now / "experts.bin").exists() and (pack_now / "index.txt").exists()
+    mtp_have = find_in(roots, "mtp/rt/experts.bin") is not None
+    q2_avx = model == "Q2_0" and avx512 and family == "qwen"
+    need = to_fetch + (2 if mtp_have else 8) + \
+        (40 if q2_avx and not pack_bin else 0) + (1 if vision != "none" else 0) + \
+        (MODELS[model]["arena_gb"] + 1 if low_ram and not q2_avx and not pack_bin else 0)
     if free_gb(models_dir) < need:
         fail(f"not enough free disk space in {models_dir}: need ~{need:.0f} GB" +
              (f" ({on_disk:.0f} GB of the model is already there)" if on_disk >= 1 and not have_model else ""),
@@ -4669,7 +4710,7 @@ def main() -> int:
     # per layer) stays in VRAM; the VRAM it frees holds more experts (+6% at 128K, +23% at 262K with Q2_0). It
     # costs ~13.7 KB of RAM per context token with 8-bit KV (1.7 GB at 128K), 10.6 KB with K8V4, 7.5 KB with 4-bit, so only
     # when it fits.
-    kv_ram_gb = ctx * (13 * KV_CELL_BYTES.get(kv, 1056)) / 1e9   # 12 QSA layers + the draft layer
+    kv_ram_gb = kv_streaming_ram_gb(ctx, kv)      # the branches below are kv_streaming_wanted, with its messages
     # --kv-streaming on|off overrides the RAM test (the owner's rule); WSL stays off - it cannot stream.
     stream_fits = ram >= MODELS[model]["ram_gb"] + kv_ram_gb + 1
     if gpu.get("unified_memory") and ctx >= 65536:

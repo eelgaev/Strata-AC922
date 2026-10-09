@@ -3428,11 +3428,13 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
     // #285: on Windows the per-layer registration runs on a thread ahead of the readers, which wait for their
     // layer's slice (the whole arena registered before the load cost ~2.5 s at 33 GiB of 4 KB pages, not hidden).
     // Only where the whole arena would be registered: no cap (STRATA_ARENA_PIN_GIB, multi-GPU), no shared arena.
-    // Linux keeps the whole-arena pin (#253). STRATA_DEFERRED_REGISTER=0: the registration before the load.
+    // Linux keeps the whole-arena pin (#253). OPT-IN (STRATA_DEFERRED_REGISTER=1): on the RTX 5070 / Windows the
+    // arena registered per layer before it is filled decoded ~10% slower than the old order (whole-arena try, sliced
+    // fallback after the load) with identical output; the start-time gain does not pay for that.
 #ifdef _WIN32
     const char* defer_env = std::getenv("STRATA_DEFERRED_REGISTER");
     const bool deferred = max_pinned_bytes == 0 && arena_pin_cap_gib() == -1 && shared_arena_file.empty() &&
-                          (defer_env == nullptr || defer_env[0] != '0');
+                          (defer_env != nullptr && defer_env[0] != 0 && defer_env[0] != '0');
 #else
     const bool deferred = false;
 #endif

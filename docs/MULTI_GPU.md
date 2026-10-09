@@ -125,7 +125,7 @@ running; the resident copy is there from the first request and stays locked when
 The card that drives the monitors needs more headroom than one that drives none; with the display on the last card,
 `--vram-reserve-mib 300 --vram-reserve-later-mib 1800` gives the first card's cache that VRAM.
 
-**auto** tries every placement (all of them for two or three cards; proportional to the free VRAM beyond that) and
+**auto** tries every placement (all of them for two, three or, since 0.1.40, four cards; proportional to the free VRAM beyond that) and
 keeps the one whose caches would hold the most of the expert profile, hottest pairs weighted most; ties go to the
 placement that leaves the fullest card the most room. The startup log prints the choice:
 
