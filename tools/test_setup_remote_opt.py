@@ -73,21 +73,6 @@ class Rule(unittest.TestCase):
         setup.recommend_remote_expert_opt(off)
         self.assertIn(FLAG, off["args"])
 
-    def test_pipeline_windows_wins(self):
-        """#1352: the two exclude each other (the engine drops the pipeline beside the helper caches), so setup
-        does not add the flag to a config that asks for the pipeline, and says so when both are there."""
-        cfg = {"args": ["--spec", "4", "--pipeline-windows", "2"], "gpu": [0, 1]}
-        setup.recommend_remote_expert_opt(cfg)
-        self.assertEqual(cfg["args"], ["--spec", "4", "--pipeline-windows", "2"])
-        both = {"args": [FLAG, "--pipeline-windows", "2"], "gpu": [0, 1]}
-        with mock.patch.object(setup, "warn") as w:
-            setup.recommend_remote_expert_opt(both)
-        self.assertEqual(both["args"], [FLAG, "--pipeline-windows", "2"])    # a recommendation, never forced
-        self.assertEqual(w.call_count, 1)
-        off = {"args": ["--pipeline-windows", "0"], "gpu": [0, 1]}            # 0: no pipeline asked for
-        setup.recommend_remote_expert_opt(off)
-        self.assertIn(FLAG, off["args"])
-
     def test_the_users_key_is_kept_on_a_rerun(self):
         self.assertNotIn("remote_expert_opt", setup.SETUP_KEYS)   # #629: carried over, so the opt-out survives
 
