@@ -113,8 +113,8 @@ __global__ void __launch_bounds__(256) gdn_ab_multi_kernel(const float* __restri
         for (int t = 0; t < kVerifyMaxT; ++t) {
             if (t >= T) break;
             const float* xt = x + (size_t) t * n;
-            const float4 xa = *reinterpret_cast<const float4*>(xt + j * 8);
-            const float4 xb = *reinterpret_cast<const float4*>(xt + j * 8 + 4);
+            const float4 xa = __ldg(reinterpret_cast<const float4*>(xt + j * 8));
+            const float4 xb = __ldg(reinterpret_cast<const float4*>(xt + j * 8 + 4));
             float a = acc[t];
             a = fmaf(w[0], xa.x, a); a = fmaf(w[1], xa.y, a);
             a = fmaf(w[2], xa.z, a); a = fmaf(w[3], xa.w, a);
@@ -127,6 +127,7 @@ __global__ void __launch_bounds__(256) gdn_ab_multi_kernel(const float* __restri
     for (int t = 0; t < kVerifyMaxT; ++t) {
         if (t >= T) break;
         float a = acc[t];
+#pragma unroll
         for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
         if (lane != 0) continue;
         if (is_beta) {
@@ -250,7 +251,7 @@ __device__ __forceinline__ void gdn_q8_1_store(GdnQ81* __restrict__ xq, size_t i
     if (idx % 32 == 0) xq[idx / 32].ds = make_half2(d, sum);
 }
 
-template<bool Q>
+template <bool ALL_OUT, bool Q>
 __global__ void __launch_bounds__(S * RG) gdn_step_norm_multi_kernel(float* __restrict__ state,
                                                                      const float* __restrict__ hbuf, int C,
                                                                      const float* __restrict__ gate,
@@ -260,75 +261,79 @@ __global__ void __launch_bounds__(S * RG) gdn_step_norm_multi_kernel(float* __re
                                                                      float* __restrict__ y, int h_k, int h_v, int T,
                                                                      const int32_t* __restrict__ n_keep, int t_out_begin,
                                                                      GdnQ81* __restrict__ xq) {
-    __shared__ float sk[S], sq[S];
-    __shared__ float red[RG][S];
-    __shared__ float wsum[S * RG / 32];
+    __shared__ float sk[2][S], sq[2][S];
+    __shared__ float red_kv[RG][S];
+    __shared__ float red_o[RG][S];
+    __shared__ float wsum[S / 32];
     const int head = blockIdx.x;
     const int col = threadIdx.x;
     const int rg = threadIdx.y;
-    const int tid = rg * S + col;
     const int qh = head % h_k;
     const int qk = S * h_k;             // q at [0, qk), k at [qk, 2qk), v at [2qk, ...)
     const int value_dim = S * h_v;
-    const int n = n_keep ? *n_keep : T;
+    const int n = ALL_OUT ? T : (n_keep ? *n_keep : T);
+    if (n > 0) {
+        if (rg == 0) sk[0][col] = hbuf[qk + qh * S + col];
+        else if (rg == 1 && (ALL_OUT || 0 >= t_out_begin)) sq[0][col] = hbuf[qh * S + col];
+    }
+    const float gam = (rg == 0) ? gamma[col] : 0.0f;
     float s[RPG];
     float* base = state + ((size_t) (rg * RPG) * h_v + head) * S + col;
     const size_t row_stride = (size_t) h_v * S;
 #pragma unroll
-    for (int r = 0; r < RPG; ++r) s[r] = base[r * row_stride];
+    for (int r = 0; r < RPG; ++r) s[r] = ALL_OUT ? __ldg(&base[r * row_stride]) : base[r * row_stride];
     for (int t = 0; t < n; ++t) {
+        const int cur = t & 1, nxt = (t + 1) & 1;
         const float* ht = hbuf + (size_t) t * C;
-        const bool need_out = (t >= t_out_begin);
-        __syncthreads();                // the previous token is done with sk/sq/red/wsum
-        if (tid < S) {
-            sk[tid] = ht[qk + qh * S + tid];
-            if (need_out) sq[tid] = ht[qh * S + tid];
-        }
+        const bool need_out = ALL_OUT || (t >= t_out_begin);
         __syncthreads();
+        if (t + 1 < n) {
+            const float* ht_next = ht + C;
+            const bool need_next = ALL_OUT || (t + 1 >= t_out_begin);
+            if (rg == 0) sk[nxt][col] = ht_next[qk + qh * S + col];
+            else if (rg == 1 && need_next) sq[nxt][col] = ht_next[qh * S + col];
+        }
         const float g = __expf(gate[(size_t) t * h_v + head]);
         float kv = 0.0f;
 #pragma unroll
-        for (int r = 0; r < RPG; ++r) kv = fmaf(s[r], sk[rg * RPG + r], kv);
-        red[rg][col] = kv;
+        for (int r = 0; r < RPG; ++r) kv = fmaf(s[r], sk[cur][rg * RPG + r], kv);
+        red_kv[rg][col] = kv;
         __syncthreads();
-        const float kv_col = red[0][col] + red[1][col] + red[2][col] + red[3][col];
+        const float kv_col = red_kv[0][col] + red_kv[1][col] + red_kv[2][col] + red_kv[3][col];
         const float delta = (ht[2 * qk + head * S + col] - g * kv_col) * beta[(size_t) t * h_v + head];
         if (!need_out) {
 #pragma unroll
-            for (int r = 0; r < RPG; ++r) s[r] = fmaf(g, s[r], sk[rg * RPG + r] * delta);
+            for (int r = 0; r < RPG; ++r) s[r] = fmaf(g, s[r], sk[cur][rg * RPG + r] * delta);
             continue;
         }
         float o = 0.0f;
 #pragma unroll
         for (int r = 0; r < RPG; ++r) {
-            s[r] = fmaf(g, s[r], sk[rg * RPG + r] * delta);
-            o = fmaf(s[r], sq[rg * RPG + r], o);
+            s[r] = fmaf(g, s[r], sk[cur][rg * RPG + r] * delta);
+            o = fmaf(s[r], sq[cur][rg * RPG + r], o);
         }
-        __syncthreads();
-        red[rg][col] = o;
+        red_o[rg][col] = o;
         __syncthreads();
         float oc = 0.0f, sq_part = 0.0f;
         if (rg == 0) {
-            oc = (red[0][col] + red[1][col] + red[2][col] + red[3][col]) * rsqrtf((float) S);
+            oc = (red_o[0][col] + red_o[1][col] + red_o[2][col] + red_o[3][col]) * rsqrtf((float) S);
             sq_part = oc * oc;
         }
+        // every thread takes the shuffles, as the single-token kernel does: inside the `rg == 0` branch hipcc on
+        // gfx1151 gave another rounding for 3% of the outputs (gdn_parity section 5 on Aurora)
         for (int o2 = 16; o2 > 0; o2 >>= 1) sq_part += __shfl_xor_sync(0xffffffffu, sq_part, o2);
-        if ((tid & 31) == 0) wsum[tid >> 5] = sq_part;
+        if (rg == 0 && (col & 31) == 0) wsum[col >> 5] = sq_part;
         __syncthreads();
         if (rg == 0) {
             const float ss = wsum[0] + wsum[1] + wsum[2] + wsum[3];
             const float scale = rsqrtf(ss / (float) S + eps);
             const float zz = z[(size_t) t * value_dim + head * S + col];
-            if constexpr (Q) {
-                const float yv = oc * scale * gamma[col] * (1.0f / (1.0f + __expf(-zz)));
-                y[(size_t) t * value_dim + head * S + col] = yv;
-                gdn_q8_1_store(xq, (size_t) (t - t_out_begin) * value_dim + head * S + col, yv);
-            } else {
-                y[(size_t) t * value_dim + head * S + col] = oc * scale * gamma[col] * (1.0f / (1.0f + __expf(-zz)));
-            }
+            const float yv = oc * scale * gam * (1.0f / (1.0f + __expf(-zz)));
+            y[(size_t) t * value_dim + head * S + col] = yv;
+            if constexpr (Q) gdn_q8_1_store(xq, (size_t) (t - t_out_begin) * value_dim + head * S + col, yv);
         }
     }
-    if (n_keep != nullptr && n > 0) {
+    if (!ALL_OUT && n_keep != nullptr && n > 0) {
 #pragma unroll
         for (int r = 0; r < RPG; ++r) base[r * row_stride] = s[r];
     }
@@ -1115,12 +1120,20 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
         check("gdn_step_commit");
         return;
     }
-    if (xq && t_out_begin < n_tok)
-        gdn_step_norm_multi_kernel<true><<<(unsigned) h_v, dim3(S, RG), 0, (cudaStream_t) stream>>>(
+    const dim3 g1((unsigned) h_v), b1(S, RG);
+    const bool all_out = n_keep == nullptr && t_out_begin <= 0;
+    if (xq && t_out_begin < n_tok) {
+        if (all_out) gdn_step_norm_multi_kernel<true, true><<<g1, b1, 0, (cudaStream_t) stream>>>(
+            state, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, n_tok, nullptr, 0, xq);
+        else gdn_step_norm_multi_kernel<false, true><<<g1, b1, 0, (cudaStream_t) stream>>>(
             state, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, n_tok, n_keep, t_out_begin, xq);
-    else
-        gdn_step_norm_multi_kernel<false><<<(unsigned) h_v, dim3(S, RG), 0, (cudaStream_t) stream>>>(
+    } else if (all_out) {
+        gdn_step_norm_multi_kernel<true, false><<<g1, b1, 0, (cudaStream_t) stream>>>(
+            state, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, n_tok, nullptr, 0, nullptr);
+    } else {
+        gdn_step_norm_multi_kernel<false, false><<<g1, b1, 0, (cudaStream_t) stream>>>(
             state, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, n_tok, n_keep, t_out_begin, nullptr);
+    }
     check("gdn_step_norm_multi");
 }
 
@@ -1136,30 +1149,28 @@ namespace {
 // 7+ tokens lost its last entries)
 constexpr int kResidentPlanMax = 128;
 static_assert(kVerifyMaxT * 10 <= kResidentPlanMax, "resident_plan: one thread per entry");
+// the parallel scan keeps one partial sum per warp in s_wsum[4] and packs (entries << 16 | groups) in an int
+static_assert(kResidentPlanMax <= 128 && kResidentPlanMax % 32 == 0, "resident_plan: at most 4 warps");
+static_assert(kResidentPlanMax < 32768, "resident_plan: the packed entry count must stay below 2^15");
 __global__ void __launch_bounds__(kResidentPlanMax) resident_plan_kernel(const int32_t* __restrict__ ids, int n, int k, const int32_t* __restrict__ res,
                                      int n_expert, const uint8_t* cache_base, const unsigned long long* slot_off,
                                      long long blob, int32_t* __restrict__ pl, long long capx, uint32_t* skip,
                                      uint32_t ring, volatile uint32_t* plan_err) {
     __shared__ int32_t s_ids[kResidentPlanMax];
-    __shared__ unsigned long long s_ptr[kResidentPlanMax];
-    __shared__ int32_t s_first[kResidentPlanMax];
-    __shared__ int32_t s_cnt[kResidentPlanMax];
-    __shared__ int32_t s_gstart[kResidentPlanMax];
+    __shared__ int32_t s_excl[kResidentPlanMax];
+    __shared__ int32_t s_wsum[4];
     __shared__ int s_bad;
     const int tid = threadIdx.x;
     if (tid == 0) s_bad = 0;
     __syncthreads();
 
     int32_t eid = -1;
+    int32_t slot = -1;
     if (tid < n) {
         eid = ids[tid];
         s_ids[tid] = eid;
-        const int32_t slot = (eid >= 0 && eid < n_expert) ? res[eid] : -1;
-        if (slot < 0) {
-            atomicOr(&s_bad, 1);
-        } else {
-            s_ptr[tid] = (unsigned long long) (cache_base + (slot_off ? (size_t) slot_off[slot] : (size_t) slot * (size_t) blob));
-        }
+        slot = (eid >= 0 && eid < n_expert) ? res[eid] : -1;
+        if (slot < 0) atomicOr(&s_bad, 1);
     }
     __syncthreads();
     if (s_bad) {
@@ -1182,9 +1193,21 @@ __global__ void __launch_bounds__(kResidentPlanMax) resident_plan_kernel(const i
                 ++count_same;
             }
         }
-        const bool is_first = (first_j == tid);
-        s_first[tid] = is_first ? 1 : 0;
-        s_cnt[tid] = is_first ? count_same : 0;
+    }
+    const bool is_first = (tid < n && first_j == tid && slot >= 0);
+    const int my_cnt = is_first ? count_same : 0;
+    const int my_pack = (my_cnt << 16) | (is_first ? 1 : 0);
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    int pref = my_pack;
+#pragma unroll
+    for (int d = 1; d < 32; d <<= 1) {
+        const int up = __shfl_up_sync(0xffffffffu, pref, d);
+        if (lane >= d) pref += up;
+    }
+    s_excl[tid] = pref - my_pack;
+    if (lane == 31) {
+        s_wsum[warp] = pref;
     }
     __syncthreads();
 
@@ -1196,27 +1219,30 @@ __global__ void __launch_bounds__(kResidentPlanMax) resident_plan_kernel(const i
     unsigned long long* ptr = (unsigned long long*) (pl + ptr_off);
     int32_t* start2 = pl + ptr_off + 4 * capx;
 
-    if (tid < n && first_j == tid) {
-        int grp_idx = 0;
-        int ent_start = 0;
-        for (int j = 0; j < tid; ++j) {
-            grp_idx += s_first[j];
-            ent_start += s_cnt[j];
+    if (is_first) {
+        int tot = s_excl[tid];
+#pragma unroll
+        for (int w = 0; w < 4; ++w) {
+            if (w < warp) tot += s_wsum[w];
         }
-        ptr[grp_idx] = s_ptr[tid];
+        const int grp_idx = tot & 0xffff;
+        const int ent_start = tot >> 16;
+        ptr[grp_idx] = (unsigned long long) (cache_base + (slot_off ? (size_t) slot_off[slot] : (size_t) slot * (size_t) blob));
         start[grp_idx] = ent_start;
-        s_gstart[tid] = ent_start;
     }
-    __syncthreads();
-
     if (tid < n) {
-        const int out_idx = s_gstart[first_j] + rank_in_group;
+        const int fj_warp = first_j >> 5;
+        int fj_tot = s_excl[first_j];
+#pragma unroll
+        for (int w = 0; w < 4; ++w) {
+            if (w < fj_warp) fj_tot += s_wsum[w];
+        }
+        const int out_idx = (fj_tot >> 16) + rank_in_group;
         dst[out_idx] = tid;
         tok[out_idx] = tid / k;
     }
     if (tid == 0) {
-        int groups = 0;
-        for (int j = 0; j < n; ++j) groups += s_first[j];
+        const int groups = (s_wsum[0] + s_wsum[1] + s_wsum[2] + s_wsum[3]) & 0xffff;
         start[groups] = n;
         start2[0] = n;
         counts[0] = groups;

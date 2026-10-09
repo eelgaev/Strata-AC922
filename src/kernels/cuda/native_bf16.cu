@@ -66,10 +66,8 @@ __global__ void bf16_f32_mmvf_kernel(const float* __restrict__ x, const void* __
     const void* row = mmvf_row<WF>(w, n_in);
     const float2* inputs2 = reinterpret_cast<const float2*>(x);
     __shared__ float partials[32];
-    if constexpr (BLOCK_SIZE > 32) {
-        if (t < 32) partials[t] = 0.0f;
-        __syncthreads();
-    }
+    if (t < 32) partials[t] = 0.0f;
+    __syncthreads();
     float acc = 0.0f;
     for (int pair = t; pair < n_in / 2; pair += BLOCK_SIZE) {
         float w0, w1;
@@ -92,18 +90,17 @@ __global__ void bf16_f32_mmvf_kernel(const float* __restrict__ x, const void* __
 // the same kernel for up to 8 activation rows - the weight row is read ONCE and every
 // token keeps its own accumulator with exactly the single-row kernel's order (pairs, two ordered FMAs, the same warp
 // and block reductions), so each output is bit-identical to a bf16_f32_mmvf_kernel launch of its own.
-template <int BLOCK_SIZE, int NT, int WF = 0>
+template <int BLOCK_SIZE, int NT, int WF = 0, bool EXACT_T = false>
 __global__ void bf16_f32_mmvf_multi_kernel(const float* __restrict__ x, int64_t ldx, const void* __restrict__ w,
                                           float* __restrict__ y, int64_t ldy, int n_in, int n_tok) {
     const int t = threadIdx.x;
     const void* row = mmvf_row<WF>(w, n_in);
     __shared__ float partials[NT][32];
-    if constexpr (BLOCK_SIZE > 32) {
-        if (t < 32)
+    if (t < 32) {
 #pragma unroll
-            for (int k = 0; k < NT; ++k) partials[k][t] = 0.0f;
-        __syncthreads();
+        for (int k = 0; k < NT; ++k) partials[k][t] = 0.0f;
     }
+    __syncthreads();
     float acc[NT];
 #pragma unroll
     for (int k = 0; k < NT; ++k) acc[k] = 0.0f;
@@ -112,28 +109,31 @@ __global__ void bf16_f32_mmvf_multi_kernel(const float* __restrict__ x, int64_t 
         mmvf_pair<WF>(row, pair, w0, w1);
 #pragma unroll
         for (int k = 0; k < NT; ++k) {
-            if (k < n_tok) {
-                const float2 input = reinterpret_cast<const float2*>(x + (size_t) k * ldx)[pair];
+            if (EXACT_T || k < n_tok) {
+                const float2 input = __ldg(reinterpret_cast<const float2*>(x + (size_t) k * ldx) + pair);
                 acc[k] = __fmaf_rn(w0, input.x, acc[k]);
                 acc[k] = __fmaf_rn(w1, input.y, acc[k]);
             }
         }
     }
 #pragma unroll
-    for (int k = 0; k < NT; ++k) acc[k] = mmvf_warp_sum(acc[k]);
+    for (int k = 0; k < NT; ++k)
+        if (EXACT_T || k < n_tok) acc[k] = mmvf_warp_sum(acc[k]);
     if constexpr (BLOCK_SIZE > 32) {
         if ((t & 31) == 0)
 #pragma unroll
-            for (int k = 0; k < NT; ++k) partials[k][t / 32] = acc[k];
+            for (int k = 0; k < NT; ++k)
+                if (EXACT_T || k < n_tok) partials[k][t / 32] = acc[k];
         __syncthreads();
         if (t < 32)
 #pragma unroll
-            for (int k = 0; k < NT; ++k) acc[k] = mmvf_warp_sum(partials[k][t]);
+            for (int k = 0; k < NT; ++k)
+                if (EXACT_T || k < n_tok) acc[k] = mmvf_warp_sum(partials[k][t]);
     }
     if (t == 0)
 #pragma unroll
         for (int k = 0; k < NT; ++k)
-            if (k < n_tok) y[(size_t) k * ldy + blockIdx.x] = acc[k];
+            if (EXACT_T || k < n_tok) y[(size_t) k * ldy + blockIdx.x] = acc[k];
 }
 
 // S25 (STRATA_MMVF_ROWS=1): RPB output rows per block. Each block read its row's weights once but all T activation
@@ -333,8 +333,15 @@ void gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const void* w, WForm f, f
         return;
     }
 #define STRATA_MMVF_MF(N, WF) \
-    if (n_tok <= 4) bf16_f32_mmvf_multi_kernel<N, 4, WF><<<(unsigned) n_out, N, 0, st>>>(x, ldx, w, y, ldy, (int) n_in, n_tok); \
-    else bf16_f32_mmvf_multi_kernel<N, 8, WF><<<(unsigned) n_out, N, 0, st>>>(x, ldx, w, y, ldy, (int) n_in, n_tok)
+    switch (n_tok) { \
+        case 1: bf16_f32_mmvf_multi_kernel<N, 1, WF, true><<<(unsigned) n_out, N, 0, st>>>(x, ldx, w, y, ldy, (int) n_in, n_tok); break; \
+        case 2: bf16_f32_mmvf_multi_kernel<N, 2, WF, true><<<(unsigned) n_out, N, 0, st>>>(x, ldx, w, y, ldy, (int) n_in, n_tok); break; \
+        case 3: bf16_f32_mmvf_multi_kernel<N, 3, WF, true><<<(unsigned) n_out, N, 0, st>>>(x, ldx, w, y, ldy, (int) n_in, n_tok); break; \
+        case 4: bf16_f32_mmvf_multi_kernel<N, 4, WF, true><<<(unsigned) n_out, N, 0, st>>>(x, ldx, w, y, ldy, (int) n_in, n_tok); break; \
+        case 5: bf16_f32_mmvf_multi_kernel<N, 5, WF, true><<<(unsigned) n_out, N, 0, st>>>(x, ldx, w, y, ldy, (int) n_in, n_tok); break; \
+        case 6: bf16_f32_mmvf_multi_kernel<N, 6, WF, true><<<(unsigned) n_out, N, 0, st>>>(x, ldx, w, y, ldy, (int) n_in, n_tok); break; \
+        default: bf16_f32_mmvf_multi_kernel<N, 8, WF, false><<<(unsigned) n_out, N, 0, st>>>(x, ldx, w, y, ldy, (int) n_in, n_tok); break; \
+    }
 #define STRATA_MMVF_M(N) case N: \
     if (f == WForm::Bf16) { STRATA_MMVF_MF(N, 0); } else if (f == WForm::F16) { STRATA_MMVF_MF(N, 1); } \
     else { STRATA_MMVF_MF(N, 2); } break
